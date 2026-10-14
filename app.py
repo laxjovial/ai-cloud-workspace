@@ -134,6 +134,10 @@ if "active_gh_account_id" not in st.session_state:
     st.session_state.active_gh_account_id = None
 if "quick_action_prompt" not in st.session_state:
     st.session_state.quick_action_prompt = None
+if "top_nav" not in st.session_state:
+    st.session_state.top_nav = "💬 Workspace & Chat"
+if "selected_model_label" not in st.session_state:
+    st.session_state.selected_model_label = "Google Gemini 2.5 Pro (Recommended)"
 
 # =========================================================
 # 0. HANDLE OAUTH CALLBACK (SAFE & ROBUST)
@@ -414,17 +418,34 @@ def render_landing_and_auth():
 
 
 def render_workspace():
-    """Renders the main authenticated dashboard, sidebar controls, and chat arena."""
+    """Renders the main authenticated dashboard with top navigation bar and views."""
     user = st.session_state.user
 
     # Auto-link GitHub account if logged in via GitHub OAuth
     db.auto_link_oauth_github(user)
 
-    # Fetch user API keys & profiles
-    user_keys = db.get_user_api_keys(user.id)
-    gh_accounts = db.get_user_github_accounts(user.id)
+    # 1. Restore persisted state across logouts / timeouts
+    saved_state = db.load_user_workspace_state(user.id, user.email)
+    if st.session_state.active_gh_account_id is None and saved_state.get(
+        "active_gh_account_id"
+    ):
+        st.session_state.active_gh_account_id = saved_state[
+            "active_gh_account_id"
+        ]
+    if st.session_state.active_repo is None and saved_state.get("active_repo"):
+        st.session_state.active_repo = saved_state["active_repo"]
+    if st.session_state.current_session_id is None and saved_state.get(
+        "current_session_id"
+    ):
+        st.session_state.current_session_id = saved_state["current_session_id"]
+    if saved_state.get("active_model"):
+        st.session_state.selected_model_label = saved_state["active_model"]
 
-    # Determine active GitHub account
+    # 2. Fetch user API keys & GitHub accounts
+    user_keys = db.get_user_api_keys(user.id, user.email)
+    gh_accounts = db.get_user_github_accounts(user.id, user.email)
+
+    # 3. Determine active GitHub account
     active_account = None
     if gh_accounts:
         if st.session_state.active_gh_account_id:
@@ -439,14 +460,94 @@ def render_workspace():
         else:
             active_account = gh_accounts[0]
             st.session_state.active_gh_account_id = active_account["id"]
+            db.save_user_workspace_state(
+                user.id,
+                user.email,
+                active_gh_account_id=active_account["id"],
+            )
 
-    active_gh_token = active_account.get("github_token") if active_account else None
+    active_gh_token = (
+        active_account.get("github_token", "") if active_account else ""
+    )
+
+    # 4. Model configuration
+    model_groups = {
+        "Google Gemini 2.5 Pro (Recommended)": "gemini/gemini-2.5-pro",
+        "Google Gemini 2.5 Flash (Fast)": "gemini/gemini-2.5-flash",
+        "Google Gemini 1.5 Pro": "gemini/gemini-1.5-pro-latest",
+        "Anthropic Claude 3.7 Sonnet": "anthropic/claude-3-7-sonnet-20250219",
+        "Anthropic Claude 3.5 Haiku": "anthropic/claude-3-5-haiku-20241022",
+        "OpenAI GPT-4o": "openai/gpt-4o",
+        "OpenAI GPT-4o Mini": "openai/gpt-4o-mini",
+        "DeepSeek Chat (V3)": "deepseek/deepseek-chat",
+        "DeepSeek Reasoner (R1)": "deepseek/deepseek-reasoner",
+    }
+
+    if st.session_state.get("selected_model_label") not in model_groups:
+        st.session_state.selected_model_label = (
+            "Google Gemini 2.5 Pro (Recommended)"
+        )
+    selected_model_label = st.session_state.selected_model_label
+    selected_model = model_groups[selected_model_label]
+    provider_name = (
+        selected_model.split("/")[0] if "/" in selected_model else "gemini"
+    )
 
     # ------------------------------------------------------
-    # SIDEBAR: Profile, Multi-GitHub Accounts, BYOK, History
+    # TOP NAVIGATION BAR (Instant switching between views)
+    # ------------------------------------------------------
+    nav_options = [
+        "💬 Workspace & Chat",
+        "🐙 GitHub Accounts",
+        "🤖 AI Models & Keys",
+        "📁 Repos & Sessions",
+        "👤 Profile & Settings",
+    ]
+
+    cur_idx = (
+        nav_options.index(st.session_state.top_nav)
+        if st.session_state.top_nav in nav_options
+        else 0
+    )
+
+    gh_user_str = (
+        f"@{active_account['github_username']}"
+        if active_account
+        else "No GitHub Linked"
+    )
+    repo_str = st.session_state.active_repo or "No Repo Selected"
+    model_short = selected_model_label.split(" (")[0]
+
+    st.markdown(
+        f"""
+        <div style="display:flex; justify-content:space-between; align-items:center; background:#161b22; border:1px solid #30363d; border-radius:8px; padding:10px 18px; margin-bottom:12px;">
+            <span style="font-weight:700; color:#58a6ff; font-size:16px;">⚡ AI Cloud Workspace</span>
+            <div style="display:flex; gap:18px; font-size:13px; color:#8b949e;">
+                <span>🐙 GitHub: <strong style="color:#f0f6fc;">{gh_user_str}</strong></span>
+                <span>🤖 Model: <strong style="color:#f0f6fc;">{model_short}</strong></span>
+                <span>📁 Repo: <strong style="color:#f0f6fc;">{repo_str}</strong></span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    selected_nav = st.radio(
+        "Top Navigation Bar",
+        nav_options,
+        index=cur_idx,
+        horizontal=True,
+        label_visibility="collapsed",
+        key="top_nav_bar_radio",
+    )
+    if selected_nav != st.session_state.top_nav:
+        st.session_state.top_nav = selected_nav
+        st.rerun()
+
+    # ------------------------------------------------------
+    # SIDEBAR: Profile, Quick Links, Sign Out
     # ------------------------------------------------------
     with st.sidebar:
-        # USER PROFILE CARD
         user_meta = getattr(user, "user_metadata", {}) or {}
         app_meta = getattr(user, "app_metadata", {}) or {}
         provider = app_meta.get("provider", "Email")
@@ -467,193 +568,314 @@ def render_workspace():
             unsafe_allow_html=True,
         )
 
+        st.markdown("### 🧭 Navigation")
+        for nav_item in nav_options:
+            is_cur = st.session_state.top_nav == nav_item
+            if st.button(
+                f"{'👉 ' if is_cur else ''}{nav_item}",
+                key=f"side_nav_{nav_item}",
+                use_container_width=True,
+            ):
+                st.session_state.top_nav = nav_item
+                st.rerun()
+
+        st.markdown("---")
+        st.caption(f"**🐙 GitHub:** {gh_user_str}")
+        st.caption(f"**🤖 Model:** {model_short}")
+        st.caption(f"**📁 Repo:** {repo_str}")
+
+        if st.session_state.current_session_id:
+            if st.button(
+                "⏹️ Leave Active Chat",
+                key="side_leave_chat",
+                use_container_width=True,
+            ):
+                st.session_state.current_session_id = None
+                db.save_user_workspace_state(
+                    user.id, user.email, current_session_id=""
+                )
+                st.rerun()
+
         if st.button("Sign Out", use_container_width=True):
             db.sign_out()
             st.session_state.user = None
             st.session_state.current_session_id = None
-            st.session_state.auth_flash = None  # Clean logout without stale flash
+            st.session_state.auth_flash = None
             st.rerun()
 
-        st.markdown("---")
+    # ------------------------------------------------------
+    # TAB 1: 🐙 GITHUB ACCOUNTS VIEW
+    # ------------------------------------------------------
+    if st.session_state.top_nav == "🐙 GitHub Accounts":
+        st.markdown("### 🐙 GitHub Account Management")
+        st.caption(
+            "Connect multiple personal or work GitHub accounts. Personal Access Tokens (PATs) are encrypted with AES-128."
+        )
 
-        # --------------------------------------------------
-        # MULTI-GITHUB ACCOUNT MANAGER
-        # --------------------------------------------------
-        st.markdown("### 🐙 GitHub Accounts")
         if gh_accounts:
-            account_labels = [
-                f"{a['account_label']} (@{a['github_username']})"
-                for a in gh_accounts
-            ]
-            current_acc_index = (
-                [a["id"] for a in gh_accounts].index(
-                    st.session_state.active_gh_account_id
+            st.markdown("#### Linked Accounts")
+            for acc in gh_accounts:
+                is_active = acc["id"] == st.session_state.active_gh_account_id
+                card_style = (
+                    "border: 1px solid #238636; background: #0d1a10;"
+                    if is_active
+                    else "border: 1px solid #30363d; background: #161b22;"
                 )
-                if st.session_state.active_gh_account_id
-                in [a["id"] for a in gh_accounts]
-                else 0
-            )
-
-            selected_acc_label = st.selectbox(
-                "Active GitHub Account",
-                account_labels,
-                index=current_acc_index,
-            )
-            st.session_state.active_gh_account_id = gh_accounts[
-                account_labels.index(selected_acc_label)
-            ]["id"]
-            active_account = gh_accounts[account_labels.index(selected_acc_label)]
-            active_gh_token = active_account.get("github_token", "")
-
-            st.caption(
-                f"✅ Active: **@{active_account['github_username']}** ({active_account['account_label']})"
-            )
-
-            if active_gh_token:
+                badge_text = (
+                    '<span class="badge" style="background-color:#238636;">● Active Account</span>'
+                    if is_active
+                    else '<span class="badge" style="background-color:#30363d; color:#8b949e;">Inactive</span>'
+                )
                 st.markdown(
-                    f"**Masked PAT:** `{db.mask_secret(active_gh_token)}`"
+                    f"""
+                    <div style="{card_style} border-radius: 8px; padding: 14px; margin-bottom: 12px;">
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <span style="font-size:16px; font-weight:700; color:#f0f6fc;">🏷️ {acc['account_label']} (@{acc['github_username']})</span>
+                            <span>{badge_text}</span>
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
                 )
-                with st.expander("📋 Copy PAT", expanded=False):
-                    st.code(active_gh_token, language="text")
-
-            if st.button(
-                "🗑️ Remove Selected Account",
-                key=f"del_gh_{active_account['id']}",
-                use_container_width=True,
-            ):
-                db.delete_github_account(user.id, active_account["id"])
-                st.session_state.active_gh_account_id = None
-                st.toast("🗑️ GitHub account removed.", icon="🗑️")
-                st.rerun()
+                col_a, col_b, col_c = st.columns([2, 1, 1])
+                with col_a:
+                    if acc.get("github_token"):
+                        st.markdown(
+                            f"**Masked PAT:** `{db.mask_secret(acc['github_token'])}`"
+                        )
+                        with st.expander("📋 Copy PAT"):
+                            st.code(acc["github_token"], language="text")
+                    else:
+                        st.caption("No PAT stored for this account.")
+                with col_b:
+                    if not is_active:
+                        if st.button(
+                            "⭐ Set as Active",
+                            key=f"btn_activate_{acc['id']}",
+                            use_container_width=True,
+                        ):
+                            st.session_state.active_gh_account_id = acc["id"]
+                            db.save_user_workspace_state(
+                                user.id,
+                                user.email,
+                                active_gh_account_id=acc["id"],
+                            )
+                            st.toast(
+                                f"🐙 Switched to @{acc['github_username']}!",
+                                icon="✅",
+                            )
+                            st.rerun()
+                    else:
+                        if st.button(
+                            "📁 Open Repositories",
+                            key=f"btn_repos_{acc['id']}",
+                            use_container_width=True,
+                        ):
+                            st.session_state.top_nav = "📁 Repos & Sessions"
+                            st.rerun()
+                with col_c:
+                    if st.button(
+                        "🗑️ Remove",
+                        key=f"btn_del_acc_{acc['id']}",
+                        use_container_width=True,
+                    ):
+                        db.delete_github_account(
+                            user.id, acc["id"], user.email
+                        )
+                        if st.session_state.active_gh_account_id == acc["id"]:
+                            st.session_state.active_gh_account_id = None
+                        st.toast("🗑️ GitHub account removed.", icon="🗑️")
+                        st.rerun()
+                st.markdown("---")
         else:
-            st.warning("⚠️ No GitHub account connected yet.")
-            st.caption(
-                "Connect a Personal Access Token below to allow the AI to clone repos and create PRs."
+            st.info(
+                "💡 No GitHub accounts connected yet. Connect your first account below to search repos and run projects."
             )
 
-        # Expander to add or switch GitHub account
-        with st.expander("➕ Connect Another GitHub Account"):
-            acc_label = st.text_input(
-                "Account Label",
-                placeholder="e.g. Work, Personal, OpenSource",
-                key="new_gh_acc_label",
-            )
-            acc_username = st.text_input(
-                "GitHub Username",
-                placeholder="e.g. laxjovial",
-                key="new_gh_acc_user",
-            )
+        st.markdown("#### ➕ Connect Another GitHub Account")
+        with st.form("add_github_acc_form", clear_on_submit=True):
+            f_col1, f_col2 = st.columns(2)
+            with f_col1:
+                acc_label = st.text_input(
+                    "Account Label",
+                    placeholder="e.g. Personal, Work, OpenSource",
+                )
+            with f_col2:
+                acc_username = st.text_input(
+                    "GitHub Username", placeholder="e.g. laxjovial"
+                )
             acc_token = st.text_input(
-                "Personal Access Token",
+                "Personal Access Token (PAT)",
                 type="password",
-                help="Requires 'repo' scope",
-                key="new_gh_acc_token",
+                help="Requires 'repo' scope from github.com/settings/tokens",
+                placeholder="ghp_...",
             )
-            if st.button("Connect Account", use_container_width=True):
+            submit_gh = st.form_submit_button(
+                "Connect Account", type="primary", use_container_width=True
+            )
+            if submit_gh:
                 if acc_label and acc_token:
-                    if db.add_github_account(
+                    db.add_github_account(
                         user.id,
                         acc_label,
                         acc_username or acc_label,
                         acc_token,
-                    ):
-                        st.toast("🐙 GitHub account connected successfully!", icon="✅")
-                        st.success("GitHub account connected and encrypted!")
-                        st.rerun()
+                        user.email,
+                    )
+                    st.toast(
+                        "🐙 GitHub account connected and encrypted!", icon="✅"
+                    )
+                    st.rerun()
                 else:
-                    st.warning("Please provide a label and token.")
+                    st.warning(
+                        "Please provide an Account Label and Personal Access Token."
+                    )
 
-        st.markdown("---")
-
-        # --------------------------------------------------
-        # MODEL CONFIGURATION & KEY STATUS
-        # --------------------------------------------------
-        st.markdown("### 🤖 Model Configuration")
-
-        model_groups = {
-            "Google Gemini 2.5 Pro (Recommended)": "gemini/gemini-2.5-pro",
-            "Google Gemini 2.5 Flash (Fast)": "gemini/gemini-2.5-flash",
-            "Google Gemini 1.5 Pro": "gemini/gemini-1.5-pro-latest",
-            "Anthropic Claude 3.7 Sonnet": "anthropic/claude-3-7-sonnet-20250219",
-            "Anthropic Claude 3.5 Haiku": "anthropic/claude-3-5-haiku-20241022",
-            "OpenAI GPT-4o": "openai/gpt-4o",
-            "OpenAI GPT-4o Mini": "openai/gpt-4o-mini",
-            "DeepSeek Chat (V3)": "deepseek/deepseek-chat",
-            "DeepSeek Reasoner (R1)": "deepseek/deepseek-reasoner",
-        }
-
-        selected_model_label = st.selectbox(
-            "Active AI Model", list(model_groups.keys())
+    # ------------------------------------------------------
+    # TAB 2: 🤖 AI MODELS & KEYS VIEW
+    # ------------------------------------------------------
+    elif st.session_state.top_nav == "🤖 AI Models & Keys":
+        st.markdown("### 🤖 AI Models & API Key Management (BYOK)")
+        st.caption(
+            "Bring Your Own Key (BYOK) for direct provider access with zero markups. All keys are encrypted with AES-128."
         )
-        selected_model = model_groups[selected_model_label]
 
-        # Check API key status for active model provider
-        provider_name = (
-            selected_model.split("/")[0] if "/" in selected_model else "gemini"
+        st.markdown("#### 1. Select Active AI Model")
+        selected_model_idx = list(model_groups.keys()).index(
+            selected_model_label
         )
-        has_key = bool(user_keys.get(provider_name))
+        new_model_label = st.selectbox(
+            "Active AI Model",
+            list(model_groups.keys()),
+            index=selected_model_idx,
+            help="Choose the AI engine for code generation, terminal commands, and debugging",
+        )
+        if new_model_label != selected_model_label:
+            st.session_state.selected_model_label = new_model_label
+            db.save_user_workspace_state(
+                user.id, user.email, active_model=new_model_label
+            )
+            st.toast(
+                f"🤖 Switched to {new_model_label.split('(')[0]}!", icon="✅"
+            )
+            st.rerun()
 
-        if has_key:
+        cur_prov = model_groups[new_model_label].split("/")[0]
+        if user_keys.get(cur_prov):
             st.markdown(
-                f'<span class="status-badge-green">● {provider_name.capitalize()} API Key Ready</span>',
+                f'<span class="status-badge-green">● {cur_prov.capitalize()} API Key is Configured & Ready</span>',
                 unsafe_allow_html=True,
             )
         else:
             st.markdown(
-                f'<span class="status-badge-red">○ Missing {provider_name.capitalize()} API Key (Add below)</span>',
+                f'<span class="status-badge-red">○ Missing {cur_prov.capitalize()} API Key (Add below)</span>',
                 unsafe_allow_html=True,
             )
 
-        # BYOK Expander
-        with st.expander("⚙️ Manage AI Keys (BYOK)", expanded=not has_key):
-            st.caption("Keys are encrypted with AES-128 and stored securely in Supabase.")
-            if user_keys:
-                st.markdown("##### 🔐 Stored API Keys")
-                for prov, key in user_keys.items():
+        st.markdown("---")
+        st.markdown("#### 2. Configured AI Keys (BYOK)")
+        all_providers = [
+            ("gemini", "Google Gemini", "https://aistudio.google.com/apikey"),
+            ("anthropic", "Anthropic Claude", "https://console.anthropic.com/"),
+            ("openai", "OpenAI GPT-4o", "https://platform.openai.com/api-keys"),
+            ("deepseek", "DeepSeek", "https://platform.deepseek.com/"),
+        ]
+
+        grid_cols = st.columns(2)
+        for i, (p_id, p_title, p_link) in enumerate(all_providers):
+            with grid_cols[i % 2]:
+                stored_key = user_keys.get(p_id)
+                has_k = bool(stored_key)
+                badge_html = (
+                    '<span class="status-badge-green">● Configured (AES-128)</span>'
+                    if has_k
+                    else '<span class="status-badge-red">○ Not Added</span>'
+                )
+                st.markdown(
+                    f"""
+                    <div style="background:#161b22; border:1px solid #30363d; border-radius:8px; padding:14px; margin-bottom:12px;">
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <strong style="color:#f0f6fc; font-size:15px;">🔑 {p_title}</strong>
+                            {badge_html}
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                if has_k:
                     k_col1, k_col2 = st.columns([3, 1])
                     with k_col1:
-                        st.markdown(f"**{prov.capitalize()}**: `{db.mask_secret(key)}`")
+                        st.markdown(
+                            f"**Masked:** `{db.mask_secret(stored_key)}`"
+                        )
                     with k_col2:
-                        if st.button("🗑️", key=f"del_key_{prov}", help=f"Delete {prov.capitalize()} key"):
-                            db.delete_user_api_key(user.id, prov)
-                            st.toast(f"🗑️ {prov.capitalize()} API key deleted.", icon="🗑️")
+                        if st.button(
+                            "🗑️ Delete",
+                            key=f"del_key_btn_{p_id}",
+                            use_container_width=True,
+                        ):
+                            db.delete_user_api_key(user.id, p_id, user.email)
+                            st.toast(f"🗑️ {p_title} key deleted.", icon="🗑️")
                             st.rerun()
-                    with st.expander(f"📋 Copy {prov.capitalize()} Key", expanded=False):
-                        st.code(key, language="text")
-                st.markdown("---")
-
-            st.markdown("##### Add or Update Key")
-            byok_provider = st.selectbox(
-                "Select Provider",
-                ["gemini", "anthropic", "openai", "deepseek"],
-            )
-            key_val = st.text_input(
-                f"{byok_provider.capitalize()} API Key",
-                value="",
-                type="password",
-                placeholder=f"Paste {byok_provider.capitalize()} key...",
-                key="byok_input_key",
-            )
-            if st.button("Save API Key", use_container_width=True):
-                if key_val:
-                    if db.save_user_api_key(user.id, byok_provider, key_val):
-                        st.toast(f"🔒 {byok_provider.capitalize()} API key saved securely!", icon="✅")
-                        st.success(f"{byok_provider.capitalize()} key saved and encrypted!")
-                        st.rerun()
+                    with st.expander(f"📋 Copy {p_title} Key"):
+                        st.code(stored_key, language="text")
                 else:
-                    st.warning("Please enter an API key.")
+                    st.caption(f"Need a key? [Get {p_title} Key]({p_link})")
 
         st.markdown("---")
+        st.markdown("#### 3. Add or Update API Key")
+        with st.form("save_byok_key_form", clear_on_submit=True):
+            f_col1, f_col2 = st.columns([1, 2])
+            with f_col1:
+                key_provider = st.selectbox(
+                    "Provider", ["gemini", "anthropic", "openai", "deepseek"]
+                )
+            with f_col2:
+                key_val_input = st.text_input(
+                    "API Key",
+                    type="password",
+                    placeholder=f"Paste {key_provider.capitalize()} API key...",
+                )
+            submit_save_key = st.form_submit_button(
+                "Save Key Securely", type="primary", use_container_width=True
+            )
+            if submit_save_key:
+                if key_val_input.strip():
+                    db.save_user_api_key(
+                        user.id,
+                        key_provider,
+                        key_val_input.strip(),
+                        user.email,
+                    )
+                    st.toast(
+                        f"🔒 {key_provider.capitalize()} API key saved and encrypted!",
+                        icon="✅",
+                    )
+                    st.rerun()
+                else:
+                    st.warning("Please enter a valid API key.")
 
-        # Target Repository Setup with Dynamic Prefix Search
-        st.markdown("### 📁 Target Repository")
+    # ------------------------------------------------------
+    # TAB 3: 📁 REPOSITORIES & SESSIONS VIEW
+    # ------------------------------------------------------
+    elif st.session_state.top_nav == "📁 Repos & Sessions":
+        st.markdown("### 📁 Repositories & Past Chat Sessions")
+        st.caption(
+            "Select or search any repository to launch a live coding session, or resume where you left off."
+        )
 
-        user_repos = fetch_user_github_repos(active_gh_token) if active_gh_token else []
+        st.markdown("#### 1. Select Target Repository")
+        user_repos = (
+            fetch_user_github_repos(active_gh_token) if active_gh_token else []
+        )
 
         repo_input = ""
         if user_repos:
-            search_options = ["-- Select or Search Repository --"] + user_repos + ["➕ Custom / Other Repository..."]
-            
+            search_options = (
+                ["-- Select or Search Repository --"]
+                + user_repos
+                + ["➕ Custom / Other Repository..."]
+            )
             default_idx = 0
             if st.session_state.active_repo in user_repos:
                 default_idx = search_options.index(st.session_state.active_repo)
@@ -668,7 +890,9 @@ def render_workspace():
             if selected_repo_opt == "➕ Custom / Other Repository...":
                 repo_input = st.text_input(
                     "Enter Repository (owner/repo)",
-                    value="" if st.session_state.active_repo in user_repos else (st.session_state.active_repo or ""),
+                    value=""
+                    if st.session_state.active_repo in user_repos
+                    else (st.session_state.active_repo or ""),
                     placeholder="e.g. laxjovial/ai-cloud-workspace",
                 )
                 st.session_state.active_repo = repo_input
@@ -679,214 +903,422 @@ def render_workspace():
                 repo_input = st.session_state.active_repo or ""
         else:
             repo_input = st.text_input(
-                "GitHub Repository",
+                "GitHub Repository (owner/repo)",
                 value=st.session_state.active_repo or "",
                 placeholder="username/repo-name (e.g. laxjovial/ai-cloud-workspace)",
-                help="Format: username/repo-name",
             )
             st.session_state.active_repo = repo_input
             if not active_gh_token:
                 st.caption(
-                    "💡 Connect a GitHub PAT above to dynamically list and search all your repositories here."
+                    "💡 Connect a GitHub account in the '🐙 GitHub Accounts' tab to automatically list and search all your repositories here."
                 )
 
         if st.button(
-            "➕ Start New Chat Session",
+            "➕ Start New Chat Session on Selected Repo",
             type="primary",
             use_container_width=True,
         ):
-            if repo_input and repo_input != "-- Select or Search Repository --" and "/" in repo_input:
+            if (
+                repo_input
+                and repo_input != "-- Select or Search Repository --"
+                and "/" in repo_input
+            ):
                 new_session = db.create_chat_session(
                     user_id=user.id,
                     repo_name=repo_input.strip(),
                     repo_url=f"https://github.com/{repo_input.strip()}",
                     title=f"Task on {repo_input.strip()} ({datetime.now().strftime('%b %d, %H:%M')})",
                     model_used=selected_model,
+                    email=user.email,
                 )
                 if new_session:
                     st.session_state.current_session_id = new_session["id"]
                     st.session_state.active_repo = repo_input.strip()
+                    st.session_state.top_nav = "💬 Workspace & Chat"
+                    db.save_user_workspace_state(
+                        user.id,
+                        user.email,
+                        active_repo=repo_input.strip(),
+                        current_session_id=new_session["id"],
+                    )
+                    st.toast(
+                        f"🚀 Session started on {repo_input.strip()}!",
+                        icon="✅",
+                    )
                     st.rerun()
             else:
-                st.error("Please enter or select a valid repository (e.g. username/repo-name)")
+                st.error(
+                    "Please enter or select a valid repository format (e.g. username/repo-name)"
+                )
 
-
-        st.markdown("### 💬 Recent Sessions")
-        sessions = db.list_user_sessions(user.id)
+        st.markdown("---")
+        st.markdown("#### 2. Past Chat Sessions")
+        sessions = db.list_user_sessions(user.id, user.email)
         if not sessions:
-            st.caption("No active chat sessions. Start one above!")
+            st.info("No past chat sessions found. Start a new session above!")
         for s in sessions:
             is_active = s["id"] == st.session_state.current_session_id
-            s_col1, s_col2 = st.columns([5, 1])
-            with s_col1:
-                btn_label = f"{'👉 ' if is_active else '💬 '}{s['title']}"
+            c_style = (
+                "border: 1px solid #238636; background: #0d1a10;"
+                if is_active
+                else "border: 1px solid #30363d; background: #161b22;"
+            )
+            active_badge = (
+                '<span class="badge" style="background-color:#238636;">Current Session</span>'
+                if is_active
+                else ""
+            )
+            st.markdown(
+                f"""
+                <div style="{c_style} border-radius: 8px; padding: 12px; margin-bottom: 8px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <div>
+                            <strong style="color:#f0f6fc; font-size:15px;">💬 {s['title']}</strong><br/>
+                            <span style="font-size:12px; color:#8b949e;">📁 Repo: <b>{s['repo_name']}</b> | 🤖 Model: <b>{s.get('model_used', 'AI Model').split('/')[-1]}</b></span>
+                        </div>
+                        <div>
+                            {active_badge}
+                        </div>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            sc1, sc2 = st.columns([4, 1])
+            with sc1:
+                btn_lbl = (
+                    "👉 Currently Active (Open Chat)"
+                    if is_active
+                    else "▶️ Resume This Chat"
+                )
                 if st.button(
-                    btn_label, key=f"sess_{s['id']}", use_container_width=True
+                    btn_lbl,
+                    key=f"resume_sess_{s['id']}",
+                    use_container_width=True,
                 ):
                     st.session_state.current_session_id = s["id"]
                     st.session_state.active_repo = s["repo_name"]
+                    st.session_state.top_nav = "💬 Workspace & Chat"
+                    db.save_user_workspace_state(
+                        user.id,
+                        user.email,
+                        active_repo=s["repo_name"],
+                        current_session_id=s["id"],
+                    )
                     st.rerun()
-            with s_col2:
+            with sc2:
                 if st.button(
-                    "🗑️",
-                    key=f"del_{s['id']}",
-                    help=f"Delete session: {s['title']}",
+                    "🗑️ Delete",
+                    key=f"del_sess_{s['id']}",
+                    use_container_width=True,
                 ):
-                    db.delete_chat_session(s["id"])
+                    db.delete_chat_session(s["id"], user.id, user.email)
                     if st.session_state.current_session_id == s["id"]:
                         st.session_state.current_session_id = None
+                        db.save_user_workspace_state(
+                            user.id, user.email, current_session_id=""
+                        )
+                    st.toast("🗑️ Chat session deleted.", icon="🗑️")
                     st.rerun()
+            st.markdown("---")
 
     # ------------------------------------------------------
-    # MAIN CHAT & EXECUTION AREA
+    # TAB 4: 👤 PROFILE & SETTINGS VIEW
     # ------------------------------------------------------
-    if not st.session_state.current_session_id:
-        st.info(
-            "👈 Select a repository in the sidebar and click **'Start New Chat Session'** to begin."
-        )
-        return
-
-    # Load active session messages
-    messages = db.get_session_messages(st.session_state.current_session_id)
-
-    head_col1, head_col2 = st.columns([5, 1])
-    with head_col1:
+    elif st.session_state.top_nav == "👤 Profile & Settings":
+        st.markdown("### 👤 User Profile & Security Settings")
         st.markdown(
-            f"### 🚀 Working on: `{st.session_state.active_repo}` &nbsp; <span class='badge'>{selected_model_label.split('(')[0]}</span>",
+            f"""
+            <div style="background:#161b22; border:1px solid #30363d; border-radius:8px; padding:20px; margin-bottom:16px;">
+                <h4 style="color:#f0f6fc; margin-top:0;">{user_name}</h4>
+                <p style="color:#8b949e; margin-bottom:8px;">📧 Email: <b>{user.email}</b></p>
+                <p style="color:#8b949e; margin-bottom:8px;">🔐 Authentication: <b>{provider.capitalize()}</b></p>
+                <p style="color:#8b949e; margin-bottom:8px;">🆔 User ID: <code>{user.id}</code></p>
+            </div>
+            """,
             unsafe_allow_html=True,
         )
-    with head_col2:
+
+        st.markdown("#### 🔒 Security & Privacy Architecture")
+        st.markdown(
+            """
+            * 🛡️ **AES-128 Encryption**: All BYOK keys and GitHub PATs are encrypted at the application layer prior to storage.
+            * 🙈 **Password Masking**: Credentials display only the first 3 and last 2 characters (e.g. `AIz••••••••••8x`).
+            * 💾 **Dual-Layer Persistence**: State is preserved across server restarts, browser reloads, and logouts.
+            * ☁️ **Isolated Cloud Sandboxes**: All terminal execution and web dev servers run in isolated Linux environments via E2B.
+            """
+        )
+
         if st.button(
-            "🗑️ Delete Chat",
-            key="del_current_chat",
-            help="Delete this chat session and its history",
-            use_container_width=True,
+            "Sign Out of Account", type="primary", use_container_width=True
         ):
-            db.delete_chat_session(st.session_state.current_session_id)
+            db.sign_out()
+            st.session_state.user = None
             st.session_state.current_session_id = None
+            st.session_state.auth_flash = None
             st.rerun()
 
-    # Render previous messages
-    for msg in messages:
-        with st.chat_message(msg["sender"]):
-            st.markdown(msg["content"])
-            if msg.get("terminal_output"):
-                with st.expander("🖥️ Terminal & Test Execution Output"):
-                    st.markdown(
-                        f"<div class='terminal-box'>{msg['terminal_output']}</div>",
-                        unsafe_allow_html=True,
-                    )
-
-    # QUICK ACTION SHORTCUT BUTTONS
-    st.markdown("##### ⚡ Quick Actions")
-    q1, q2, q3, q4 = st.columns(4)
-
-    prompt_to_run = None
-
-    with q1:
-        if st.button("🔍 Audit Codebase", use_container_width=True):
-            prompt_to_run = "Inspect the repository architecture and list all core files and dependencies."
-    with q2:
-        if st.button("🧪 Run Test Suite", use_container_width=True):
-            prompt_to_run = "Detect the testing framework, execute all tests in the terminal, and report results."
-    with q3:
-        if st.button("📱 Start Web Preview", use_container_width=True):
-            prompt_to_run = "Detect the web framework and run the project dev server in the background using start_dev_server so I can preview it on mobile."
-    with q4:
-        if st.button("🐙 Check Git Diffs", use_container_width=True):
-            prompt_to_run = "Run git status and git diff to check all modified files."
-
-    # Chat Input
-    user_prompt = st.chat_input(
-        "Instruct the AI (e.g., 'Run npm test', 'Fix the failing tests', or 'Run this project')..."
-    )
-
-    final_prompt = prompt_to_run or user_prompt
-
-    if final_prompt:
-        active_api_key = user_keys.get(provider_name)
-
-        if not active_api_key:
-            st.error(
-                f"Missing API key for provider '{provider_name.capitalize()}'. Please save your key in the sidebar under '⚙️ Manage AI Keys (BYOK)'."
-            )
-            return
-
-        if not active_gh_token:
-            st.error(
-                "Missing GitHub token for active account. Please connect a GitHub token in the sidebar to clone and inspect repos."
-            )
-            return
-
-        # 1. Save and display User Message
-        db.add_message(
-            st.session_state.current_session_id, "user", final_prompt
-        )
-        with st.chat_message("user"):
-            st.markdown(final_prompt)
-
-        # 2. Run Autonomous AI Execution in Sandbox
-        with st.chat_message("assistant"):
-            status_box = st.status(
-                "Initializing Sandbox and Repository...", expanded=True
+    # ------------------------------------------------------
+    # TAB 5: 💬 WORKSPACE & CHAT VIEW (Active Arena)
+    # ------------------------------------------------------
+    elif st.session_state.top_nav == "💬 Workspace & Chat":
+        if not st.session_state.current_session_id:
+            st.markdown("### ⚡ AI Cloud Workspace Arena")
+            st.info(
+                "👈 No active chat session loaded. Pick a repository below, select one from the **📁 Repos & Sessions** tab, or resume a recent chat!"
             )
 
-            sandbox = WorkspaceSandbox(
-                repo_name=st.session_state.active_repo,
-                github_token=active_gh_token,
-            )
-
-            status_box.update(label="Cloning repository into cloud sandbox...")
-            boot_res = sandbox.start()
-
-            if not boot_res.get("success"):
-                status_box.update(
-                    label="Failed to start sandbox", state="error"
+            w_col1, w_col2 = st.columns(2)
+            with w_col1:
+                st.markdown(
+                    """
+                    <div style="background:#161b22; border:1px solid #30363d; border-radius:8px; padding:16px; margin-bottom:14px;">
+                        <h4 style="margin-top:0; color:#58a6ff;">🐙 Active GitHub Account</h4>
+                        <p style="color:#8b949e; font-size:14px;">Select or change the GitHub account used for git cloning, pushing, and pull requests.</p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
                 )
-                st.error(boot_res.get("error"))
+                if st.button(
+                    "🐙 Manage GitHub Accounts",
+                    key="quick_btn_gh",
+                    use_container_width=True,
+                ):
+                    st.session_state.top_nav = "🐙 GitHub Accounts"
+                    st.rerun()
+
+            with w_col2:
+                st.markdown(
+                    """
+                    <div style="background:#161b22; border:1px solid #30363d; border-radius:8px; padding:16px; margin-bottom:14px;">
+                        <h4 style="margin-top:0; color:#58a6ff;">🤖 Active AI Model & Keys</h4>
+                        <p style="color:#8b949e; font-size:14px;">Configure Gemini, Claude, OpenAI, or DeepSeek API keys with zero host markup.</p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                if st.button(
+                    "🤖 Configure AI Models & Keys",
+                    key="quick_btn_ai",
+                    use_container_width=True,
+                ):
+                    st.session_state.top_nav = "🤖 AI Models & Keys"
+                    st.rerun()
+
+            st.markdown("---")
+            st.markdown("#### 💬 Recent Chat Sessions")
+            recent_sessions = db.list_user_sessions(user.id, user.email)
+            if recent_sessions:
+                for s in recent_sessions[:5]:
+                    r_col1, r_col2 = st.columns([4, 1])
+                    with r_col1:
+                        st.markdown(
+                            f"**{s['title']}** &nbsp; (`{s['repo_name']}`)"
+                        )
+                    with r_col2:
+                        if st.button(
+                            "▶️ Resume",
+                            key=f"ws_resume_{s['id']}",
+                            use_container_width=True,
+                        ):
+                            st.session_state.current_session_id = s["id"]
+                            st.session_state.active_repo = s["repo_name"]
+                            db.save_user_workspace_state(
+                                user.id,
+                                user.email,
+                                active_repo=s["repo_name"],
+                                current_session_id=s["id"],
+                            )
+                            st.rerun()
+            else:
+                st.caption(
+                    "No chat sessions yet. Click below to start your first session!"
+                )
+                if st.button(
+                    "📁 Pick a Repository to Start",
+                    key="btn_pick_repo_start",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    st.session_state.top_nav = "📁 Repos & Sessions"
+                    st.rerun()
+            return
+
+        # Load active session messages
+        messages = db.get_session_messages(
+            st.session_state.current_session_id, user.id, user.email
+        )
+
+        head_col1, head_col2, head_col3 = st.columns([4, 1, 1])
+        with head_col1:
+            st.markdown(
+                f"### 🚀 Working on: `{st.session_state.active_repo}` &nbsp; <span class='badge'>{selected_model_label.split('(')[0]}</span>",
+                unsafe_allow_html=True,
+            )
+        with head_col2:
+            if st.button(
+                "⏹️ Leave Chat",
+                key="leave_current_chat",
+                help="Leave this chat session and return to the session menu",
+                use_container_width=True,
+            ):
+                st.session_state.current_session_id = None
+                db.save_user_workspace_state(
+                    user.id, user.email, current_session_id=""
+                )
+                st.rerun()
+        with head_col3:
+            if st.button(
+                "🗑️ Delete Chat",
+                key="del_current_chat",
+                help="Delete this chat session and its history permanently",
+                use_container_width=True,
+            ):
+                db.delete_chat_session(
+                    st.session_state.current_session_id, user.id, user.email
+                )
+                st.session_state.current_session_id = None
+                db.save_user_workspace_state(
+                    user.id, user.email, current_session_id=""
+                )
+                st.toast("🗑️ Chat session deleted.", icon="🗑️")
+                st.rerun()
+
+        # Render previous messages
+        for msg in messages:
+            with st.chat_message(msg["sender"]):
+                st.markdown(msg["content"])
+                if msg.get("terminal_output"):
+                    with st.expander("🖥️ Terminal & Test Execution Output"):
+                        st.markdown(
+                            f"<div class='terminal-box'>{msg['terminal_output']}</div>",
+                            unsafe_allow_html=True,
+                        )
+
+        # QUICK ACTION SHORTCUT BUTTONS
+        st.markdown("##### ⚡ Quick Actions")
+        q1, q2, q3, q4 = st.columns(4)
+
+        prompt_to_run = None
+
+        with q1:
+            if st.button("🔍 Audit Codebase", use_container_width=True):
+                prompt_to_run = "Inspect the repository architecture and list all core files and dependencies."
+        with q2:
+            if st.button("🧪 Run Test Suite", use_container_width=True):
+                prompt_to_run = "Detect the testing framework, execute all tests in the terminal, and report results."
+        with q3:
+            if st.button("📱 Start Web Preview", use_container_width=True):
+                prompt_to_run = "Detect the web framework and run the project dev server in the background using start_dev_server so I can preview it on mobile."
+        with q4:
+            if st.button("🐙 Check Git Diffs", use_container_width=True):
+                prompt_to_run = (
+                    "Run git status and git diff to check all modified files."
+                )
+
+        # Chat Input
+        user_prompt = st.chat_input(
+            "Instruct the AI (e.g., 'Run npm test', 'Fix the failing tests', or 'Run this project')..."
+        )
+
+        final_prompt = prompt_to_run or user_prompt
+
+        if final_prompt:
+            active_api_key = user_keys.get(provider_name)
+
+            if not active_api_key:
+                st.error(
+                    f"Missing API key for provider '{provider_name.capitalize()}'. Please configure your key in the '🤖 AI Models & Keys' tab at the top."
+                )
                 return
 
-            def update_status(text: str):
-                status_box.update(label=text)
-
-            history_payload = []
-            for m in messages:
-                history_payload.append(
-                    {
-                        "role": "user" if m["sender"] == "user" else "assistant",
-                        "content": m["content"],
-                    }
+            if not active_gh_token:
+                st.error(
+                    "Missing GitHub token for active account. Please connect a GitHub token in the '🐙 GitHub Accounts' tab at the top to clone and inspect repos."
                 )
-            history_payload.append({"role": "user", "content": final_prompt})
+                return
 
-            result = agent.run_agent_turn(
-                messages=history_payload,
-                model=selected_model,
-                api_key=active_api_key,
-                sandbox=sandbox,
-                status_callback=update_status,
-            )
-
-            status_box.update(label="Execution complete!", state="complete")
-
-            reply_text = result.get("content", "")
-            terminal_logs = result.get("terminal_logs", "")
-
-            st.markdown(reply_text)
-            if terminal_logs:
-                with st.expander("🖥️ Terminal & Test Execution Output"):
-                    st.markdown(
-                        f"<div class='terminal-box'>{terminal_logs}</div>",
-                        unsafe_allow_html=True,
-                    )
-
-            # Save assistant message to Supabase
+            # 1. Save and display User Message
             db.add_message(
                 st.session_state.current_session_id,
-                "assistant",
-                reply_text,
-                terminal_output=terminal_logs,
+                "user",
+                final_prompt,
+                user_id=user.id,
+                email=user.email,
             )
+            with st.chat_message("user"):
+                st.markdown(final_prompt)
+
+            # 2. Run Autonomous AI Execution in Sandbox
+            with st.chat_message("assistant"):
+                status_box = st.status(
+                    "Initializing Sandbox and Repository...", expanded=True
+                )
+
+                sandbox = WorkspaceSandbox(
+                    repo_name=st.session_state.active_repo,
+                    github_token=active_gh_token,
+                )
+
+                status_box.update(
+                    label="Cloning repository into cloud sandbox..."
+                )
+                boot_res = sandbox.start()
+
+                if not boot_res.get("success"):
+                    status_box.update(
+                        label="Failed to start sandbox", state="error"
+                    )
+                    st.error(boot_res.get("error"))
+                    return
+
+                def update_status(text: str):
+                    status_box.update(label=text)
+
+                history_payload = []
+                for m in messages:
+                    history_payload.append(
+                        {
+                            "role": "user"
+                            if m["sender"] == "user"
+                            else "assistant",
+                            "content": m["content"],
+                        }
+                    )
+                history_payload.append(
+                    {"role": "user", "content": final_prompt}
+                )
+
+                result = agent.run_agent_turn(
+                    messages=history_payload,
+                    model=selected_model,
+                    api_key=active_api_key,
+                    sandbox=sandbox,
+                    status_callback=update_status,
+                )
+
+                status_box.update(label="Execution complete!", state="complete")
+
+                reply_text = result.get("content", "")
+                terminal_logs = result.get("terminal_logs", "")
+
+                st.markdown(reply_text)
+                if terminal_logs:
+                    with st.expander("🖥️ Terminal & Test Execution Output"):
+                        st.markdown(
+                            f"<div class='terminal-box'>{terminal_logs}</div>",
+                            unsafe_allow_html=True,
+                        )
+
+                # Save assistant message to hybrid database & local store
+                db.add_message(
+                    st.session_state.current_session_id,
+                    "assistant",
+                    reply_text,
+                    terminal_output=terminal_logs,
+                    user_id=user.id,
+                    email=user.email,
+                )
 
 
 # =========================================================
@@ -897,3 +1329,4 @@ if st.session_state.user is None:
     render_landing_and_auth()
 else:
     render_workspace()
+

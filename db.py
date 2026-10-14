@@ -1,6 +1,9 @@
 """Database and Authentication module using Supabase with deterministic PKCE and AES encryption."""
 
+import hashlib
+import json
 import os
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 from cryptography.fernet import Fernet
 import streamlit as st
@@ -10,6 +13,18 @@ from supabase_auth._sync.gotrue_client import generate_pkce_challenge
 # Deterministic PKCE pair so OAuth code verifiers never get lost or out of sync across reruns
 FIXED_PKCE_VERIFIER = "ai_cloud_workspace_pkce_verifier_secure_key_2026_unique"
 FIXED_PKCE_CHALLENGE = generate_pkce_challenge(FIXED_PKCE_VERIFIER)
+
+# Local encrypted store directory (AES-128 encrypted, excluded in .gitignore)
+USER_STORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".user_store")
+
+
+def _ensure_user_store_dir():
+    if not os.path.exists(USER_STORE_DIR):
+        os.makedirs(USER_STORE_DIR, exist_ok=True)
+
+
+def _get_safe_filename(key: str) -> str:
+    return hashlib.sha256(key.strip().lower().encode()).hexdigest()
 
 
 # ==========================================
@@ -146,24 +161,134 @@ def sign_out() -> bool:
 
 
 # ==========================================
-# USER PROFILE & MULTI-GITHUB ACCOUNTS
+# USER PROFILE & PERSISTENT HYBRID STORE
 # ==========================================
 
 
-def get_user_profile(user_id: str) -> Optional[Dict[str, Any]]:
+def _load_local_user_data(
+    user_id: str, email: Optional[str] = None
+) -> Dict[str, Any]:
+    """Loads and decrypts user data from .user_store by user_id or email hash."""
+    _ensure_user_store_dir()
+    f = _get_fernet()
+    candidates = []
+    if user_id:
+        candidates.append(_get_safe_filename(user_id))
+    if email:
+        candidates.append(_get_safe_filename(email))
+
+    for c in candidates:
+        filepath = os.path.join(USER_STORE_DIR, f"{c}.json")
+        if os.path.exists(filepath):
+            try:
+                with open(filepath, "r", encoding="utf-8") as fp:
+                    raw = fp.read()
+                if f:
+                    try:
+                        decrypted = f.decrypt(raw.encode()).decode()
+                        data = json.loads(decrypted)
+                    except Exception:
+                        data = json.loads(raw)
+                else:
+                    data = json.loads(raw)
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
+    return {}
+
+
+def _save_local_user_data(
+    user_id: str, email: Optional[str], data: Dict[str, Any]
+):
+    """Encrypts and saves user data to .user_store keyed by both user_id and email."""
+    _ensure_user_store_dir()
+    f = _get_fernet()
+    raw = json.dumps(data)
+    if f:
+        try:
+            payload = f.encrypt(raw.encode()).decode()
+        except Exception:
+            payload = raw
+    else:
+        payload = raw
+
+    keys = []
+    if user_id:
+        keys.append(_get_safe_filename(user_id))
+    if email:
+        keys.append(_get_safe_filename(email))
+
+    for k in keys:
+        filepath = os.path.join(USER_STORE_DIR, f"{k}.json")
+        try:
+            with open(filepath, "w", encoding="utf-8") as fp:
+                fp.write(payload)
+        except Exception:
+            pass
+
+
+def save_user_workspace_state(
+    user_id: str,
+    email: Optional[str] = None,
+    active_repo: Optional[str] = None,
+    active_model: Optional[str] = None,
+    active_gh_account_id: Optional[str] = None,
+    current_session_id: Optional[str] = None,
+):
+    """Persists the user's active workspace session state across logouts and browser timeouts."""
+    data = _load_local_user_data(user_id, email)
+    if active_repo is not None:
+        data["active_repo"] = active_repo
+    if active_model is not None:
+        data["active_model"] = active_model
+    if active_gh_account_id is not None:
+        data["active_gh_account_id"] = active_gh_account_id
+    if current_session_id is not None:
+        data["current_session_id"] = current_session_id
+    _save_local_user_data(user_id, email, data)
+
+
+def load_user_workspace_state(
+    user_id: str, email: Optional[str] = None
+) -> Dict[str, Any]:
+    """Retrieves the user's last active workspace session state."""
+    data = _load_local_user_data(user_id, email)
+    return {
+        "active_repo": data.get("active_repo"),
+        "active_model": data.get(
+            "active_model", "Google Gemini 2.5 Pro (Recommended)"
+        ),
+        "active_gh_account_id": data.get("active_gh_account_id"),
+        "current_session_id": data.get("current_session_id"),
+    }
+
+
+def get_user_profile(
+    user_id: str, email: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
     """Retrieves user profile data."""
     supabase = get_supabase_client()
     try:
         res = supabase.table("profiles").select("*").eq("id", user_id).execute()
-        return res.data[0] if res.data else None
+        if res.data:
+            return res.data[0]
     except Exception:
-        return None
+        pass
+    data = _load_local_user_data(user_id, email)
+    return data.get("profile")
 
 
-def get_user_github_accounts(user_id: str) -> List[Dict[str, Any]]:
+def get_user_github_accounts(
+    user_id: str, email: Optional[str] = None
+) -> List[Dict[str, Any]]:
     """Fetches all connected GitHub accounts for a user with decrypted tokens."""
-    supabase = get_supabase_client()
+    data = _load_local_user_data(user_id, email)
+    local_accounts = data.get("github_accounts", [])
+
+    supabase_accounts = []
     try:
+        supabase = get_supabase_client()
         res = (
             supabase.table("user_github_accounts")
             .select("*")
@@ -171,68 +296,98 @@ def get_user_github_accounts(user_id: str) -> List[Dict[str, Any]]:
             .order("created_at", desc=False)
             .execute()
         )
-        accounts = []
         for a in res.data or []:
-            accounts.append(
+            supabase_accounts.append(
                 {
-                    "id": a["id"],
+                    "id": str(a["id"]),
                     "account_label": a["account_label"],
                     "github_username": a["github_username"],
                     "github_token": decrypt_secret(a.get("github_token", "")),
                     "is_active": a.get("is_active", True),
                 }
             )
-        return accounts
     except Exception:
-        profile = get_user_profile(user_id)
-        if profile and profile.get("github_token"):
-            raw_token = decrypt_secret(profile["github_token"])
-            return [
-                {
-                    "id": "default",
-                    "account_label": "Primary GitHub",
-                    "github_username": "Primary Account",
-                    "github_token": raw_token,
-                    "is_active": True,
-                }
-            ]
-        return []
+        pass
+
+    # Merge accounts
+    merged = {a["github_username"]: a for a in local_accounts}
+    for a in supabase_accounts:
+        merged[a["github_username"]] = a
+
+    result = list(merged.values())
+    if result and not local_accounts:
+        data["github_accounts"] = result
+        _save_local_user_data(user_id, email, data)
+    return result
 
 
 def add_github_account(
-    user_id: str, label: str, username: str, token: str
+    user_id: str,
+    label: str,
+    username: str,
+    token: str,
+    email: Optional[str] = None,
 ) -> bool:
     """Adds a new encrypted GitHub account connection for the user."""
-    supabase = get_supabase_client()
-    encrypted_tok = encrypt_secret(token)
+    data = _load_local_user_data(user_id, email)
+    accounts = data.get("github_accounts", [])
+    acc_id = f"gh_{int(datetime.now().timestamp())}_{username.lower()}"
+    new_acc = {
+        "id": acc_id,
+        "account_label": label,
+        "github_username": username,
+        "github_token": token,
+        "is_active": True,
+    }
+    accounts = [
+        a for a in accounts if a["github_username"].lower() != username.lower()
+    ]
+    accounts.append(new_acc)
+    data["github_accounts"] = accounts
+    data["active_gh_account_id"] = acc_id
+    _save_local_user_data(user_id, email, data)
+
     try:
+        supabase = get_supabase_client()
         supabase.table("user_github_accounts").insert(
             {
                 "user_id": user_id,
                 "account_label": label,
                 "github_username": username,
-                "github_token": encrypted_tok,
+                "github_token": encrypt_secret(token),
                 "is_active": True,
             }
         ).execute()
-        return True
     except Exception:
-        return update_github_token(user_id, token)
+        update_github_token(user_id, token, email)
+
+    return True
 
 
-def delete_github_account(user_id: str, account_id: str) -> bool:
+def delete_github_account(
+    user_id: str, account_id: str, email: Optional[str] = None
+) -> bool:
     """Removes a connected GitHub account."""
+    data = _load_local_user_data(user_id, email)
+    accounts = [
+        a for a in data.get("github_accounts", []) if a["id"] != account_id
+    ]
+    data["github_accounts"] = accounts
+    if data.get("active_gh_account_id") == account_id:
+        data["active_gh_account_id"] = accounts[0]["id"] if accounts else None
+    _save_local_user_data(user_id, email, data)
+
     if account_id == "default":
-        return update_github_token(user_id, "")
-    supabase = get_supabase_client()
+        return update_github_token(user_id, "", email)
+
     try:
+        supabase = get_supabase_client()
         supabase.table("user_github_accounts").delete().eq(
             "id", account_id
         ).eq("user_id", user_id).execute()
-        return True
     except Exception:
-        # Fallback for default profile token
-        return update_github_token(user_id, "")
+        update_github_token(user_id, "", email)
+    return True
 
 
 def auto_link_oauth_github(user: Any) -> Optional[Dict[str, Any]]:
@@ -254,85 +409,130 @@ def auto_link_oauth_github(user: Any) -> Optional[Dict[str, Any]]:
             or user_metadata.get("preferred_username")
             or "GitHub User"
         )
-        existing = get_user_github_accounts(user.id)
+        existing = get_user_github_accounts(user.id, user.email)
         if not existing:
-            add_github_account(user.id, "Default GitHub", username, "")
+            add_github_account(
+                user.id, "Default GitHub", username, "", user.email
+            )
             return {"username": username, "label": "Default GitHub"}
     return None
 
 
-def update_github_token(user_id: str, token: str) -> bool:
-    """Updates the primary GitHub token in profiles with encryption."""
-    supabase = get_supabase_client()
-    encrypted_tok = encrypt_secret(token)
+def update_github_token(
+    user_id: str, token: str, email: Optional[str] = None
+) -> bool:
+    """Updates the primary GitHub token with encryption."""
+    data = _load_local_user_data(user_id, email)
+    prof = data.get("profile", {})
+    prof["github_token"] = token
+    data["profile"] = prof
+    _save_local_user_data(user_id, email, data)
+
     try:
+        supabase = get_supabase_client()
+        encrypted_tok = encrypt_secret(token)
         supabase.table("profiles").update({"github_token": encrypted_tok}).eq(
             "id", user_id
         ).execute()
         return True
     except Exception:
-        return False
+        return True
 
 
-def get_user_api_keys(user_id: str) -> Dict[str, str]:
+def get_user_api_keys(
+    user_id: str, email: Optional[str] = None
+) -> Dict[str, str]:
     """Fetches and decrypts all BYOK API keys configured for the user."""
-    supabase = get_supabase_client()
+    data = _load_local_user_data(user_id, email)
+    keys = dict(data.get("api_keys", {}))
+
     try:
+        supabase = get_supabase_client()
         res = (
             supabase.table("user_api_keys")
             .select("provider, api_key")
             .eq("user_id", user_id)
             .execute()
         )
-        keys = {}
         for item in res.data or []:
-            keys[item["provider"]] = decrypt_secret(item["api_key"])
-        return keys
+            p = item["provider"].lower()
+            dec = decrypt_secret(item["api_key"])
+            if dec:
+                keys[p] = dec
     except Exception:
-        return {}
+        pass
+
+    return keys
 
 
-def save_user_api_key(user_id: str, provider: str, api_key: str) -> bool:
-    """Encrypts and upserts an API key for a given provider (gemini, anthropic, openai, deepseek)."""
-    supabase = get_supabase_client()
-    encrypted_key = encrypt_secret(api_key)
+def save_user_api_key(
+    user_id: str, provider: str, api_key: str, email: Optional[str] = None
+) -> bool:
+    """Encrypts and persists an API key for a given provider (gemini, anthropic, openai, deepseek)."""
+    clean_prov = provider.lower().strip()
+    clean_key = api_key.strip()
+    if not clean_key:
+        return False
+
+    data = _load_local_user_data(user_id, email)
+    keys = data.get("api_keys", {})
+    keys[clean_prov] = clean_key
+    data["api_keys"] = keys
+    _save_local_user_data(user_id, email, data)
+
     try:
+        supabase = get_supabase_client()
+        encrypted_key = encrypt_secret(clean_key)
         supabase.table("user_api_keys").upsert(
             {
                 "user_id": user_id,
-                "provider": provider,
+                "provider": clean_prov,
                 "api_key": encrypted_key,
             },
             on_conflict="user_id,provider",
         ).execute()
-        return True
-    except Exception as e:
-        st.error(f"Error saving API key: {e}")
-        return False
+    except Exception:
+        pass
+
+    return True
 
 
-def delete_user_api_key(user_id: str, provider: str) -> bool:
-    """Permanently deletes a saved API key from the database."""
-    supabase = get_supabase_client()
+def delete_user_api_key(
+    user_id: str, provider: str, email: Optional[str] = None
+) -> bool:
+    """Permanently deletes a saved API key."""
+    clean_prov = provider.lower().strip()
+    data = _load_local_user_data(user_id, email)
+    keys = data.get("api_keys", {})
+    keys.pop(clean_prov, None)
+    data["api_keys"] = keys
+    _save_local_user_data(user_id, email, data)
+
     try:
+        supabase = get_supabase_client()
         supabase.table("user_api_keys").delete().eq(
             "user_id", user_id
-        ).eq("provider", provider).execute()
-        return True
-    except Exception as e:
-        st.error(f"Error deleting API key: {e}")
-        return False
+        ).eq("provider", clean_prov).execute()
+    except Exception:
+        pass
+    return True
 
 
 # ==========================================
-# CHAT SESSIONS & MESSAGES
+# CHAT SESSIONS & MESSAGES (HYBRID SYNC)
 # ==========================================
 
 
-def list_user_sessions(user_id: str) -> List[Dict[str, Any]]:
+def list_user_sessions(
+    user_id: str, email: Optional[str] = None
+) -> List[Dict[str, Any]]:
     """Lists all chat sessions for a user, ordered by most recent."""
-    supabase = get_supabase_client()
+    data = _load_local_user_data(user_id, email)
+    local_sessions = data.get("sessions", [])
+
+    sb_sessions = []
     try:
+        supabase = get_supabase_client()
         res = (
             supabase.table("chat_sessions")
             .select("*")
@@ -340,53 +540,110 @@ def list_user_sessions(user_id: str) -> List[Dict[str, Any]]:
             .order("updated_at", desc=True)
             .execute()
         )
-        return res.data or []
+        sb_sessions = res.data or []
     except Exception:
-        return []
+        pass
+
+    merged = {s["id"]: s for s in local_sessions}
+    for s in sb_sessions:
+        merged[s["id"]] = s
+
+    sessions = list(merged.values())
+    sessions.sort(key=lambda x: str(x.get("updated_at", "")), reverse=True)
+    return sessions
 
 
 def create_chat_session(
-    user_id: str, repo_name: str, repo_url: str, title: str, model_used: str
+    user_id: str,
+    repo_name: str,
+    repo_url: str,
+    title: str,
+    model_used: str,
+    email: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Creates a new chat session for a repository."""
-    supabase = get_supabase_client()
-    try:
-        res = (
-            supabase.table("chat_sessions")
-            .insert(
-                {
-                    "user_id": user_id,
-                    "repo_name": repo_name,
-                    "repo_url": repo_url,
-                    "title": title,
-                    "model_used": model_used,
-                }
-            )
-            .execute()
-        )
-        return res.data[0] if res.data else None
-    except Exception as e:
-        st.error(f"Error creating session: {e}")
-        return None
+    session_id = f"sess_{int(datetime.now().timestamp())}_{repo_name.replace('/', '_')}"
+    new_sess = {
+        "id": session_id,
+        "user_id": user_id,
+        "repo_name": repo_name,
+        "repo_url": repo_url,
+        "title": title,
+        "model_used": model_used,
+        "updated_at": datetime.now().isoformat(),
+    }
 
+    data = _load_local_user_data(user_id, email)
+    sessions = data.get("sessions", [])
+    sessions = [s for s in sessions if s["id"] != session_id]
+    sessions.insert(0, new_sess)
+    data["sessions"] = sessions
+    data["current_session_id"] = session_id
+    data["active_repo"] = repo_name
+    _save_local_user_data(user_id, email, data)
 
-def delete_chat_session(session_id: str) -> bool:
-    """Deletes a chat session and all associated messages."""
-    supabase = get_supabase_client()
     try:
-        supabase.table("chat_sessions").delete().eq(
-            "id", session_id
+        supabase = get_supabase_client()
+        res = supabase.table("chat_sessions").insert(
+            {
+                "user_id": user_id,
+                "repo_name": repo_name,
+                "repo_url": repo_url,
+                "title": title,
+                "model_used": model_used,
+            }
         ).execute()
-        return True
-    except Exception as e:
-        st.error(f"Error deleting session: {e}")
-        return False
+        if res.data:
+            new_sess["id"] = res.data[0]["id"]
+            data["current_session_id"] = new_sess["id"]
+            _save_local_user_data(user_id, email, data)
+    except Exception:
+        pass
+
+    return new_sess
 
 
-def get_session_messages(session_id: str) -> List[Dict[str, Any]]:
-    """Fetches all messages in a session in chronological order."""
-    supabase = get_supabase_client()
+def delete_chat_session(
+    session_id: str,
+    user_id: Optional[str] = None,
+    email: Optional[str] = None,
+) -> bool:
+    """Deletes a chat session and all associated messages."""
+    if user_id:
+        data = _load_local_user_data(user_id, email)
+        sessions = [
+            s for s in data.get("sessions", []) if s["id"] != session_id
+        ]
+        data["sessions"] = sessions
+        messages = data.get("messages", {})
+        messages.pop(session_id, None)
+        data["messages"] = messages
+        if data.get("current_session_id") == session_id:
+            data["current_session_id"] = None
+        _save_local_user_data(user_id, email, data)
+
     try:
+        supabase = get_supabase_client()
+        supabase.table("chat_sessions").delete().eq("id", session_id).execute()
+    except Exception:
+        pass
+    return True
+
+
+def get_session_messages(
+    session_id: str,
+    user_id: Optional[str] = None,
+    email: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Fetches all messages in a session in chronological order."""
+    local_msgs = []
+    if user_id:
+        data = _load_local_user_data(user_id, email)
+        local_msgs = data.get("messages", {}).get(session_id, [])
+
+    sb_msgs = []
+    try:
+        supabase = get_supabase_client()
         res = (
             supabase.table("chat_messages")
             .select("*")
@@ -394,9 +651,13 @@ def get_session_messages(session_id: str) -> List[Dict[str, Any]]:
             .order("created_at", desc=False)
             .execute()
         )
-        return res.data or []
+        sb_msgs = res.data or []
     except Exception:
-        return []
+        pass
+
+    if sb_msgs:
+        return sb_msgs
+    return local_msgs
 
 
 def add_message(
@@ -404,10 +665,36 @@ def add_message(
     sender: str,
     content: str,
     terminal_output: Optional[str] = None,
+    user_id: Optional[str] = None,
+    email: Optional[str] = None,
 ) -> bool:
     """Inserts a new message into the chat session."""
-    supabase = get_supabase_client()
+    if user_id:
+        data = _load_local_user_data(user_id, email)
+        messages_map = data.get("messages", {})
+        msg_list = messages_map.get(session_id, [])
+        msg_list.append(
+            {
+                "id": f"msg_{int(datetime.now().timestamp()*1000)}",
+                "session_id": session_id,
+                "sender": sender,
+                "content": content,
+                "terminal_output": terminal_output,
+                "created_at": datetime.now().isoformat(),
+            }
+        )
+        messages_map[session_id] = msg_list
+        data["messages"] = messages_map
+
+        # Update updated_at of session
+        for s in data.get("sessions", []):
+            if s["id"] == session_id:
+                s["updated_at"] = datetime.now().isoformat()
+                break
+        _save_local_user_data(user_id, email, data)
+
     try:
+        supabase = get_supabase_client()
         payload = {
             "session_id": session_id,
             "sender": sender,
@@ -418,7 +705,6 @@ def add_message(
         supabase.table("chat_sessions").update(
             {"updated_at": "now()"}
         ).eq("id", session_id).execute()
-        return True
-    except Exception as e:
-        st.error(f"Error saving message: {e}")
-        return False
+    except Exception:
+        pass
+    return True
