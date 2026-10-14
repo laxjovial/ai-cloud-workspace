@@ -5,3 +5,4 @@ litellm>=1.40.0
 PyGithub>=2.3.0
 pydantic>=2.7.0
 python-dotenv>=1.0.0
+cryptography>=42.0.0

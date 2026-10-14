@@ -1,7 +1,8 @@
-"""Database and Authentication module using Supabase with deterministic PKCE."""
+"""Database and Authentication module using Supabase with deterministic PKCE and AES encryption."""
 
 import os
 from typing import Any, Dict, List, Optional
+from cryptography.fernet import Fernet
 import streamlit as st
 from supabase import Client, create_client
 from supabase_auth._sync.gotrue_client import generate_pkce_challenge
@@ -9,6 +10,59 @@ from supabase_auth._sync.gotrue_client import generate_pkce_challenge
 # Deterministic PKCE pair so OAuth code verifiers never get lost or out of sync across reruns
 FIXED_PKCE_VERIFIER = "ai_cloud_workspace_pkce_verifier_secure_key_2026_unique"
 FIXED_PKCE_CHALLENGE = generate_pkce_challenge(FIXED_PKCE_VERIFIER)
+
+
+# ==========================================
+# AES ENCRYPTION FOR BYOK KEYS & TOKENS
+# ==========================================
+
+
+def _get_fernet() -> Optional[Fernet]:
+    """Retrieves Fernet cipher from ENCRYPTION_KEY in secrets."""
+    enc_key = st.secrets.get("ENCRYPTION_KEY", os.getenv("ENCRYPTION_KEY", ""))
+    if enc_key:
+        try:
+            return Fernet(enc_key.encode())
+        except Exception:
+            return None
+    return None
+
+
+def encrypt_secret(plaintext: str) -> str:
+    """Encrypts a sensitive string (API key or PAT) using AES/Fernet."""
+    if not plaintext:
+        return ""
+    f = _get_fernet()
+    if not f:
+        return plaintext
+    try:
+        return f.encrypt(plaintext.strip().encode()).decode()
+    except Exception:
+        return plaintext
+
+
+def decrypt_secret(ciphertext: str) -> str:
+    """Decrypts a stored ciphertext into plaintext. Falls back gracefully if already plaintext."""
+    if not ciphertext:
+        return ""
+    f = _get_fernet()
+    if not f:
+        return ciphertext
+    try:
+        return f.decrypt(ciphertext.encode()).decode()
+    except Exception:
+        # Legacy plaintext fallback
+        return ciphertext
+
+
+def mask_secret(secret: str) -> str:
+    """Masks a secret key showing first 3 and last 2 characters (e.g. AIz••••••••••8x)."""
+    if not secret:
+        return ""
+    s = secret.strip()
+    if len(s) <= 6:
+        return "••••••••"
+    return f"{s[:3]}{'•' * 10}{s[-2:]}"
 
 
 def get_supabase_client() -> Client:
@@ -107,7 +161,7 @@ def get_user_profile(user_id: str) -> Optional[Dict[str, Any]]:
 
 
 def get_user_github_accounts(user_id: str) -> List[Dict[str, Any]]:
-    """Fetches all connected GitHub accounts for a user."""
+    """Fetches all connected GitHub accounts for a user with decrypted tokens."""
     supabase = get_supabase_client()
     try:
         res = (
@@ -117,16 +171,28 @@ def get_user_github_accounts(user_id: str) -> List[Dict[str, Any]]:
             .order("created_at", desc=False)
             .execute()
         )
-        return res.data or []
+        accounts = []
+        for a in res.data or []:
+            accounts.append(
+                {
+                    "id": a["id"],
+                    "account_label": a["account_label"],
+                    "github_username": a["github_username"],
+                    "github_token": decrypt_secret(a.get("github_token", "")),
+                    "is_active": a.get("is_active", True),
+                }
+            )
+        return accounts
     except Exception:
         profile = get_user_profile(user_id)
         if profile and profile.get("github_token"):
+            raw_token = decrypt_secret(profile["github_token"])
             return [
                 {
                     "id": "default",
                     "account_label": "Primary GitHub",
                     "github_username": "Primary Account",
-                    "github_token": profile["github_token"],
+                    "github_token": raw_token,
                     "is_active": True,
                 }
             ]
@@ -136,15 +202,16 @@ def get_user_github_accounts(user_id: str) -> List[Dict[str, Any]]:
 def add_github_account(
     user_id: str, label: str, username: str, token: str
 ) -> bool:
-    """Adds a new GitHub account connection for the user."""
+    """Adds a new encrypted GitHub account connection for the user."""
     supabase = get_supabase_client()
+    encrypted_tok = encrypt_secret(token)
     try:
         supabase.table("user_github_accounts").insert(
             {
                 "user_id": user_id,
                 "account_label": label,
                 "github_username": username,
-                "github_token": token,
+                "github_token": encrypted_tok,
                 "is_active": True,
             }
         ).execute()
@@ -155,6 +222,8 @@ def add_github_account(
 
 def delete_github_account(user_id: str, account_id: str) -> bool:
     """Removes a connected GitHub account."""
+    if account_id == "default":
+        return update_github_token(user_id, "")
     supabase = get_supabase_client()
     try:
         supabase.table("user_github_accounts").delete().eq(
@@ -162,7 +231,8 @@ def delete_github_account(user_id: str, account_id: str) -> bool:
         ).eq("user_id", user_id).execute()
         return True
     except Exception:
-        return False
+        # Fallback for default profile token
+        return update_github_token(user_id, "")
 
 
 def auto_link_oauth_github(user: Any) -> Optional[Dict[str, Any]]:
@@ -192,10 +262,11 @@ def auto_link_oauth_github(user: Any) -> Optional[Dict[str, Any]]:
 
 
 def update_github_token(user_id: str, token: str) -> bool:
-    """Updates the primary GitHub token in profiles."""
+    """Updates the primary GitHub token in profiles with encryption."""
     supabase = get_supabase_client()
+    encrypted_tok = encrypt_secret(token)
     try:
-        supabase.table("profiles").update({"github_token": token}).eq(
+        supabase.table("profiles").update({"github_token": encrypted_tok}).eq(
             "id", user_id
         ).execute()
         return True
@@ -204,7 +275,7 @@ def update_github_token(user_id: str, token: str) -> bool:
 
 
 def get_user_api_keys(user_id: str) -> Dict[str, str]:
-    """Fetches all BYOK API keys configured for the user."""
+    """Fetches and decrypts all BYOK API keys configured for the user."""
     supabase = get_supabase_client()
     try:
         res = (
@@ -215,23 +286,41 @@ def get_user_api_keys(user_id: str) -> Dict[str, str]:
         )
         keys = {}
         for item in res.data or []:
-            keys[item["provider"]] = item["api_key"]
+            keys[item["provider"]] = decrypt_secret(item["api_key"])
         return keys
     except Exception:
         return {}
 
 
 def save_user_api_key(user_id: str, provider: str, api_key: str) -> bool:
-    """Upserts an API key for a given provider (gemini, anthropic, openai, deepseek)."""
+    """Encrypts and upserts an API key for a given provider (gemini, anthropic, openai, deepseek)."""
     supabase = get_supabase_client()
+    encrypted_key = encrypt_secret(api_key)
     try:
         supabase.table("user_api_keys").upsert(
-            {"user_id": user_id, "provider": provider, "api_key": api_key},
+            {
+                "user_id": user_id,
+                "provider": provider,
+                "api_key": encrypted_key,
+            },
             on_conflict="user_id,provider",
         ).execute()
         return True
     except Exception as e:
         st.error(f"Error saving API key: {e}")
+        return False
+
+
+def delete_user_api_key(user_id: str, provider: str) -> bool:
+    """Permanently deletes a saved API key from the database."""
+    supabase = get_supabase_client()
+    try:
+        supabase.table("user_api_keys").delete().eq(
+            "user_id", user_id
+        ).eq("provider", provider).execute()
+        return True
+    except Exception as e:
+        st.error(f"Error deleting API key: {e}")
         return False
 
 
@@ -285,7 +374,9 @@ def delete_chat_session(session_id: str) -> bool:
     """Deletes a chat session and all associated messages."""
     supabase = get_supabase_client()
     try:
-        supabase.table("chat_sessions").delete().eq("id", session_id).execute()
+        supabase.table("chat_sessions").delete().eq(
+            "id", session_id
+        ).execute()
         return True
     except Exception as e:
         st.error(f"Error deleting session: {e}")

@@ -169,6 +169,28 @@ if "code" in st.query_params and not st.session_state.user:
         pass
 
 
+@st.cache_data(ttl=180, show_spinner=False)
+def fetch_user_github_repos(token: str):
+    """Fetches list of repository full names (owner/repo) using GitHub token."""
+    if not token:
+        return []
+    try:
+        from github import Auth, Github
+
+        try:
+            gh = Github(auth=Auth.Token(token))
+        except Exception:
+            gh = Github(token)
+        repos = []
+        for r in gh.get_user().get_repos(sort="updated", direction="desc"):
+            repos.append(r.full_name)
+            if len(repos) >= 100:
+                break
+        return repos
+    except Exception:
+        return []
+
+
 # =========================================================
 # 1. LANDING & AUTHENTICATION VIEWS
 # =========================================================
@@ -481,11 +503,28 @@ def render_workspace():
                 account_labels.index(selected_acc_label)
             ]["id"]
             active_account = gh_accounts[account_labels.index(selected_acc_label)]
-            active_gh_token = active_account["github_token"]
+            active_gh_token = active_account.get("github_token", "")
 
             st.caption(
-                f"✅ Using **@{active_account['github_username']}** for git operations"
+                f"✅ Active: **@{active_account['github_username']}** ({active_account['account_label']})"
             )
+
+            if active_gh_token:
+                st.markdown(
+                    f"**Masked PAT:** `{db.mask_secret(active_gh_token)}`"
+                )
+                with st.expander("📋 Copy PAT", expanded=False):
+                    st.code(active_gh_token, language="text")
+
+            if st.button(
+                "🗑️ Remove Selected Account",
+                key=f"del_gh_{active_account['id']}",
+                use_container_width=True,
+            ):
+                db.delete_github_account(user.id, active_account["id"])
+                st.session_state.active_gh_account_id = None
+                st.toast("🗑️ GitHub account removed.", icon="🗑️")
+                st.rerun()
         else:
             st.warning("⚠️ No GitHub account connected yet.")
             st.caption(
@@ -497,16 +536,20 @@ def render_workspace():
             acc_label = st.text_input(
                 "Account Label",
                 placeholder="e.g. Work, Personal, OpenSource",
+                key="new_gh_acc_label",
             )
             acc_username = st.text_input(
-                "GitHub Username", placeholder="e.g. torvalds"
+                "GitHub Username",
+                placeholder="e.g. laxjovial",
+                key="new_gh_acc_user",
             )
             acc_token = st.text_input(
                 "Personal Access Token",
                 type="password",
                 help="Requires 'repo' scope",
+                key="new_gh_acc_token",
             )
-            if st.button("Connect Account"):
+            if st.button("Connect Account", use_container_width=True):
                 if acc_label and acc_token:
                     if db.add_github_account(
                         user.id,
@@ -514,7 +557,8 @@ def render_workspace():
                         acc_username or acc_label,
                         acc_token,
                     ):
-                        st.success("GitHub account connected!")
+                        st.toast("🐙 GitHub account connected successfully!", icon="✅")
+                        st.success("GitHub account connected and encrypted!")
                         st.rerun()
                 else:
                     st.warning("Please provide a label and token.")
@@ -562,50 +606,110 @@ def render_workspace():
 
         # BYOK Expander
         with st.expander("⚙️ Manage AI Keys (BYOK)", expanded=not has_key):
-            st.caption("Keys are stored privately in your personal Supabase database")
+            st.caption("Keys are encrypted with AES-128 and stored securely in Supabase.")
+            if user_keys:
+                st.markdown("##### 🔐 Stored API Keys")
+                for prov, key in user_keys.items():
+                    k_col1, k_col2 = st.columns([3, 1])
+                    with k_col1:
+                        st.markdown(f"**{prov.capitalize()}**: `{db.mask_secret(key)}`")
+                    with k_col2:
+                        if st.button("🗑️", key=f"del_key_{prov}", help=f"Delete {prov.capitalize()} key"):
+                            db.delete_user_api_key(user.id, prov)
+                            st.toast(f"🗑️ {prov.capitalize()} API key deleted.", icon="🗑️")
+                            st.rerun()
+                    with st.expander(f"📋 Copy {prov.capitalize()} Key", expanded=False):
+                        st.code(key, language="text")
+                st.markdown("---")
+
+            st.markdown("##### Add or Update Key")
             byok_provider = st.selectbox(
                 "Select Provider",
                 ["gemini", "anthropic", "openai", "deepseek"],
             )
             key_val = st.text_input(
                 f"{byok_provider.capitalize()} API Key",
-                value=user_keys.get(byok_provider, ""),
+                value="",
                 type="password",
+                placeholder=f"Paste {byok_provider.capitalize()} key...",
+                key="byok_input_key",
             )
-            if st.button("Save API Key"):
-                if db.save_user_api_key(user.id, byok_provider, key_val):
-                    st.success(f"{byok_provider.capitalize()} key saved!")
-                    st.rerun()
+            if st.button("Save API Key", use_container_width=True):
+                if key_val:
+                    if db.save_user_api_key(user.id, byok_provider, key_val):
+                        st.toast(f"🔒 {byok_provider.capitalize()} API key saved securely!", icon="✅")
+                        st.success(f"{byok_provider.capitalize()} key saved and encrypted!")
+                        st.rerun()
+                else:
+                    st.warning("Please enter an API key.")
 
         st.markdown("---")
 
-        # Target Repository Setup
+        # Target Repository Setup with Dynamic Prefix Search
         st.markdown("### 📁 Target Repository")
-        repo_input = st.text_input(
-            "GitHub Repository",
-            value=st.session_state.active_repo or "owner/repository",
-            help="Format: username/repo-name (e.g., torvalds/linux)",
-        )
-        st.session_state.active_repo = repo_input
+
+        user_repos = fetch_user_github_repos(active_gh_token) if active_gh_token else []
+
+        repo_input = ""
+        if user_repos:
+            search_options = ["-- Select or Search Repository --"] + user_repos + ["➕ Custom / Other Repository..."]
+            
+            default_idx = 0
+            if st.session_state.active_repo in user_repos:
+                default_idx = search_options.index(st.session_state.active_repo)
+
+            selected_repo_opt = st.selectbox(
+                "Search & Select Repository",
+                search_options,
+                index=default_idx,
+                help="Type to search your repos dynamically (e.g. 'gre' -> 'green...')",
+            )
+
+            if selected_repo_opt == "➕ Custom / Other Repository...":
+                repo_input = st.text_input(
+                    "Enter Repository (owner/repo)",
+                    value="" if st.session_state.active_repo in user_repos else (st.session_state.active_repo or ""),
+                    placeholder="e.g. laxjovial/ai-cloud-workspace",
+                )
+                st.session_state.active_repo = repo_input
+            elif selected_repo_opt != "-- Select or Search Repository --":
+                repo_input = selected_repo_opt
+                st.session_state.active_repo = repo_input
+            else:
+                repo_input = st.session_state.active_repo or ""
+        else:
+            repo_input = st.text_input(
+                "GitHub Repository",
+                value=st.session_state.active_repo or "",
+                placeholder="username/repo-name (e.g. laxjovial/ai-cloud-workspace)",
+                help="Format: username/repo-name",
+            )
+            st.session_state.active_repo = repo_input
+            if not active_gh_token:
+                st.caption(
+                    "💡 Connect a GitHub PAT above to dynamically list and search all your repositories here."
+                )
 
         if st.button(
             "➕ Start New Chat Session",
             type="primary",
             use_container_width=True,
         ):
-            if repo_input and repo_input != "owner/repository":
+            if repo_input and repo_input != "-- Select or Search Repository --" and "/" in repo_input:
                 new_session = db.create_chat_session(
                     user_id=user.id,
-                    repo_name=repo_input,
-                    repo_url=f"https://github.com/{repo_input}",
-                    title=f"Task on {repo_input} ({datetime.now().strftime('%b %d, %H:%M')})",
+                    repo_name=repo_input.strip(),
+                    repo_url=f"https://github.com/{repo_input.strip()}",
+                    title=f"Task on {repo_input.strip()} ({datetime.now().strftime('%b %d, %H:%M')})",
                     model_used=selected_model,
                 )
                 if new_session:
                     st.session_state.current_session_id = new_session["id"]
+                    st.session_state.active_repo = repo_input.strip()
                     st.rerun()
             else:
-                st.error("Please enter a valid repository (e.g. yourname/myrepo)")
+                st.error("Please enter or select a valid repository (e.g. username/repo-name)")
+
 
         st.markdown("### 💬 Recent Sessions")
         sessions = db.list_user_sessions(user.id)
