@@ -1,0 +1,27 @@
+# Secrets and Credentials (NEVER COMMIT)
+.streamlit/secrets.toml
+.oauth_states.json
+*.env
+.env*
+
+# Virtual Environment
+.venv/
+env/
+venv/
+ENV/
+
+# Python Cache & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Distribution / Packaging / Wheels
+*.whl
+*.egg-info/
+dist/
+build/
+
+# Logs & Temporary files
+*.log
+.DS_Store
