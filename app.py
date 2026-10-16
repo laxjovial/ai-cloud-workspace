@@ -517,13 +517,18 @@ def render_workspace():
     model_groups = {
         "Google Gemini 2.5 Pro (Recommended)": "gemini/gemini-2.5-pro",
         "Google Gemini 2.5 Flash (Fast)": "gemini/gemini-2.5-flash",
-        "Google Gemini 1.5 Pro": "gemini/gemini-1.5-pro-latest",
-        "Anthropic Claude 3.7 Sonnet": "anthropic/claude-3-7-sonnet-20250219",
+        "Google Gemini 2.0 Flash": "gemini/gemini-2.0-flash",
+        "Google Gemini 2.0 Flash Thinking": "gemini/gemini-2.0-flash-thinking-exp",
+        "Google Gemini 1.5 Pro": "gemini/gemini-1.5-pro",
+        "Google Gemini 1.5 Flash": "gemini/gemini-1.5-flash",
+        "Anthropic Claude 3.7 Sonnet (Hybrid Thinking)": "anthropic/claude-3-7-sonnet-20250219",
+        "Anthropic Claude 3.5 Sonnet": "anthropic/claude-3-5-sonnet-20241022",
         "Anthropic Claude 3.5 Haiku": "anthropic/claude-3-5-haiku-20241022",
         "OpenAI GPT-4o": "openai/gpt-4o",
         "OpenAI GPT-4o Mini": "openai/gpt-4o-mini",
-        "DeepSeek Chat (V3)": "deepseek/deepseek-chat",
+        "OpenAI o3-mini (Reasoning)": "openai/o3-mini",
         "DeepSeek Reasoner (R1)": "deepseek/deepseek-reasoner",
+        "DeepSeek Chat (V3)": "deepseek/deepseek-chat",
     }
 
     if st.session_state.get("selected_model_label") not in model_groups:
@@ -536,6 +541,11 @@ def render_workspace():
         selected_model.split("/")[0] if "/" in selected_model else "gemini"
     )
 
+    def switch_view(nav_target: str):
+        """Cleanly switches views and synchronizes top navigation state."""
+        st.session_state.top_nav = nav_target
+        st.session_state.top_nav_bar_radio = nav_target
+
     # ------------------------------------------------------
     # TOP NAVIGATION BAR (Instant switching between views)
     # ------------------------------------------------------
@@ -546,6 +556,11 @@ def render_workspace():
         "📁 Repos & Sessions",
         "👤 Profile & Settings",
     ]
+
+    # Keep radio state in sync before rendering widget
+    if "top_nav" in st.session_state:
+        if st.session_state.get("top_nav_bar_radio") != st.session_state.top_nav:
+            st.session_state.top_nav_bar_radio = st.session_state.top_nav
 
     cur_idx = (
         nav_options.index(st.session_state.top_nav)
@@ -584,7 +599,7 @@ def render_workspace():
         key="top_nav_bar_radio",
     )
     if selected_nav != st.session_state.top_nav:
-        st.session_state.top_nav = selected_nav
+        switch_view(selected_nav)
         st.rerun()
 
     # ------------------------------------------------------
@@ -619,7 +634,7 @@ def render_workspace():
                 key=f"side_nav_{nav_item}",
                 use_container_width=True,
             ):
-                st.session_state.top_nav = nav_item
+                switch_view(nav_item)
                 st.rerun()
 
         st.markdown("---")
@@ -654,6 +669,9 @@ def render_workspace():
         st.caption(
             "Connect multiple personal or work GitHub accounts. Personal Access Tokens (PATs) are verified with GitHub and encrypted with AES-128."
         )
+
+        if "gh_alert" in st.session_state:
+            st.success(st.session_state.pop("gh_alert"))
 
         if gh_accounts:
             st.markdown("#### Linked Accounts")
@@ -731,7 +749,7 @@ def render_workspace():
                                 key=f"btn_repos_{acc['id']}",
                                 use_container_width=True,
                             ):
-                                st.session_state.top_nav = "📁 Repos & Sessions"
+                                switch_view("📁 Repos & Sessions")
                                 st.rerun()
                     with col_c:
                         if st.button(
@@ -745,7 +763,7 @@ def render_workspace():
                             if st.session_state.active_gh_account_id == acc["id"]:
                                 st.session_state.active_gh_account_id = None
                             fetch_user_github_repos.clear()
-                            st.toast("🗑️ GitHub account removed.", icon="🗑️")
+                            st.session_state["gh_alert"] = f"🗑️ GitHub account @{acc['github_username']} removed."
                             st.rerun()
                 else:
                     # Account exists but has no PAT attached yet
@@ -775,10 +793,21 @@ def render_workspace():
                             if v["valid"]:
                                 db.attach_pat_to_account(user.id, acc["id"], inline_tok.strip(), user.email)
                                 fetch_user_github_repos.clear()
-                                st.toast(f"🐙 Verified and attached PAT for @{v['login']}!", icon="✅")
+                                st.session_state["gh_alert"] = f"🐙 Verified and attached PAT for @{v['login']}!"
                                 st.rerun()
                             else:
                                 st.error(v["error"])
+
+                    # Allow deleting an unlinked account
+                    del_np_col1, del_np_col2 = st.columns([3, 1])
+                    with del_np_col2:
+                        if st.button("🗑️ Remove Account", key=f"btn_del_no_pat_{acc['id']}", use_container_width=True):
+                            db.delete_github_account(user.id, acc["id"], user.email)
+                            if st.session_state.active_gh_account_id == acc["id"]:
+                                st.session_state.active_gh_account_id = None
+                            fetch_user_github_repos.clear()
+                            st.session_state["gh_alert"] = f"🗑️ GitHub account @{acc['github_username']} removed."
+                            st.rerun()
 
                 st.markdown("---")
         else:
@@ -917,25 +946,56 @@ def render_workspace():
             "Bring Your Own Key (BYOK) for direct provider access with zero markups. All keys are encrypted with AES-128."
         )
 
-        st.markdown("#### 1. Select Active AI Model")
-        selected_model_idx = list(model_groups.keys()).index(
-            selected_model_label
-        )
-        new_model_label = st.selectbox(
-            "Active AI Model",
-            list(model_groups.keys()),
-            index=selected_model_idx,
-            help="Choose the AI engine for code generation, terminal commands, and debugging",
-        )
-        if new_model_label != selected_model_label:
-            st.session_state.selected_model_label = new_model_label
-            db.save_user_workspace_state(
-                user.id, user.email, active_model=new_model_label
+        if "key_alert" in st.session_state:
+            st.success(st.session_state.pop("key_alert"))
+
+        st.markdown("#### 1. Select Active AI Model & Reasoning Effort")
+        m_col1, m_col2 = st.columns([3, 2])
+        with m_col1:
+            selected_model_idx = list(model_groups.keys()).index(
+                selected_model_label
             )
-            st.toast(
-                f"🤖 Switched to {new_model_label.split('(')[0]}!", icon="✅"
+            new_model_label = st.selectbox(
+                "Active AI Model",
+                list(model_groups.keys()),
+                index=selected_model_idx,
+                help="Choose the AI engine for code generation, terminal commands, and debugging",
             )
-            st.rerun()
+            if new_model_label != selected_model_label:
+                st.session_state.selected_model_label = new_model_label
+                db.save_user_workspace_state(
+                    user.id, user.email, active_model=new_model_label
+                )
+                st.toast(
+                    f"🤖 Switched to {new_model_label.split('(')[0]}!", icon="✅"
+                )
+                st.rerun()
+
+        with m_col2:
+            reasoning_levels = [
+                "Auto / Standard",
+                "Low (Fast Thinking)",
+                "Medium (Balanced)",
+                "High (Deep Multi-Step)",
+            ]
+            if "reasoning_effort" not in st.session_state:
+                st.session_state.reasoning_effort = "Auto / Standard"
+
+            cur_re_idx = 0
+            for idx, r_opt in enumerate(reasoning_levels):
+                if st.session_state.reasoning_effort.split(" ")[0].lower() in r_opt.lower():
+                    cur_re_idx = idx
+                    break
+
+            new_re = st.selectbox(
+                "🧠 Reasoning / Thinking Effort",
+                reasoning_levels,
+                index=cur_re_idx,
+                help="Controls thinking budget / reasoning effort for models with reasoning capabilities (Claude 3.7 Sonnet, Gemini 2.5 / 2.0 Thinking, OpenAI o3-mini / o1, DeepSeek R1).",
+            )
+            if new_re != st.session_state.reasoning_effort:
+                st.session_state.reasoning_effort = new_re
+                st.toast(f"🧠 Reasoning effort set to: {new_re}", icon="✅")
 
         cur_prov = model_groups[new_model_label].split("/")[0]
         if user_keys.get(cur_prov):
@@ -992,10 +1052,11 @@ def render_workspace():
                             use_container_width=True,
                         ):
                             db.delete_user_api_key(user.id, p_id, user.email)
-                            st.toast(f"🗑️ {p_title} key deleted.", icon="🗑️")
+                            st.session_state["key_alert"] = f"🗑️ {p_title} API key deleted."
                             st.rerun()
                     with st.expander(f"📋 Copy {p_title} Key"):
                         st.code(stored_key, language="text")
+                        st.caption("Click the copy button on the top right of the code box to copy.")
                 else:
                     st.caption(f"Need a key? [Get {p_title} Key]({p_link})")
 
@@ -1024,10 +1085,7 @@ def render_workspace():
                         key_val_input.strip(),
                         user.email,
                     )
-                    st.toast(
-                        f"🔒 {key_provider.capitalize()} API key saved and encrypted!",
-                        icon="✅",
-                    )
+                    st.session_state["key_alert"] = f"🔒 {key_provider.capitalize()} API key saved and encrypted successfully!"
                     st.rerun()
                 else:
                     st.warning("Please enter a valid API key.")
@@ -1197,7 +1255,7 @@ def render_workspace():
             if new_session:
                 st.session_state.current_session_id = new_session["id"]
                 st.session_state.active_repo = repo_input.strip()
-                st.session_state.top_nav = "💬 Workspace & Chat"
+                switch_view("💬 Workspace & Chat")
                 db.save_user_workspace_state(
                     user.id,
                     user.email,
@@ -1258,7 +1316,7 @@ def render_workspace():
                 ):
                     st.session_state.current_session_id = s["id"]
                     st.session_state.active_repo = s["repo_name"]
-                    st.session_state.top_nav = "💬 Workspace & Chat"
+                    switch_view("💬 Workspace & Chat")
                     db.save_user_workspace_state(
                         user.id,
                         user.email,
@@ -1324,9 +1382,40 @@ def render_workspace():
     elif st.session_state.top_nav == "💬 Workspace & Chat":
         if not st.session_state.current_session_id:
             st.markdown("### ⚡ AI Cloud Workspace Arena")
-            st.info(
-                "👈 No active chat session loaded. Pick a repository below, select one from the **📁 Repos & Sessions** tab, or resume a recent chat!"
-            )
+            if st.session_state.active_repo:
+                st.info(f"📁 Target repository selected: **{st.session_state.active_repo}**")
+                if st.button(
+                    f"💬 Open / Start Chat on {st.session_state.active_repo}",
+                    type="primary",
+                    use_container_width=True,
+                    key="btn_quick_open_active_repo",
+                ):
+                    recent_sessions = db.list_user_sessions(user.id, user.email)
+                    matching = [s for s in recent_sessions if s.get("repo_name") == st.session_state.active_repo]
+                    if matching:
+                        sess_id = matching[0]["id"]
+                    else:
+                        new_s = db.create_chat_session(
+                            user_id=user.id,
+                            repo_name=st.session_state.active_repo,
+                            repo_url=f"https://github.com/{st.session_state.active_repo}",
+                            title=f"Chat on {st.session_state.active_repo}",
+                            model_used=selected_model,
+                            email=user.email,
+                        )
+                        sess_id = new_s["id"]
+                    st.session_state.current_session_id = sess_id
+                    db.save_user_workspace_state(
+                        user.id,
+                        user.email,
+                        active_repo=st.session_state.active_repo,
+                        current_session_id=sess_id,
+                    )
+                    st.rerun()
+            else:
+                st.info(
+                    "👈 No active chat session loaded. Pick a repository below, select one from the **📁 Repos & Sessions** tab, or resume a recent chat!"
+                )
 
             w_col1, w_col2 = st.columns(2)
             with w_col1:
@@ -1344,7 +1433,7 @@ def render_workspace():
                     key="quick_btn_gh",
                     use_container_width=True,
                 ):
-                    st.session_state.top_nav = "🐙 GitHub Accounts"
+                    switch_view("🐙 GitHub Accounts")
                     st.rerun()
 
             with w_col2:
@@ -1362,7 +1451,7 @@ def render_workspace():
                     key="quick_btn_ai",
                     use_container_width=True,
                 ):
-                    st.session_state.top_nav = "🤖 AI Models & Keys"
+                    switch_view("🤖 AI Models & Keys")
                     st.rerun()
 
             st.markdown("---")
@@ -1400,7 +1489,7 @@ def render_workspace():
                     type="primary",
                     use_container_width=True,
                 ):
-                    st.session_state.top_nav = "📁 Repos & Sessions"
+                    switch_view("📁 Repos & Sessions")
                     st.rerun()
             return
 
@@ -1549,36 +1638,48 @@ def render_workspace():
                     {"role": "user", "content": final_prompt}
                 )
 
-                result = agent.run_agent_turn(
-                    messages=history_payload,
-                    model=selected_model,
-                    api_key=active_api_key,
-                    sandbox=sandbox,
-                    status_callback=update_status,
-                )
+                reasoning_val = st.session_state.get("reasoning_effort", "Auto / Standard").split(" ")[0].lower()
+                try:
+                    result = agent.run_agent_turn(
+                        messages=history_payload,
+                        model=selected_model,
+                        api_key=active_api_key,
+                        sandbox=sandbox,
+                        status_callback=update_status,
+                        reasoning_effort=reasoning_val if reasoning_val in ["low", "medium", "high"] else None,
+                    )
 
-                status_box.update(label="Execution complete!", state="complete")
+                    if not result.get("success"):
+                        status_box.update(label="❌ AI Execution encountered an issue", state="error")
+                        st.error(result.get("error", "An error occurred during AI execution."))
+                    else:
+                        status_box.update(label="Execution complete!", state="complete")
 
-                reply_text = result.get("content", "")
-                terminal_logs = result.get("terminal_logs", "")
+                    reply_text = result.get("content", "")
+                    terminal_logs = result.get("terminal_logs", "")
 
-                st.markdown(reply_text)
-                if terminal_logs:
-                    with st.expander("🖥️ Terminal & Test Execution Output"):
-                        st.markdown(
-                            f"<div class='terminal-box'>{terminal_logs}</div>",
-                            unsafe_allow_html=True,
+                    if reply_text:
+                        st.markdown(reply_text)
+                    if terminal_logs:
+                        with st.expander("🖥️ Terminal & Test Execution Output"):
+                            st.markdown(
+                                f"<div class='terminal-box'>{terminal_logs}</div>",
+                                unsafe_allow_html=True,
+                            )
+
+                    if reply_text or terminal_logs:
+                        # Save assistant message to hybrid database & local store
+                        db.add_message(
+                            st.session_state.current_session_id,
+                            "assistant",
+                            reply_text or "Task execution finished.",
+                            terminal_output=terminal_logs,
+                            user_id=user.id,
+                            email=user.email,
                         )
-
-                # Save assistant message to hybrid database & local store
-                db.add_message(
-                    st.session_state.current_session_id,
-                    "assistant",
-                    reply_text,
-                    terminal_output=terminal_logs,
-                    user_id=user.id,
-                    email=user.email,
-                )
+                finally:
+                    if "Preview URL: https://" not in terminal_logs:
+                        sandbox.close()
 
 
 # =========================================================

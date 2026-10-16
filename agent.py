@@ -137,8 +137,9 @@ def run_agent_turn(
     sandbox: WorkspaceSandbox,
     status_callback: Optional[Callable[[str], None]] = None,
     max_steps: int = 10,
+    reasoning_effort: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Runs a multi-turn agent execution loop with sandbox tool calling."""
+    """Runs a multi-turn agent execution loop with sandbox tool calling and optional reasoning effort."""
 
     working_messages = [
         {"role": "system", "content": SYSTEM_PROMPT}
@@ -150,21 +151,51 @@ def run_agent_turn(
         if status_callback:
             status_callback(f"Agent thinking (Step {step + 1}/{max_steps})...")
 
+        completion_kwargs: Dict[str, Any] = {
+            "model": model,
+            "messages": working_messages,
+            "tools": AGENT_TOOLS,
+            "tool_choice": "auto",
+            "api_key": api_key,
+            "temperature": 0.2,
+        }
+
+        if reasoning_effort and reasoning_effort.lower() in ("low", "medium", "high"):
+            re_val = reasoning_effort.lower()
+            if "o1" in model or "o3" in model:
+                completion_kwargs["reasoning_effort"] = re_val
+            elif "claude-3-7" in model:
+                budget = 1024 if re_val == "low" else 4096 if re_val == "medium" else 16000
+                completion_kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
+
         try:
-            response = completion(
-                model=model,
-                messages=working_messages,
-                tools=AGENT_TOOLS,
-                tool_choice="auto",
-                api_key=api_key,
-                temperature=0.2,
-            )
+            response = completion(**completion_kwargs)
         except Exception as e:
-            return {
-                "success": False,
-                "error": f"LLM API Error: {str(e)}",
-                "terminal_logs": "\n".join(accumulated_logs),
-            }
+            # If rejected due to reasoning kwargs on an unsupportive model, retry cleanly
+            err_str = str(e).lower()
+            if "reasoning" in err_str or "thinking" in err_str:
+                try:
+                    fallback_kwargs = {
+                        "model": model,
+                        "messages": working_messages,
+                        "tools": AGENT_TOOLS,
+                        "tool_choice": "auto",
+                        "api_key": api_key,
+                        "temperature": 0.2,
+                    }
+                    response = completion(**fallback_kwargs)
+                except Exception as inner_e:
+                    return {
+                        "success": False,
+                        "error": f"LLM API Error: {str(inner_e)}",
+                        "terminal_logs": "\n".join(accumulated_logs),
+                    }
+            else:
+                return {
+                    "success": False,
+                    "error": f"LLM API Error: {str(e)}",
+                    "terminal_logs": "\n".join(accumulated_logs),
+                }
 
         response_message = response.choices[0].message
         working_messages.append(response_message)

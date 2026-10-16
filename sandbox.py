@@ -10,17 +10,20 @@ def get_e2b_api_key() -> str:
     return st.secrets.get("E2B_API_KEY", os.getenv("E2B_API_KEY", ""))
 
 
+WORKSPACE_DIR = "/home/user/workspace"
+
+
 class WorkspaceSandbox:
     """Manages an ephemeral cloud Linux container for a user's repository."""
 
     def __init__(self, repo_name: str, github_token: str):
-        self.repo_name = repo_name
-        self.github_token = github_token
+        self.repo_name = repo_name.strip()
+        self.github_token = (github_token or "").strip()
         self.api_key = get_e2b_api_key()
         self.sandbox: Optional[Any] = None
 
     def start(self) -> Dict[str, Any]:
-        """Boots the E2B sandbox and clones the repository into /workspace."""
+        """Boots the E2B sandbox and clones the repository into /home/user/workspace."""
         if not self.api_key:
             return {
                 "success": False,
@@ -30,18 +33,37 @@ class WorkspaceSandbox:
         try:
             from e2b import Sandbox
 
-            # Initialize sandbox
-            self.sandbox = Sandbox(api_key=self.api_key)
+            # Initialize sandbox using modern E2B API
+            if hasattr(Sandbox, "create"):
+                self.sandbox = Sandbox.create(api_key=self.api_key)
+            else:
+                self.sandbox = Sandbox(api_key=self.api_key)
 
-            # Clone repository
-            auth_repo_url = f"https://x-access-token:{self.github_token}@github.com/{self.repo_name}.git"
-            clone_cmd = f"git clone {auth_repo_url} /workspace"
+            # Clean and clone repository into /home/user/workspace
+            if self.github_token:
+                auth_repo_url = f"https://x-access-token:{self.github_token}@github.com/{self.repo_name}.git"
+            else:
+                auth_repo_url = f"https://github.com/{self.repo_name}.git"
 
-            result = self.sandbox.commands.run(clone_cmd)
-            if result.exit_code != 0:
+            clone_cmd = f"rm -rf {WORKSPACE_DIR} && git clone {auth_repo_url} {WORKSPACE_DIR}"
+
+            try:
+                result = self.sandbox.commands.run(clone_cmd)
+                exit_code = getattr(result, "exit_code", 0)
+                if exit_code != 0:
+                    return {
+                        "success": False,
+                        "error": f"Failed to clone repository: {getattr(result, 'stderr', '') or getattr(result, 'stdout', '')}",
+                    }
+            except Exception as cmd_err:
+                err_msg = str(cmd_err)
+                if hasattr(cmd_err, "stderr") and getattr(cmd_err, "stderr"):
+                    err_msg = getattr(cmd_err, "stderr")
+                elif hasattr(cmd_err, "stdout") and getattr(cmd_err, "stdout"):
+                    err_msg = getattr(cmd_err, "stdout")
                 return {
                     "success": False,
-                    "error": f"Failed to clone repository: {result.stderr or result.stdout}",
+                    "error": f"Failed to clone repository: {err_msg}",
                 }
 
             return {
@@ -51,20 +73,40 @@ class WorkspaceSandbox:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def run_command(self, command: str, cwd: str = "/workspace") -> Dict[str, Any]:
+    def _resolve_path(self, file_path: str) -> str:
+        """Resolves relative or legacy /workspace paths to /home/user/workspace."""
+        p = file_path.strip()
+        if p.startswith(WORKSPACE_DIR):
+            return p
+        if p.startswith("/workspace"):
+            p = p[len("/workspace"):].lstrip("/")
+        elif p.startswith("/"):
+            p = p.lstrip("/")
+        return f"{WORKSPACE_DIR}/{p}"
+
+    def run_command(self, command: str, cwd: str = WORKSPACE_DIR) -> Dict[str, Any]:
         """Runs any bash command (e.g. npm test, pytest, go run, cargo) inside the sandbox."""
         if not self.sandbox:
             return {"success": False, "error": "Sandbox is not running."}
 
+        target_cwd = self._resolve_path(cwd) if cwd != WORKSPACE_DIR else WORKSPACE_DIR
         try:
-            res = self.sandbox.commands.run(command, cwd=cwd)
+            res = self.sandbox.commands.run(command, cwd=target_cwd)
             return {
                 "success": True,
-                "stdout": res.stdout,
-                "stderr": res.stderr,
-                "exit_code": res.exit_code,
+                "stdout": getattr(res, "stdout", "") or "",
+                "stderr": getattr(res, "stderr", "") or "",
+                "exit_code": getattr(res, "exit_code", 0),
             }
         except Exception as e:
+            # Handle commands that exited with non-zero code (tests, compiler errors, etc.)
+            if hasattr(e, "exit_code"):
+                return {
+                    "success": True,
+                    "stdout": getattr(e, "stdout", "") or "",
+                    "stderr": getattr(e, "stderr", "") or getattr(e, "error", ""),
+                    "exit_code": getattr(e, "exit_code", 1),
+                }
             return {"success": False, "error": str(e)}
 
     def start_dev_server(self, command: str, port: int) -> Dict[str, Any]:
@@ -74,7 +116,7 @@ class WorkspaceSandbox:
 
         try:
             # Run command in the background
-            self.sandbox.commands.run(command, background=True, cwd="/workspace")
+            self.sandbox.commands.run(command, background=True, cwd=WORKSPACE_DIR)
             # Expose port as public URL
             host = self.sandbox.get_host(port)
             preview_url = f"https://{host}"
@@ -92,11 +134,7 @@ class WorkspaceSandbox:
         if not self.sandbox:
             return {"success": False, "error": "Sandbox is not running."}
 
-        full_path = (
-            file_path
-            if file_path.startswith("/workspace")
-            else f"/workspace/{file_path}"
-        )
+        full_path = self._resolve_path(file_path)
         try:
             content = self.sandbox.files.read(full_path)
             return {"success": True, "content": content}
@@ -108,11 +146,7 @@ class WorkspaceSandbox:
         if not self.sandbox:
             return {"success": False, "error": "Sandbox is not running."}
 
-        full_path = (
-            file_path
-            if file_path.startswith("/workspace")
-            else f"/workspace/{file_path}"
-        )
+        full_path = self._resolve_path(file_path)
         try:
             self.sandbox.files.write(full_path, content)
             return {"success": True}
@@ -142,11 +176,12 @@ class WorkspaceSandbox:
             ]
 
             full_script = " && ".join(commands)
-            res = self.sandbox.commands.run(full_script, cwd="/workspace")
-            if res.exit_code != 0:
+            res = self.sandbox.commands.run(full_script, cwd=WORKSPACE_DIR)
+            exit_code = getattr(res, "exit_code", 0)
+            if exit_code != 0:
                 return {
                     "success": False,
-                    "error": f"Git operations failed: {res.stderr or res.stdout}",
+                    "error": f"Git operations failed: {getattr(res, 'stderr', '') or getattr(res, 'stdout', '')}",
                 }
 
             from github import Github
@@ -173,3 +208,4 @@ class WorkspaceSandbox:
             except Exception:
                 pass
             self.sandbox = None
+
