@@ -390,6 +390,85 @@ def delete_github_account(
     return True
 
 
+def attach_pat_to_account(
+    user_id: str, account_id: str, token: str, email: Optional[str] = None
+) -> bool:
+    """Attaches or updates a Personal Access Token for an existing connected account."""
+    clean_tok = token.strip()
+    data = _load_local_user_data(user_id, email)
+    accounts = data.get("github_accounts", [])
+    updated = False
+    for acc in accounts:
+        if acc["id"] == account_id:
+            acc["github_token"] = clean_tok
+            updated = True
+            break
+    if updated:
+        data["github_accounts"] = accounts
+        data["active_gh_account_id"] = account_id
+        _save_local_user_data(user_id, email, data)
+        try:
+            supabase = get_supabase_client()
+            supabase.table("user_github_accounts").update(
+                {"github_token": encrypt_secret(clean_tok)}
+            ).eq("id", account_id).eq("user_id", user_id).execute()
+        except Exception:
+            update_github_token(user_id, clean_tok, email)
+        return True
+    return False
+
+
+def verify_github_credentials(
+    token: str, username: Optional[str] = None
+) -> Dict[str, Any]:
+    """Validates with GitHub API that a Personal Access Token is authentic and valid."""
+    clean_tok = token.strip() if token else ""
+    if not clean_tok:
+        return {
+            "valid": False,
+            "error": "Personal Access Token cannot be blank.",
+        }
+
+    try:
+        from github import Auth, Github
+
+        try:
+            gh = Github(auth=Auth.Token(clean_tok))
+        except Exception:
+            gh = Github(clean_tok)
+
+        auth_user = gh.get_user()
+        real_login = auth_user.login
+        real_name = auth_user.name or real_login
+        public_repos = auth_user.public_repos
+        total_private_repos = getattr(auth_user, "total_private_repos", 0)
+
+        return {
+            "valid": True,
+            "login": real_login,
+            "name": real_name,
+            "public_repos": public_repos,
+            "private_repos": total_private_repos,
+            "avatar_url": getattr(auth_user, "avatar_url", ""),
+        }
+    except Exception as e:
+        err_str = str(e)
+        if "Bad credentials" in err_str or "401" in err_str:
+            return {
+                "valid": False,
+                "error": "❌ Invalid GitHub Token: GitHub rejected the credentials (401 Bad Credentials). Please verify your token at https://github.com/settings/tokens.",
+            }
+        elif "rate limit" in err_str.lower():
+            return {
+                "valid": False,
+                "error": "⚠️ GitHub API rate limit reached. Please wait a moment and try again.",
+            }
+        return {
+            "valid": False,
+            "error": f"❌ Could not verify GitHub account: {err_str}",
+        }
+
+
 def auto_link_oauth_github(user: Any) -> Optional[Dict[str, Any]]:
     """Checks if the user authenticated with GitHub and ensures it is registered as default."""
     if not user:
@@ -412,9 +491,9 @@ def auto_link_oauth_github(user: Any) -> Optional[Dict[str, Any]]:
         existing = get_user_github_accounts(user.id, user.email)
         if not existing:
             add_github_account(
-                user.id, "Default GitHub", username, "", user.email
+                user.id, "Personal", username, "", user.email
             )
-            return {"username": username, "label": "Default GitHub"}
+            return {"username": username, "label": "Personal"}
     return None
 
 

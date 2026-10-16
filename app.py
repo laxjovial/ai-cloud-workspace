@@ -108,8 +108,51 @@ st.markdown(
         font-size: 11px;
         font-weight: bold;
         background-color: #238636;
-        color: white;
+    /* Disabled button cursor: Hand with Cancel/Forbidden symbol 🚫 */
+    button:disabled, .stButton button:disabled, .stFormSubmitButton button:disabled {
+        cursor: not-allowed !important;
+        opacity: 0.5 !important;
+        pointer-events: auto !important;
+        background-color: #21262d !important;
+        border: 1px solid #30363d !important;
+        color: #8b949e !important;
+        box-shadow: none !important;
+        transform: none !important;
     }
+    button:disabled:hover, .stButton button:disabled:hover, .stFormSubmitButton button:disabled:hover {
+        cursor: not-allowed !important;
+        background-color: #21262d !important;
+        border-color: #f85149 !important; /* Subtle cancel red indicator on hover */
+        box-shadow: 0 0 8px rgba(248, 81, 73, 0.25) !important;
+    }
+
+    /* Rolling wheel spinner animation for loading/busy states */
+    @keyframes rolling-wheel-spin {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
+    }
+    .stApp[data-test-script-state="running"] button,
+    .stApp[data-test-script-state="running"] .stButton > button {
+        cursor: wait !important;
+    }
+    .rolling-wheel {
+        display: inline-block;
+        width: 14px;
+        height: 14px;
+        border: 2px solid rgba(255, 255, 255, 0.25);
+        border-radius: 50%;
+        border-top-color: #58a6ff;
+        animation: rolling-wheel-spin 0.75s linear infinite;
+        vertical-align: middle;
+        margin-right: 6px;
+    }
+
+    /* Category Badges for GitHub Accounts */
+    .cat-badge-personal { background-color: #1f6feb; color: white; padding: 3px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+    .cat-badge-work { background-color: #8957e5; color: white; padding: 3px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+    .cat-badge-opensource { background-color: #238636; color: white; padding: 3px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+    .cat-badge-org { background-color: #d29922; color: white; padding: 3px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+    .cat-badge-custom { background-color: #388bfd; color: white; padding: 3px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -609,13 +652,28 @@ def render_workspace():
     if st.session_state.top_nav == "🐙 GitHub Accounts":
         st.markdown("### 🐙 GitHub Account Management")
         st.caption(
-            "Connect multiple personal or work GitHub accounts. Personal Access Tokens (PATs) are encrypted with AES-128."
+            "Connect multiple personal or work GitHub accounts. Personal Access Tokens (PATs) are verified with GitHub and encrypted with AES-128."
         )
 
         if gh_accounts:
             st.markdown("#### Linked Accounts")
+
             for acc in gh_accounts:
                 is_active = acc["id"] == st.session_state.active_gh_account_id
+                acc_label_text = acc.get("account_label", "Personal")
+                has_pat = bool(acc.get("github_token"))
+
+                # Choose category badge style
+                cat_class = "cat-badge-personal"
+                if "work" in acc_label_text.lower() or "business" in acc_label_text.lower():
+                    cat_class = "cat-badge-work"
+                elif "open" in acc_label_text.lower():
+                    cat_class = "cat-badge-opensource"
+                elif "org" in acc_label_text.lower():
+                    cat_class = "cat-badge-org"
+                elif acc_label_text.lower() not in ["personal", "default github"]:
+                    cat_class = "cat-badge-custom"
+
                 card_style = (
                     "border: 1px solid #238636; background: #0d1a10;"
                     if is_active
@@ -630,106 +688,225 @@ def render_workspace():
                     f"""
                     <div style="{card_style} border-radius: 8px; padding: 14px; margin-bottom: 12px;">
                         <div style="display:flex; justify-content:space-between; align-items:center;">
-                            <span style="font-size:16px; font-weight:700; color:#f0f6fc;">🏷️ {acc['account_label']} (@{acc['github_username']})</span>
+                            <div>
+                                <span style="font-size:16px; font-weight:700; color:#f0f6fc;">@{acc['github_username']}</span>
+                                &nbsp; <span class="{cat_class}">{acc_label_text}</span>
+                            </div>
                             <span>{badge_text}</span>
                         </div>
                     </div>
                     """,
                     unsafe_allow_html=True,
                 )
-                col_a, col_b, col_c = st.columns([2, 1, 1])
-                with col_a:
-                    if acc.get("github_token"):
+
+                if has_pat:
+                    col_a, col_b, col_c = st.columns([2, 1, 1])
+                    with col_a:
                         st.markdown(
                             f"**Masked PAT:** `{db.mask_secret(acc['github_token'])}`"
                         )
                         with st.expander("📋 Copy PAT"):
                             st.code(acc["github_token"], language="text")
-                    else:
-                        st.caption("No PAT stored for this account.")
-                with col_b:
-                    if not is_active:
+                    with col_b:
+                        if not is_active:
+                            if st.button(
+                                "⭐ Set as Active",
+                                key=f"btn_activate_{acc['id']}",
+                                use_container_width=True,
+                            ):
+                                st.session_state.active_gh_account_id = acc["id"]
+                                db.save_user_workspace_state(
+                                    user.id,
+                                    user.email,
+                                    active_gh_account_id=acc["id"],
+                                )
+                                st.toast(
+                                    f"🐙 Switched to @{acc['github_username']}!",
+                                    icon="✅",
+                                )
+                                st.rerun()
+                        else:
+                            if st.button(
+                                "📁 Open Repositories",
+                                key=f"btn_repos_{acc['id']}",
+                                use_container_width=True,
+                            ):
+                                st.session_state.top_nav = "📁 Repos & Sessions"
+                                st.rerun()
+                    with col_c:
                         if st.button(
-                            "⭐ Set as Active",
-                            key=f"btn_activate_{acc['id']}",
+                            "🗑️ Remove",
+                            key=f"btn_del_acc_{acc['id']}",
                             use_container_width=True,
                         ):
-                            st.session_state.active_gh_account_id = acc["id"]
-                            db.save_user_workspace_state(
-                                user.id,
-                                user.email,
-                                active_gh_account_id=acc["id"],
+                            db.delete_github_account(
+                                user.id, acc["id"], user.email
                             )
-                            st.toast(
-                                f"🐙 Switched to @{acc['github_username']}!",
-                                icon="✅",
-                            )
+                            if st.session_state.active_gh_account_id == acc["id"]:
+                                st.session_state.active_gh_account_id = None
+                            fetch_user_github_repos.clear()
+                            st.toast("🗑️ GitHub account removed.", icon="🗑️")
                             st.rerun()
-                    else:
-                        if st.button(
-                            "📁 Open Repositories",
-                            key=f"btn_repos_{acc['id']}",
-                            use_container_width=True,
-                        ):
-                            st.session_state.top_nav = "📁 Repos & Sessions"
-                            st.rerun()
-                with col_c:
-                    if st.button(
-                        "🗑️ Remove",
-                        key=f"btn_del_acc_{acc['id']}",
-                        use_container_width=True,
-                    ):
-                        db.delete_github_account(
-                            user.id, acc["id"], user.email
+                else:
+                    # Account exists but has no PAT attached yet
+                    st.warning(
+                        f"⚠️ **@{acc['github_username']}** has no Personal Access Token attached. To list and clone your repositories, attach a PAT below."
+                    )
+                    pat_in_col, pat_btn_col = st.columns([3, 1])
+                    with pat_in_col:
+                        inline_tok = st.text_input(
+                            f"Paste Personal Access Token for @{acc['github_username']}",
+                            type="password",
+                            placeholder="ghp_...",
+                            key=f"inline_tok_input_{acc['id']}",
+                            label_visibility="collapsed",
                         )
-                        if st.session_state.active_gh_account_id == acc["id"]:
-                            st.session_state.active_gh_account_id = None
-                        st.toast("🗑️ GitHub account removed.", icon="🗑️")
-                        st.rerun()
+                    with pat_btn_col:
+                        attach_ready = bool(inline_tok.strip())
+                        if st.button(
+                            "Attach & Verify PAT",
+                            key=f"btn_attach_tok_{acc['id']}",
+                            disabled=not attach_ready,
+                            use_container_width=True,
+                            help="Enter token to attach" if not attach_ready else "Verify and attach PAT",
+                        ):
+                            with st.spinner("Verifying token with GitHub API..."):
+                                v = db.verify_github_credentials(inline_tok.strip(), acc['github_username'])
+                            if v["valid"]:
+                                db.attach_pat_to_account(user.id, acc["id"], inline_tok.strip(), user.email)
+                                fetch_user_github_repos.clear()
+                                st.toast(f"🐙 Verified and attached PAT for @{v['login']}!", icon="✅")
+                                st.rerun()
+                            else:
+                                st.error(v["error"])
+
                 st.markdown("---")
         else:
             st.info(
-                "💡 No GitHub accounts connected yet. Connect your first account below to search repos and run projects."
+                "💡 No GitHub accounts connected yet. Connect your GitHub account below to search repos and run projects."
             )
 
         st.markdown("#### ➕ Connect Another GitHub Account")
-        with st.form("add_github_acc_form", clear_on_submit=True):
-            f_col1, f_col2 = st.columns(2)
-            with f_col1:
-                acc_label = st.text_input(
-                    "Account Label",
-                    placeholder="e.g. Personal, Work, OpenSource",
+        st.markdown(
+            "💡 *Need a token?* [🔗 Open Pre-configured GitHub Token Page](https://github.com/settings/tokens/new?scopes=repo,read:user&description=AI+Cloud+Workspace) *(pre-configures required `repo` scope on GitHub)*"
+        )
+
+        cat_col1, cat_col2 = st.columns(2)
+        with cat_col1:
+            cat_choice = st.selectbox(
+                "Account Category (Optional)",
+                ["Personal", "Work / Business", "Open Source", "Organization", "Custom Label..."],
+                index=0,
+                key="conn_gh_cat_select",
+                help="Categorize this account to group personal and business repos",
+            )
+        with cat_col2:
+            if cat_choice == "Custom Label...":
+                custom_lbl = st.text_input(
+                    "Custom Category Name",
+                    placeholder="e.g. Freelance, Client Work",
+                    key="conn_gh_cat_custom",
                 )
-            with f_col2:
-                acc_username = st.text_input(
-                    "GitHub Username", placeholder="e.g. laxjovial"
-                )
-            acc_token = st.text_input(
-                "Personal Access Token (PAT)",
+                chosen_label = custom_lbl.strip() or "Custom"
+            else:
+                chosen_label = cat_choice
+
+        f_col1, f_col2 = st.columns(2)
+        with f_col1:
+            new_gh_username = st.text_input(
+                "GitHub Username *",
+                placeholder="e.g. laxjovial",
+                key="conn_gh_username_input",
+            )
+        with f_col2:
+            new_gh_token = st.text_input(
+                "Personal Access Token (PAT) *",
                 type="password",
                 help="Requires 'repo' scope from github.com/settings/tokens",
                 placeholder="ghp_...",
+                key="conn_gh_token_input",
             )
-            submit_gh = st.form_submit_button(
-                "Connect Account", type="primary", use_container_width=True
-            )
-            if submit_gh:
-                if acc_label and acc_token:
-                    db.add_github_account(
-                        user.id,
-                        acc_label,
-                        acc_username or acc_label,
-                        acc_token,
-                        user.email,
-                    )
-                    st.toast(
-                        "🐙 GitHub account connected and encrypted!", icon="✅"
-                    )
-                    st.rerun()
-                else:
-                    st.warning(
-                        "Please provide an Account Label and Personal Access Token."
-                    )
+
+        is_ready_to_connect = bool(new_gh_username.strip() and new_gh_token.strip())
+
+        connect_submitted = st.button(
+            "✅ Verify & Connect GitHub Account",
+            type="primary",
+            disabled=not is_ready_to_connect,
+            use_container_width=True,
+            key="btn_connect_github_acc",
+            help="Fill in both Username and Personal Access Token to connect" if not is_ready_to_connect else "Verify and connect your account",
+        )
+
+        # Seamless Enter Key navigation: Enter in username jumps to PAT; Enter in PAT clicks Connect if both ready
+        st.html(
+            """
+            <div id="gh-connect-marker"></div>
+            <script>
+            (function() {
+                function bindEnter() {
+                    const uInput = document.querySelector('input[aria-label="GitHub Username *"]');
+                    const tInput = document.querySelector('input[aria-label="Personal Access Token (PAT) *"]');
+                    const btn = document.querySelector('button:has(div:contains("Verify & Connect"))') || 
+                                Array.from(document.querySelectorAll('button')).find(b => b.innerText.includes("Connect GitHub"));
+                    
+                    if (uInput && !uInput.dataset.enterBound) {
+                        uInput.dataset.enterBound = "true";
+                        uInput.addEventListener('keydown', function(e) {
+                            if (e.key === 'Enter') {
+                                e.preventDefault();
+                                if (tInput && !tInput.value.trim()) {
+                                    tInput.focus();
+                                } else if (btn && !btn.disabled) {
+                                    btn.click();
+                                }
+                            }
+                        });
+                    }
+                    if (tInput && !tInput.dataset.enterBound) {
+                        tInput.dataset.enterBound = "true";
+                        tInput.addEventListener('keydown', function(e) {
+                            if (e.key === 'Enter') {
+                                e.preventDefault();
+                                if (uInput && !uInput.value.trim()) {
+                                    uInput.focus();
+                                } else if (btn && !btn.disabled) {
+                                    btn.click();
+                                }
+                            }
+                        });
+                    }
+                }
+                setTimeout(bindEnter, 250);
+                setTimeout(bindEnter, 800);
+            })();
+            </script>
+            """
+        )
+
+        if connect_submitted:
+            with st.spinner("Verifying credentials with GitHub API..."):
+                val_result = db.verify_github_credentials(
+                    new_gh_token.strip(), new_gh_username.strip()
+                )
+            if not val_result["valid"]:
+                st.error(val_result["error"])
+            else:
+                real_login = val_result["login"]
+                db.add_github_account(
+                    user.id,
+                    chosen_label,
+                    real_login,
+                    new_gh_token.strip(),
+                    user.email,
+                )
+                fetch_user_github_repos.clear()
+                st.toast(
+                    f"🐙 Verified and connected @{real_login} ({val_result.get('public_repos', 0)} public repos)!",
+                    icon="✅",
+                )
+                st.rerun()
+
 
     # ------------------------------------------------------
     # TAB 2: 🤖 AI MODELS & KEYS VIEW
@@ -861,95 +1038,178 @@ def render_workspace():
     elif st.session_state.top_nav == "📁 Repos & Sessions":
         st.markdown("### 📁 Repositories & Past Chat Sessions")
         st.caption(
-            "Select or search any repository to launch a live coding session, or resume where you left off."
+            "Browse your GitHub repositories from the dropdown menu, search dynamically by typing, or resume any past coding session."
         )
 
         st.markdown("#### 1. Select Target Repository")
+
+        # Active GitHub account status banner
+        acc_name = f"@{active_account['github_username']}" if active_account else "None"
+        has_active_pat = bool(active_gh_token)
+
+        st.markdown(
+            f"""
+            <div style="background:#161b22; border:1px solid #30363d; border-radius:8px; padding:12px 16px; margin-bottom:12px; display:flex; justify-content:space-between; align-items:center;">
+                <div>
+                    <span style="font-size:15px; font-weight:600; color:#f0f6fc;">🐙 Active GitHub Account: <b>{acc_name}</b></span>
+                    <div style="font-size:12px; color:#8b949e; margin-top:3px;">
+                        {'<span class="status-badge-green">● PAT Connected & Verified (Repositories Ready)</span>' if has_active_pat else '<span class="status-badge-red">⚠️ No PAT Attached (Attach below to populate repository dropdown)</span>'}
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # Inline PAT attach if current active account has no token
+        if not has_active_pat and active_account:
+            st.info(f"💡 Attach a Personal Access Token for **@{active_account['github_username']}** to load all your private and public repositories into the dropdown menu.")
+            p_col1, p_col2 = st.columns([3, 1])
+            with p_col1:
+                repo_tab_pat = st.text_input(
+                    "Paste PAT",
+                    type="password",
+                    placeholder="ghp_...",
+                    key="repo_tab_inline_pat_input",
+                    label_visibility="collapsed",
+                )
+            with p_col2:
+                can_attach_repo_pat = bool(repo_tab_pat.strip())
+                if st.button(
+                    "Attach PAT & Load Repos",
+                    key="btn_repo_tab_attach_pat",
+                    disabled=not can_attach_repo_pat,
+                    use_container_width=True,
+                    help="Enter token to load repos" if not can_attach_repo_pat else "Verify and load repositories",
+                ):
+                    with st.spinner("Verifying token with GitHub API..."):
+                        v = db.verify_github_credentials(repo_tab_pat.strip(), active_account['github_username'])
+                    if v["valid"]:
+                        db.attach_pat_to_account(user.id, active_account["id"], repo_tab_pat.strip(), user.email)
+                        fetch_user_github_repos.clear()
+                        st.toast("🐙 Verified & connected! Loading repositories...", icon="✅")
+                        st.rerun()
+                    else:
+                        st.error(v["error"])
+
+        # Fetch repositories if token available
         user_repos = (
             fetch_user_github_repos(active_gh_token) if active_gh_token else []
         )
 
+        # Header with Refresh button
+        col_hdr1, col_hdr2 = st.columns([4, 1])
+        with col_hdr1:
+            st.markdown("##### 📋 Repository Dropdown & Dynamic Search")
+        with col_hdr2:
+            if active_gh_token:
+                if st.button("🔄 Refresh Repos", key="btn_refresh_repos_list", use_container_width=True, help="Re-fetch fresh list of repositories from GitHub"):
+                    fetch_user_github_repos.clear()
+                    st.toast("🔄 Refreshed repository list from GitHub!", icon="🐙")
+                    st.rerun()
+
+        # Always construct and render the Dropdown Menu
+        sessions = db.list_user_sessions(user.id, user.email)
         repo_input = ""
+
         if user_repos:
-            search_options = (
-                ["-- Select or Search Repository --"]
+            dropdown_options = (
+                [f"-- 📋 Browse all repositories ({len(user_repos)} available) --"]
                 + user_repos
-                + ["➕ Custom / Other Repository..."]
+                + ["➕ Custom / Other External Repository..."]
             )
             default_idx = 0
             if st.session_state.active_repo in user_repos:
-                default_idx = search_options.index(st.session_state.active_repo)
+                default_idx = dropdown_options.index(st.session_state.active_repo)
 
             selected_repo_opt = st.selectbox(
-                "Search & Select Repository",
-                search_options,
+                "Click dropdown to browse all repositories, or type to filter dynamically",
+                dropdown_options,
                 index=default_idx,
-                help="Type to search your repos dynamically (e.g. 'gre' -> 'green...')",
+                help="Click the dropdown to browse all repos, or type to filter (e.g. 'g' -> 'gr' -> 'green...')",
+                key="active_repo_dropdown_select",
             )
 
-            if selected_repo_opt == "➕ Custom / Other Repository...":
+            if selected_repo_opt == "➕ Custom / Other External Repository...":
                 repo_input = st.text_input(
                     "Enter Repository (owner/repo)",
                     value=""
                     if st.session_state.active_repo in user_repos
                     else (st.session_state.active_repo or ""),
-                    placeholder="e.g. laxjovial/ai-cloud-workspace",
-                )
+                    placeholder="e.g. facebook/react",
+                    key="custom_repo_external_input",
+                ).strip()
                 st.session_state.active_repo = repo_input
-            elif selected_repo_opt != "-- Select or Search Repository --":
+            elif not selected_repo_opt.startswith("--"):
                 repo_input = selected_repo_opt
-                st.session_state.active_repo = repo_input
+                st.session_state.active_repo = selected_repo_opt
             else:
                 repo_input = st.session_state.active_repo or ""
         else:
-            repo_input = st.text_input(
-                "GitHub Repository (owner/repo)",
-                value=st.session_state.active_repo or "",
-                placeholder="username/repo-name (e.g. laxjovial/ai-cloud-workspace)",
+            # Fallback dropdown menu with past sessions and manual entry
+            past_repo_names = list(dict.fromkeys([s["repo_name"] for s in sessions if s.get("repo_name")]))
+            fallback_options = (
+                ["-- 📋 Select a Repository --"]
+                + past_repo_names
+                + ["➕ Enter Repository Manually..."]
             )
-            st.session_state.active_repo = repo_input
-            if not active_gh_token:
-                st.caption(
-                    "💡 Connect a GitHub account in the '🐙 GitHub Accounts' tab to automatically list and search all your repositories here."
-                )
+            selected_fallback = st.selectbox(
+                "Repository Dropdown Menu",
+                fallback_options,
+                index=0,
+                key="fallback_repo_dropdown_select",
+                help="Select from past repositories or enter manually",
+            )
+            if selected_fallback == "➕ Enter Repository Manually..." or selected_fallback.startswith("--"):
+                repo_input = st.text_input(
+                    "GitHub Repository (owner/repo)",
+                    value=st.session_state.active_repo or "",
+                    placeholder="e.g. laxjovial/ai-cloud-workspace",
+                    key="manual_repo_fallback_input",
+                ).strip()
+                st.session_state.active_repo = repo_input
+            else:
+                repo_input = selected_fallback
+                st.session_state.active_repo = selected_fallback
+
+        is_valid_repo_target = bool(
+            repo_input
+            and not repo_input.startswith("--")
+            and "/" in repo_input
+        )
 
         if st.button(
             "➕ Start New Chat Session on Selected Repo",
             type="primary",
+            disabled=not is_valid_repo_target,
             use_container_width=True,
+            key="btn_start_new_repo_session",
+            help="Select or enter a valid repository (e.g. owner/repo) above to start" if not is_valid_repo_target else f"Start coding session on {repo_input}",
         ):
-            if (
-                repo_input
-                and repo_input != "-- Select or Search Repository --"
-                and "/" in repo_input
-            ):
-                new_session = db.create_chat_session(
-                    user_id=user.id,
-                    repo_name=repo_input.strip(),
-                    repo_url=f"https://github.com/{repo_input.strip()}",
-                    title=f"Task on {repo_input.strip()} ({datetime.now().strftime('%b %d, %H:%M')})",
-                    model_used=selected_model,
-                    email=user.email,
+            new_session = db.create_chat_session(
+                user_id=user.id,
+                repo_name=repo_input.strip(),
+                repo_url=f"https://github.com/{repo_input.strip()}",
+                title=f"Task on {repo_input.strip()} ({datetime.now().strftime('%b %d, %H:%M')})",
+                model_used=selected_model,
+                email=user.email,
+            )
+            if new_session:
+                st.session_state.current_session_id = new_session["id"]
+                st.session_state.active_repo = repo_input.strip()
+                st.session_state.top_nav = "💬 Workspace & Chat"
+                db.save_user_workspace_state(
+                    user.id,
+                    user.email,
+                    active_repo=repo_input.strip(),
+                    current_session_id=new_session["id"],
                 )
-                if new_session:
-                    st.session_state.current_session_id = new_session["id"]
-                    st.session_state.active_repo = repo_input.strip()
-                    st.session_state.top_nav = "💬 Workspace & Chat"
-                    db.save_user_workspace_state(
-                        user.id,
-                        user.email,
-                        active_repo=repo_input.strip(),
-                        current_session_id=new_session["id"],
-                    )
-                    st.toast(
-                        f"🚀 Session started on {repo_input.strip()}!",
-                        icon="✅",
-                    )
-                    st.rerun()
-            else:
-                st.error(
-                    "Please enter or select a valid repository format (e.g. username/repo-name)"
+                st.toast(
+                    f"🚀 Session started on {repo_input.strip()}!",
+                    icon="✅",
                 )
+                st.rerun()
+
 
         st.markdown("---")
         st.markdown("#### 2. Past Chat Sessions")
