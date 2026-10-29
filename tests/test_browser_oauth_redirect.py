@@ -120,15 +120,57 @@ class TestBrowserOAuthRedirectLifecycle:
             assert return_sid_cookie is not None
             assert return_sid_cookie["value"] == initiating_sid, "Cookie changed or was lost during redirect!"
 
-            # 7. Verify that missing cookie / fresh browser context fails closed against this state
-            foreign_context = browser.new_context()  # Empty context without cookies
+            # 7. Verify that the app callback consumed the OAuth state under this matching session
+            # Polling ensures the server's asynchronous callback processing has finished
+            consumed = False
+            dl_consume = time.time() + 5
+            while time.time() < dl_consume:
+                current_states = db._atomic_modify_oauth_states(lambda s: dict(s))
+                if state_val not in current_states:
+                    consumed = True
+                    break
+                time.sleep(0.3)
+            assert consumed, f"State {state_val} was not consumed by the app callback under matching session!"
+
+            # 8. Verify cross-session protection:
+            # In a foreign browser context with no cookie, navigate to the callback using a state bound to the first browser
+            foreign_context = browser.new_context()  # Separate context without cookies
             foreign_page = foreign_context.new_page()
             foreign_cookies = foreign_context.cookies()
             assert not any(c["name"] == "ai_cloud_ws_sid" for c in foreign_cookies)
 
-            # Attempting to exchange with None or empty session fails closed
-            fail_closed_res = db.exchange_oauth_code("mock_github_auth_code_123", state=fail_state_val, session_id="")
-            assert fail_closed_res["success"] is False
-            assert "session identifier missing" in fail_closed_res["error"]
+            foreign_callback_url = f"{streamlit_server}/?code=mock_foreign_code_789&state={fail_state_val}"
+            foreign_page.goto(foreign_callback_url)
+            foreign_page.wait_for_selector("text=AI Cloud Workspace", timeout=15000)
+
+            # Assert rejection: verify the state was NOT consumed and remains available for the legitimate session
+            time.sleep(1)
+            states_after_foreign = db._atomic_modify_oauth_states(lambda s: dict(s))
+            assert fail_state_val in states_after_foreign, "Foreign browser context illegally consumed the state!"
+
+            # 9. Verify that the legitimate browser context can now exchange the preserved state with a mock token exchange
+            from unittest.mock import MagicMock
+            mock_client = MagicMock()
+            mock_client.auth.exchange_code_for_session.return_value = MagicMock(
+                user=MagicMock(id="user_123", email="user@example.com"),
+                session=MagicMock(access_token="mock_jwt"),
+            )
+            mock_client.auth._storage_key = "sb"
+            mock_client.auth._storage = MagicMock()
+
+            orig_client = db.get_supabase_client
+            db.get_supabase_client = lambda: mock_client
+            try:
+                legitimate_res = db.exchange_oauth_code(
+                    "mock_legitimate_code",
+                    state=fail_state_val,
+                    session_id=initiating_sid,
+                )
+                assert legitimate_res["success"] is True
+                # State must now be atomically consumed
+                states_final = db._atomic_modify_oauth_states(lambda s: dict(s))
+                assert fail_state_val not in states_final
+            finally:
+                db.get_supabase_client = orig_client
 
             browser.close()
