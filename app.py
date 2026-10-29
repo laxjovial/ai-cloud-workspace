@@ -159,6 +159,9 @@ st.markdown(
 )
 
 # Initialize Session State
+if "browser_session_id" not in st.session_state:
+    import secrets
+    st.session_state.browser_session_id = secrets.token_hex(16)
 if "user" not in st.session_state:
     st.session_state.user = None
 if "current_session_id" not in st.session_state:
@@ -198,7 +201,11 @@ if "code" in st.query_params and not st.session_state.user:
 
     try:
         with st.spinner("Completing authentication..."):
-            oauth_res = db.exchange_oauth_code(auth_code, state=auth_state)
+            oauth_res = db.exchange_oauth_code(
+                auth_code,
+                state=auth_state,
+                session_id=st.session_state.get("browser_session_id"),
+            )
         if oauth_res.get("success"):
             st.session_state.user = oauth_res["data"].user
             st.session_state.auth_flash = (
@@ -305,8 +312,9 @@ def render_landing_and_auth():
             gh_label = "🐙 Sign Up with GitHub"
 
         o_col1, o_col2 = st.columns(2)
-        google_auth = db.get_oauth_url("google", redirect_url)
-        github_auth = db.get_oauth_url("github", redirect_url)
+        cur_browser_sid = st.session_state.get("browser_session_id")
+        google_auth = db.get_oauth_url("google", redirect_url, session_id=cur_browser_sid)
+        github_auth = db.get_oauth_url("github", redirect_url, session_id=cur_browser_sid)
 
         with o_col1:
             if google_auth.get("success"):

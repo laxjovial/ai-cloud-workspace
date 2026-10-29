@@ -44,6 +44,50 @@ class WorkspaceSandbox:
         self.api_key = get_e2b_api_key()
         self.sandbox: Optional[Any] = None
 
+    def _run_git_with_askpass(
+        self,
+        command_args: str,
+        cwd: Optional[str] = None,
+        helper_prefix: str = "askpass",
+    ) -> Dict[str, Any]:
+        """Runs a Git command using an ephemeral GIT_ASKPASS credential helper with unified setup/execution cleanup.
+        
+        Distinguishes username versus password/token prompts.
+        Guarantees cleanup of the helper script on both success and failure.
+        """
+        import uuid
+        askpass_id = uuid.uuid4().hex[:8]
+        askpass_path = f"/home/user/.git_askpass_{helper_prefix}_{askpass_id}"
+
+        # Script distinguishes username vs password prompts
+        # For HTTPS GitHub clone/push, username can be 'x-access-token' and password is the token
+        askpass_content = (
+            "#!/bin/sh\n"
+            "case \"$1\" in\n"
+            "  *Username*|*username*) exec echo \"x-access-token\" ;;\n"
+            f"  *) exec echo {shlex.quote(self.github_token)} ;;\n"
+            "esac\n"
+        )
+
+        try:
+            self.sandbox.files.write(askpass_path, askpass_content)
+            self.sandbox.commands.run(f"chmod 700 {askpass_path}")
+
+            full_cmd = f"GIT_ASKPASS={askpass_path} GIT_TERMINAL_PROMPT=0 {command_args}"
+            target_cwd = cwd or WORKSPACE_DIR
+            res = self.sandbox.commands.run(full_cmd, cwd=target_cwd)
+            return {
+                "success": getattr(res, "exit_code", 0) == 0,
+                "stdout": getattr(res, "stdout", "") or "",
+                "stderr": getattr(res, "stderr", "") or "",
+                "exit_code": getattr(res, "exit_code", 0),
+            }
+        finally:
+            try:
+                self.sandbox.commands.run(f"rm -f {askpass_path}")
+            except Exception:
+                pass
+
     def start(self) -> Dict[str, Any]:
         """Boots the E2B sandbox and clones the repository into /home/user/workspace."""
         if not self.api_key:
@@ -75,35 +119,27 @@ class WorkspaceSandbox:
             self.sandbox.commands.run(f"rm -rf {WORKSPACE_DIR}")
 
             # Clone using Git client with transient credential helper
-            # Token is provided via an ephemeral askpass script with chmod 700 and deleted immediately
             if self.github_token:
-                # Install ephemeral askpass helper script in /home/user/.git_askpass_tmp
-                askpass_path = "/home/user/.git_askpass_tmp"
-                # Write token via sandbox files API to avoid exposing it in process command arguments
-                askpass_content = f"#!/bin/sh\nexec echo {shlex.quote(self.github_token)}\n"
-                self.sandbox.files.write(askpass_path, askpass_content)
-                self.sandbox.commands.run(f"chmod 700 {askpass_path}")
-
-                clone_cmd = (
-                    f"GIT_ASKPASS={askpass_path} GIT_TERMINAL_PROMPT=0 "
-                    f"git clone --depth 50 {clean_repo_url} {WORKSPACE_DIR}"
+                clone_res = self._run_git_with_askpass(
+                    f"git clone --depth 50 {clean_repo_url} {WORKSPACE_DIR}",
+                    cwd="/home/user",
+                    helper_prefix="clone",
                 )
-                try:
-                    result = self.sandbox.commands.run(clone_cmd)
-                finally:
-                    # Guaranteed cleanup of credential helper immediately after clone
-                    self.sandbox.commands.run(f"rm -f {askpass_path}")
+                if not clone_res["success"]:
+                    raw_err = clone_res.get("stderr") or clone_res.get("stdout") or ""
+                    return {
+                        "success": False,
+                        "error": f"Failed to clone repository: {sanitize_error_message(raw_err, self.github_token)}",
+                    }
             else:
                 clone_cmd = f"git clone --depth 50 {clean_repo_url} {WORKSPACE_DIR}"
-                result = self.sandbox.commands.run(clone_cmd)
-
-            exit_code = getattr(result, "exit_code", 0)
-            if exit_code != 0:
-                raw_err = getattr(result, 'stderr', '') or getattr(result, 'stdout', '')
-                return {
-                    "success": False,
-                    "error": f"Failed to clone repository: {sanitize_error_message(raw_err, self.github_token)}",
-                }
+                result = self.sandbox.commands.run(clone_cmd, cwd="/home/user")
+                if getattr(result, "exit_code", 0) != 0:
+                    raw_err = getattr(result, 'stderr', '') or getattr(result, 'stdout', '')
+                    return {
+                        "success": False,
+                        "error": f"Failed to clone repository: {sanitize_error_message(raw_err, self.github_token)}",
+                    }
 
             # Double-check that .git/config does NOT contain credentials
             verify_res = self.sandbox.commands.run(f"git -C {WORKSPACE_DIR} remote get-url origin")
@@ -205,6 +241,39 @@ class WorkspaceSandbox:
         except Exception as e:
             return {"success": False, "error": sanitize_error_message(str(e), self.github_token)}
 
+    def _check_realpath_confinement(self, full_path: str) -> Dict[str, Any]:
+        """Validates that a path does not escape the workspace via symlinks.
+        
+        Fails closed: requires realpath exit_code == 0, non-empty stdout, and strict containment.
+        """
+        norm_workspace = os.path.normpath(WORKSPACE_DIR)
+        try:
+            realpath_check = self.sandbox.commands.run(f"realpath -m {shlex.quote(full_path)}")
+            exit_code = getattr(realpath_check, "exit_code", 1)
+            resolved_real = getattr(realpath_check, "stdout", "").strip()
+
+            # Fail closed: must successfully execute and return non-empty resolved path
+            if exit_code != 0 or not resolved_real:
+                err_detail = getattr(realpath_check, "stderr", "") or "realpath command returned empty or non-zero status"
+                return {
+                    "valid": False,
+                    "error": f"Path validation failed: unable to verify file containment ({err_detail}).",
+                }
+
+            # Check containment
+            if not (resolved_real == norm_workspace or resolved_real.startswith(norm_workspace + "/")):
+                return {
+                    "valid": False,
+                    "error": "Security violation: symbolic link targets a path outside workspace.",
+                }
+
+            return {"valid": True, "realpath": resolved_real}
+        except Exception as e:
+            return {
+                "valid": False,
+                "error": f"Path validation failed: {sanitize_error_message(str(e), self.github_token)}",
+            }
+
     def read_file(self, file_path: str) -> Dict[str, Any]:
         """Reads a file from the repository inside the sandbox with strict path and symlink checks."""
         if not self.sandbox:
@@ -217,13 +286,12 @@ class WorkspaceSandbox:
         if full_path == norm_workspace:
             return {"success": False, "error": "Invalid file path: path points outside workspace or to workspace root."}
 
-        # Check for escaping symlinks via realpath check in sandbox
-        try:
-            realpath_check = self.sandbox.commands.run(f"realpath -m {shlex.quote(full_path)}")
-            resolved_real = getattr(realpath_check, "stdout", "").strip()
-            if resolved_real and not (resolved_real == norm_workspace or resolved_real.startswith(norm_workspace + "/")):
-                return {"success": False, "error": "Security violation: symbolic link targets a path outside workspace."}
+        # Check for escaping symlinks via realpath check in sandbox (fails closed)
+        containment = self._check_realpath_confinement(full_path)
+        if not containment["valid"]:
+            return {"success": False, "error": containment["error"]}
 
+        try:
             content = self.sandbox.files.read(full_path)
             return {"success": True, "content": content}
         except Exception as e:
@@ -240,12 +308,12 @@ class WorkspaceSandbox:
         if full_path == norm_workspace:
             return {"success": False, "error": "Invalid file path: path points outside workspace or to workspace root."}
 
-        try:
-            realpath_check = self.sandbox.commands.run(f"realpath -m {shlex.quote(full_path)}")
-            resolved_real = getattr(realpath_check, "stdout", "").strip()
-            if resolved_real and not (resolved_real == norm_workspace or resolved_real.startswith(norm_workspace + "/")):
-                return {"success": False, "error": "Security violation: symbolic link targets a path outside workspace."}
+        # Check for escaping symlinks via realpath check in sandbox (fails closed)
+        containment = self._check_realpath_confinement(full_path)
+        if not containment["valid"]:
+            return {"success": False, "error": containment["error"]}
 
+        try:
             self.sandbox.files.write(full_path, content)
             return {"success": True}
         except Exception as e:
@@ -301,16 +369,11 @@ class WorkspaceSandbox:
 
             # Push branch using transient askpass helper without exposing credentials to command args or remote URL
             if self.github_token:
-                askpass_push = "/home/user/.git_askpass_push_tmp"
-                askpass_content = f"#!/bin/sh\nexec echo {shlex.quote(self.github_token)}\n"
-                self.sandbox.files.write(askpass_push, askpass_content)
-                self.sandbox.commands.run(f"chmod 700 {askpass_push}")
-
-                push_cmd = f"GIT_ASKPASS={askpass_push} GIT_TERMINAL_PROMPT=0 git push -u origin {q_branch}"
-                try:
-                    push_res = self.sandbox.commands.run(push_cmd, cwd=WORKSPACE_DIR)
-                finally:
-                    self.sandbox.commands.run(f"rm -f {askpass_push}")
+                push_res = self._run_git_with_askpass(
+                    f"git push -u origin {q_branch}",
+                    cwd=WORKSPACE_DIR,
+                    helper_prefix="push",
+                )
             else:
                 push_cmd = f"git push -u origin {q_branch}"
                 push_res = self.sandbox.commands.run(push_cmd, cwd=WORKSPACE_DIR)

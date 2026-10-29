@@ -4,14 +4,20 @@ Covers:
 1. PKCE verifiers and OAuth states are cryptographically unpredictable and unique across attempts.
 2. Invalid, mismatched, expired, reused, or cross-session OAuth state is rejected.
    CRITICAL: Verifies rejection of invalid state even when exactly ONE legitimate pending state exists.
+   CRITICAL: Verifies rejection of cross-session OAuth state consumption between different browser sessions.
 3. Missing or invalid encryption keys prevent secret writes (fail-closed in encrypt_secret and _save_local_user_data).
 4. Failed decryption does not return ciphertext as a valid plaintext secret.
+   CRITICAL: Distinguishes supported legacy plaintext records from invalid ciphertext and corrupted files.
+   CRITICAL: Raises DecryptionError on corrupted ciphertext or invalid key, preserving existing store.
 5. Git clone and push do NOT embed credentials in remote URLs or process command strings (uses ephemeral askpass helper).
+   CRITICAL: Unified setup/execution cleanup guarantees helper deletion on failure.
+   CRITICAL: Distinguishes username and password prompts.
 6. Tokens are redacted and not exposed through command strings, config, logs, or error messages.
 7. Malicious branch names and commit messages cannot execute arbitrary shell commands.
 8. Nonzero process exit codes are reported accurately (success=False).
 9. Step-limit exhaustion is reported as incomplete (success=False, status='incomplete_step_limit').
 10. Strict path confinement: prevents directory traversal (../), prefix collision (/workspace-evil), and escaping symlinks.
+   CRITICAL: Symlink validation fails closed if realpath command fails or returns empty output.
 """
 
 import os
@@ -32,7 +38,7 @@ from sandbox import (
 
 
 # =====================================================================
-# 1 & 2. OAUTH PKCE & STATE TESTS
+# 1 & 2. OAUTH PKCE & STATE TESTS (SESSION BINDING & STRICT VALIDATION)
 # =====================================================================
 
 class TestOAuthSecurity:
@@ -45,8 +51,8 @@ class TestOAuthSecurity:
             mock_client.auth._url = "https://example.supabase.co/auth/v1"
             mock_supabase.return_value = mock_client
 
-            res1 = db.get_oauth_url("github", "http://localhost:8501")
-            res2 = db.get_oauth_url("github", "http://localhost:8501")
+            res1 = db.get_oauth_url("github", "http://localhost:8501", session_id="session_A")
+            res2 = db.get_oauth_url("github", "http://localhost:8501", session_id="session_B")
 
             assert res1["success"] is True
             assert res2["success"] is True
@@ -59,6 +65,32 @@ class TestOAuthSecurity:
             assert f"state={res1['state']}" in res1["url"]
             assert f"state={res2['state']}" in res2["url"]
 
+    def test_oauth_exchange_rejects_cross_session_state(self):
+        """CRITICAL: One user's/browser's pending state cannot be consumed by a different session (login-CSRF defense)."""
+        with patch.object(db, "get_supabase_client") as mock_supabase:
+            mock_client = MagicMock()
+            mock_client.auth._url = "https://example.supabase.co/auth/v1"
+            mock_supabase.return_value = mock_client
+
+            # Session A initiates OAuth
+            session_a = "browser_session_alpha"
+            session_b = "browser_session_beta_attacker"
+
+            gen_res = db.get_oauth_url("github", "http://localhost:8501", session_id=session_a)
+            assert gen_res["success"] is True
+            state_a = gen_res["state"]
+
+            # Session B attempts to complete login with Session A's state
+            res = db.exchange_oauth_code("auth_code_victim", state=state_a, session_id=session_b)
+            assert res["success"] is False
+            assert "cross-session state mismatch" in res["error"]
+
+            # Session A completing with Session A's state must succeed
+            mock_client.auth._storage_key = "sb"
+            mock_client.auth.exchange_code_for_session.return_value = MagicMock(user=MagicMock(id="user_alpha"))
+            valid_res = db.exchange_oauth_code("auth_code_victim", state=state_a, session_id=session_a)
+            assert valid_res["success"] is True
+
     def test_oauth_exchange_rejects_invalid_state_even_when_single_pending_state_exists(self):
         """CRITICAL: Mismatched state must be rejected even if exactly one valid state exists."""
         with patch.object(db, "get_supabase_client") as mock_supabase:
@@ -67,25 +99,25 @@ class TestOAuthSecurity:
             mock_supabase.return_value = mock_client
 
             # Generate exactly one legitimate attempt
-            gen_res = db.get_oauth_url("github", "http://localhost:8501")
+            gen_res = db.get_oauth_url("github", "http://localhost:8501", session_id="sess_1")
             assert gen_res["success"] is True
             valid_state = gen_res["state"]
 
             # Attempt exchange with forged / mismatched state
             forged_state = "forged_attacker_state_12345"
-            res = db.exchange_oauth_code("auth_code_x", state=forged_state)
+            res = db.exchange_oauth_code("auth_code_x", state=forged_state, session_id="sess_1")
             assert res["success"] is False
             assert "invalid, expired, or already-used" in res["error"]
 
             # Also attempt exchange with missing / empty state
-            res_empty = db.exchange_oauth_code("auth_code_x", state="")
+            res_empty = db.exchange_oauth_code("auth_code_x", state="", session_id="sess_1")
             assert res_empty["success"] is False
             assert "missing or empty state" in res_empty["error"]
 
             # The original valid state should still be consumable
             mock_client.auth._storage_key = "sb"
             mock_client.auth.exchange_code_for_session.return_value = MagicMock(user=MagicMock(id="user_valid"))
-            valid_res = db.exchange_oauth_code("auth_code_x", state=valid_state)
+            valid_res = db.exchange_oauth_code("auth_code_x", state=valid_state, session_id="sess_1")
             assert valid_res["success"] is True
 
     def test_oauth_exchange_single_use_prevents_replay(self):
@@ -97,15 +129,15 @@ class TestOAuthSecurity:
             mock_client.auth.exchange_code_for_session.return_value = MagicMock(user=MagicMock(id="user_123"))
             mock_supabase.return_value = mock_client
 
-            gen_res = db.get_oauth_url("google", "http://localhost:8501")
+            gen_res = db.get_oauth_url("google", "http://localhost:8501", session_id="sess_replay")
             state = gen_res["state"]
 
             # First exchange should succeed
-            exchange1 = db.exchange_oauth_code("auth_code_1", state=state)
+            exchange1 = db.exchange_oauth_code("auth_code_1", state=state, session_id="sess_replay")
             assert exchange1["success"] is True
 
             # Second exchange with same state must be rejected (single-use)
-            exchange2 = db.exchange_oauth_code("auth_code_1", state=state)
+            exchange2 = db.exchange_oauth_code("auth_code_1", state=state, session_id="sess_replay")
             assert exchange2["success"] is False
             assert "invalid, expired, or already-used" in exchange2["error"]
 
@@ -122,12 +154,13 @@ class TestOAuthSecurity:
                 states[expired_state] = {
                     "verifier": "old_verifier",
                     "provider": "github",
+                    "session_id": "sess_exp",
                     "created_at": time.time() - (db.OAUTH_STATE_EXPIRY_SECONDS + 50),
                 }
 
             db._atomic_modify_oauth_states(_inject_expired)
 
-            res = db.exchange_oauth_code("auth_code_x", state=expired_state)
+            res = db.exchange_oauth_code("auth_code_x", state=expired_state, session_id="sess_exp")
             assert res["success"] is False
             assert "invalid, expired, or already-used" in res["error"]
 
@@ -152,6 +185,41 @@ class TestFailClosedEncryption:
         with pytest.raises(db.EncryptionConfigurationError) as exc_info:
             db._save_local_user_data("test_user_id", "test@example.com", {"api_keys": {"openai": "sk-123"}})
         assert "Refusing to persist local user store in plaintext" in str(exc_info.value)
+
+    def test_load_local_user_data_distinguishes_legacy_and_raises_on_corrupted_ciphertext(self, monkeypatch, tmp_path):
+        """_load_local_user_data must raise DecryptionError on corrupted ciphertext instead of returning empty dict."""
+        monkeypatch.setattr(db, "USER_STORE_DIR", str(tmp_path))
+        valid_key = Fernet.generate_key().decode()
+        monkeypatch.setattr(db, "_get_fernet", lambda: Fernet(valid_key.encode()))
+
+        # 1. Write corrupted Fernet token
+        test_uid = "user_corrupted_test"
+        filename = db._get_safe_filename(test_uid) + ".json"
+        corrupted_file = tmp_path / filename
+        corrupted_file.write_text("gAAAAABcorrupted_fernet_token_contents_here")
+
+        # Must raise DecryptionError, NOT silently return {}
+        with pytest.raises(db.DecryptionError) as exc_info:
+            db._load_local_user_data(test_uid)
+        assert "invalid key or corrupted ciphertext" in str(exc_info.value)
+
+        # Ensure the corrupted file on disk was preserved (not overwritten/deleted)
+        assert corrupted_file.exists()
+        assert corrupted_file.read_text() == "gAAAAABcorrupted_fernet_token_contents_here"
+
+    def test_load_local_user_data_supports_legitimate_legacy_plaintext_json(self, monkeypatch, tmp_path):
+        """Legacy plaintext JSON records are safely parsed without error."""
+        monkeypatch.setattr(db, "USER_STORE_DIR", str(tmp_path))
+        valid_key = Fernet.generate_key().decode()
+        monkeypatch.setattr(db, "_get_fernet", lambda: Fernet(valid_key.encode()))
+
+        legacy_uid = "legacy_user_test"
+        filename = db._get_safe_filename(legacy_uid) + ".json"
+        legacy_file = tmp_path / filename
+        legacy_file.write_text('{"active_repo": "owner/legacy-repo"}')
+
+        loaded = db._load_local_user_data(legacy_uid)
+        assert loaded == {"active_repo": "owner/legacy-repo"}
 
     def test_decrypt_secret_fails_closed_on_invalid_token(self, monkeypatch):
         """Corrupted or mismatched ciphertext must raise DecryptionError, not return ciphertext."""
@@ -240,8 +308,45 @@ class TestTokenIsolationAndRedaction:
                 assert "AUTHORIZATION: basic" not in cmd
 
             # Verify askpass script was written and cleaned up
-            assert "/home/user/.git_askpass_tmp" in files_written
-            assert any("rm -f /home/user/.git_askpass_tmp" in cmd for cmd in executed_commands)
+            askpass_files = [p for p in files_written.keys() if ".git_askpass_clone_" in p]
+            assert len(askpass_files) > 0
+            # Script must distinguish Username vs Password
+            assert "*Username*|*username*)" in files_written[askpass_files[0]]
+            assert any(f"rm -f {askpass_files[0]}" in cmd for cmd in executed_commands)
+
+    def test_askpass_cleans_up_even_if_git_command_fails(self):
+        """Credential helper must be cleaned up even if git clone exits with error."""
+        with patch.object(sandbox, "get_e2b_api_key", return_value="fake_e2b_key"):
+            sb = WorkspaceSandbox(repo_name="org/failing-repo", github_token="ghp_SecretToken12345")
+            mock_container = MagicMock()
+            sb.sandbox = mock_container
+
+            executed_commands = []
+            files_written = {}
+
+            def fake_run(cmd, **kwargs):
+                executed_commands.append(cmd)
+                res = MagicMock()
+                if "git clone" in cmd:
+                    res.exit_code = 128
+                    res.stderr = "fatal: repository not found"
+                else:
+                    res.exit_code = 0
+                return res
+
+            mock_container.commands.run = fake_run
+            mock_container.files.write = lambda p, c: files_written.update({p: c})
+
+            with patch("e2b.Sandbox") as mock_e2b:
+                mock_e2b.create.return_value = mock_container
+                start_res = sb.start()
+
+            assert start_res["success"] is False
+
+            # Cleanup command must still have executed
+            askpass_files = [p for p in files_written.keys() if ".git_askpass_clone_" in p]
+            assert len(askpass_files) > 0
+            assert any(f"rm -f {askpass_files[0]}" in cmd for cmd in executed_commands)
 
 
 # =====================================================================
@@ -432,3 +537,34 @@ class TestPathConfinementAndSymlinks:
         write_res = sb.write_file("evil_symlink.txt", "hacked")
         assert write_res["success"] is False
         assert "symbolic link targets a path outside workspace" in write_res["error"]
+
+    def test_read_and_write_file_fail_closed_if_realpath_fails_or_returns_empty(self):
+        """CRITICAL: If realpath command fails or returns empty stdout, read/write must be blocked (fail-closed)."""
+        sb = WorkspaceSandbox(repo_name="org/repo", github_token="")
+        mock_container = MagicMock()
+        sb.sandbox = mock_container
+
+        # 1. realpath command returns non-zero exit code
+        mock_failed_res = MagicMock()
+        mock_failed_res.exit_code = 1
+        mock_failed_res.stdout = ""
+        mock_failed_res.stderr = "realpath: permission denied"
+        mock_container.commands.run.return_value = mock_failed_res
+
+        read_res = sb.read_file("some_file.txt")
+        assert read_res["success"] is False
+        assert "Path validation failed" in read_res["error"]
+
+        write_res = sb.write_file("some_file.txt", "content")
+        assert write_res["success"] is False
+        assert "Path validation failed" in write_res["error"]
+
+        # 2. realpath command returns exit code 0 but empty stdout
+        mock_empty_res = MagicMock()
+        mock_empty_res.exit_code = 0
+        mock_empty_res.stdout = "   "
+        mock_container.commands.run.return_value = mock_empty_res
+
+        read_res2 = sb.read_file("some_file.txt")
+        assert read_res2["success"] is False
+        assert "Path validation failed" in read_res2["error"]

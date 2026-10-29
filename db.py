@@ -185,9 +185,10 @@ def _atomic_modify_oauth_states(modifier_fn):
             fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
 
-def get_oauth_url(provider: str, redirect_to: str) -> Dict[str, Any]:
+def get_oauth_url(provider: str, redirect_to: str, session_id: Optional[str] = None) -> Dict[str, Any]:
     """Generates a secure OAuth URL with cryptographically random per-attempt PKCE verifier and state.
     
+    Binds the attempt to the initiating browser session_id if provided.
     Does NOT leak the verifier in the returned dictionary.
     """
     supabase = get_supabase_client()
@@ -200,6 +201,7 @@ def get_oauth_url(provider: str, redirect_to: str) -> Dict[str, Any]:
             states[oauth_state] = {
                 "verifier": pkce_verifier,
                 "provider": provider,
+                "session_id": session_id or "",
                 "created_at": time.time(),
             }
 
@@ -218,11 +220,11 @@ def get_oauth_url(provider: str, redirect_to: str) -> Dict[str, Any]:
         return {"success": False, "error": str(e)}
 
 
-def exchange_oauth_code(code: str, state: Optional[str] = None) -> Dict[str, Any]:
+def exchange_oauth_code(code: str, state: Optional[str] = None, session_id: Optional[str] = None) -> Dict[str, Any]:
     """Exchanges an authorization code using the matched single-use PKCE verifier for the state.
     
-    Strictly validates that state is present, matches an active attempt, and consumes it atomically.
-    Never falls back to other pending states.
+    Strictly validates that state is present, matches an active attempt, matches the initiating session_id,
+    and consumes it atomically. Never falls back to other pending states.
     """
     if not state or not isinstance(state, str) or not state.strip():
         return {
@@ -234,17 +236,30 @@ def exchange_oauth_code(code: str, state: Optional[str] = None) -> Dict[str, Any
 
     def _consume_state(states):
         if clean_state in states:
+            val = states.get(clean_state, {})
+            expected_session = val.get("session_id", "")
+            # If session binding was recorded, enforce exact match to prevent login-CSRF / cross-session injection
+            if expected_session and session_id and expected_session != session_id:
+                return "SESSION_MISMATCH"
             val = states.pop(clean_state)
             return val.get("verifier")
         return None
 
-    pkce_verifier = _atomic_modify_oauth_states(_consume_state)
+    consume_result = _atomic_modify_oauth_states(_consume_state)
 
-    if not pkce_verifier:
+    if consume_result == "SESSION_MISMATCH":
+        return {
+            "success": False,
+            "error": "OAuth authorization failed: cross-session state mismatch. This authorization attempt does not belong to your session.",
+        }
+
+    if not consume_result:
         return {
             "success": False,
             "error": "OAuth authorization failed: invalid, expired, or already-used authorization attempt.",
         }
+
+    pkce_verifier = consume_result
 
     supabase = get_supabase_client()
     try:
@@ -277,7 +292,12 @@ def sign_out() -> bool:
 def _load_local_user_data(
     user_id: str, email: Optional[str] = None
 ) -> Dict[str, Any]:
-    """Loads and decrypts user data from .user_store by user_id or email hash."""
+    """Loads and decrypts user data from .user_store by user_id or email hash.
+    
+    Distinguishes legitimate legacy plaintext JSON from encrypted data and corrupted ciphertext.
+    If decryption fails or ciphertext is corrupted/mismatched, raises DecryptionError
+    to prevent partial/empty state from overwriting persisted user data.
+    """
     _ensure_user_store_dir()
     f = _get_fernet()
     candidates = []
@@ -289,21 +309,39 @@ def _load_local_user_data(
     for c in candidates:
         filepath = os.path.join(USER_STORE_DIR, f"{c}.json")
         if os.path.exists(filepath):
-            try:
-                with open(filepath, "r", encoding="utf-8") as fp:
-                    raw = fp.read()
-                if f:
-                    try:
-                        decrypted = f.decrypt(raw.encode()).decode()
-                        data = json.loads(decrypted)
-                    except Exception:
-                        data = json.loads(raw)
-                else:
+            with open(filepath, "r", encoding="utf-8") as fp:
+                raw = fp.read().strip()
+            if not raw:
+                continue
+
+            # Encrypted Fernet payload check
+            if raw.startswith("gAAAAA"):
+                if not f:
+                    raise EncryptionConfigurationError(
+                        "ENCRYPTION_KEY missing or invalid; cannot decrypt existing encrypted user store."
+                    )
+                try:
+                    decrypted = f.decrypt(raw.encode()).decode()
+                    data = json.loads(decrypted)
+                    if isinstance(data, dict):
+                        return data
+                except InvalidToken:
+                    raise DecryptionError(
+                        f"Decryption failed for user store {c}: invalid key or corrupted ciphertext. "
+                        "Preserving existing store without overwrite."
+                    )
+                except Exception as dec_err:
+                    raise DecryptionError(f"Decryption failed for user store {c}: {str(dec_err)}")
+            else:
+                # Legacy plaintext record compatibility
+                try:
                     data = json.loads(raw)
-                if isinstance(data, dict):
-                    return data
-            except Exception:
-                pass
+                    if isinstance(data, dict):
+                        return data
+                except Exception as json_err:
+                    raise DecryptionError(
+                        f"Corrupted user store data in {c}: neither valid ciphertext nor valid JSON ({str(json_err)})."
+                    )
     return {}
 
 
