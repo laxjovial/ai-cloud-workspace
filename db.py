@@ -142,57 +142,68 @@ def get_supabase_client() -> Client:
 # ==========================================
 
 
-def _clean_and_load_oauth_states() -> Dict[str, Any]:
-    """Loads pending OAuth states and removes expired ones."""
-    now = time.time()
-    states: Dict[str, Any] = {}
-    if os.path.exists(OAUTH_STATES_FILE):
+import fcntl
+
+
+def _atomic_modify_oauth_states(modifier_fn):
+    """Safely reads, modifies, and writes OAuth states using file-level exclusive locking."""
+    # Ensure directory exists
+    dir_name = os.path.dirname(os.path.abspath(OAUTH_STATES_FILE))
+    os.makedirs(dir_name, exist_ok=True)
+    lock_file = OAUTH_STATES_FILE + ".lock"
+
+    with open(lock_file, "w") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
         try:
-            with open(OAUTH_STATES_FILE, "r", encoding="utf-8") as fp:
-                data = json.load(fp)
-                if isinstance(data, dict):
-                    states = data
-        except Exception:
-            states = {}
+            now = time.time()
+            states: Dict[str, Any] = {}
+            if os.path.exists(OAUTH_STATES_FILE):
+                try:
+                    with open(OAUTH_STATES_FILE, "r", encoding="utf-8") as fp:
+                        data = json.load(fp)
+                        if isinstance(data, dict):
+                            states = data
+                except Exception:
+                    states = {}
 
-    cleaned = {}
-    for st_id, val in states.items():
-        if isinstance(val, dict):
-            created_at = val.get("created_at", 0)
-            if now - created_at < OAUTH_STATE_EXPIRY_SECONDS:
-                cleaned[st_id] = val
-        elif isinstance(val, str):
-            # Legacy state without timestamp: expire to be safe
-            pass
-    return cleaned
+            # Expire old states
+            cleaned = {
+                st_id: val
+                for st_id, val in states.items()
+                if isinstance(val, dict) and (now - val.get("created_at", 0) < OAUTH_STATE_EXPIRY_SECONDS)
+            }
 
+            result = modifier_fn(cleaned)
 
-def _save_oauth_states(states: Dict[str, Any]):
-    """Persists active OAuth states."""
-    try:
-        with open(OAUTH_STATES_FILE, "w", encoding="utf-8") as fp:
-            json.dump(states, fp)
-    except Exception:
-        pass
+            # Write back atomically via temp file
+            tmp_path = OAUTH_STATES_FILE + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as fp:
+                json.dump(cleaned, fp)
+            os.replace(tmp_path, OAUTH_STATES_FILE)
+            return result
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
 
 def get_oauth_url(provider: str, redirect_to: str) -> Dict[str, Any]:
-    """Generates a secure OAuth URL with cryptographically random per-attempt PKCE verifier and state."""
+    """Generates a secure OAuth URL with cryptographically random per-attempt PKCE verifier and state.
+    
+    Does NOT leak the verifier in the returned dictionary.
+    """
     supabase = get_supabase_client()
     try:
-        # Generate cryptographically secure random verifier (minimum 43, max 128 chars)
         pkce_verifier = secrets.token_urlsafe(64)
         pkce_challenge = generate_pkce_challenge(pkce_verifier)
         oauth_state = secrets.token_urlsafe(32)
 
-        # Record in pending OAuth states with timestamp
-        states = _clean_and_load_oauth_states()
-        states[oauth_state] = {
-            "verifier": pkce_verifier,
-            "provider": provider,
-            "created_at": time.time(),
-        }
-        _save_oauth_states(states)
+        def _record_state(states):
+            states[oauth_state] = {
+                "verifier": pkce_verifier,
+                "provider": provider,
+                "created_at": time.time(),
+            }
+
+        _atomic_modify_oauth_states(_record_state)
 
         auth_url = (
             f"{supabase.auth._url}/authorize?provider={provider}"
@@ -201,27 +212,33 @@ def get_oauth_url(provider: str, redirect_to: str) -> Dict[str, Any]:
             f"&code_challenge_method=s256"
             f"&state={oauth_state}"
         )
-        return {"success": True, "url": auth_url, "state": oauth_state, "verifier": pkce_verifier}
+        # Note: Do not return 'verifier' to the caller/UI
+        return {"success": True, "url": auth_url, "state": oauth_state}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
 def exchange_oauth_code(code: str, state: Optional[str] = None) -> Dict[str, Any]:
-    """Exchanges an authorization code using the matched single-use PKCE verifier for the state."""
-    supabase = get_supabase_client()
-    states = _clean_and_load_oauth_states()
+    """Exchanges an authorization code using the matched single-use PKCE verifier for the state.
+    
+    Strictly validates that state is present, matches an active attempt, and consumes it atomically.
+    Never falls back to other pending states.
+    """
+    if not state or not isinstance(state, str) or not state.strip():
+        return {
+            "success": False,
+            "error": "OAuth authorization failed: missing or empty state parameter.",
+        }
 
-    pkce_verifier = None
-    if state and state in states:
-        pkce_verifier = states[state].get("verifier")
-        del states[state]
-        _save_oauth_states(states)
-    elif len(states) == 1:
-        # Fallback if state was stripped by provider or redirect
-        single_state = next(iter(states))
-        pkce_verifier = states[single_state].get("verifier")
-        del states[single_state]
-        _save_oauth_states(states)
+    clean_state = state.strip()
+
+    def _consume_state(states):
+        if clean_state in states:
+            val = states.pop(clean_state)
+            return val.get("verifier")
+        return None
+
+    pkce_verifier = _atomic_modify_oauth_states(_consume_state)
 
     if not pkce_verifier:
         return {
@@ -229,6 +246,7 @@ def exchange_oauth_code(code: str, state: Optional[str] = None) -> Dict[str, Any
             "error": "OAuth authorization failed: invalid, expired, or already-used authorization attempt.",
         }
 
+    supabase = get_supabase_client()
     try:
         supabase.auth._storage.set_item(
             f"{supabase.auth._storage_key}-code-verifier", pkce_verifier
@@ -292,17 +310,25 @@ def _load_local_user_data(
 def _save_local_user_data(
     user_id: str, email: Optional[str], data: Dict[str, Any]
 ):
-    """Encrypts and saves user data to .user_store keyed by both user_id and email."""
+    """Encrypts and saves user data to .user_store keyed by both user_id and email.
+    
+    Fails closed: if ENCRYPTION_KEY is missing, invalid, or encryption fails,
+    raises EncryptionConfigurationError and refuses to write plaintext data.
+    """
     _ensure_user_store_dir()
     f = _get_fernet()
+    if not f:
+        raise EncryptionConfigurationError(
+            "ENCRYPTION_KEY is not configured or is invalid. Refusing to persist local user store in plaintext."
+        )
+
     raw = json.dumps(data)
-    if f:
-        try:
-            payload = f.encrypt(raw.encode()).decode()
-        except Exception:
-            payload = raw
-    else:
-        payload = raw
+    try:
+        payload = f.encrypt(raw.encode()).decode()
+    except Exception as e:
+        raise EncryptionConfigurationError(
+            f"Failed to encrypt user store data: {str(e)}. Aborting local persistence to prevent plaintext exposure."
+        )
 
     keys = []
     if user_id:
@@ -312,11 +338,13 @@ def _save_local_user_data(
 
     for k in keys:
         filepath = os.path.join(USER_STORE_DIR, f"{k}.json")
+        tmp_filepath = filepath + ".tmp"
         try:
-            with open(filepath, "w", encoding="utf-8") as fp:
+            with open(tmp_filepath, "w", encoding="utf-8") as fp:
                 fp.write(payload)
-        except Exception:
-            pass
+            os.replace(tmp_filepath, filepath)
+        except Exception as write_err:
+            raise IOError(f"Failed to atomically persist encrypted user store: {str(write_err)}")
 
 
 def save_user_workspace_state(

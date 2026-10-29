@@ -74,37 +74,35 @@ class WorkspaceSandbox:
             # Clean destination directory
             self.sandbox.commands.run(f"rm -rf {WORKSPACE_DIR}")
 
-            # Clone using Git client or temporary git credential helper
-            # Token is never embedded in clone URL or persistent origin URL
+            # Clone using Git client with transient credential helper
+            # Token is provided via an ephemeral askpass script with chmod 700 and deleted immediately
             if self.github_token:
-                # Use git -c http.extraHeader to pass authorization for clone without writing to .git/config
-                import base64
-                auth_val = base64.b64encode(f"x-access-token:{self.github_token}".encode()).decode()
+                # Install ephemeral askpass helper script in /home/user/.git_askpass_tmp
+                askpass_path = "/home/user/.git_askpass_tmp"
+                # Write token via sandbox files API to avoid exposing it in process command arguments
+                askpass_content = f"#!/bin/sh\nexec echo {shlex.quote(self.github_token)}\n"
+                self.sandbox.files.write(askpass_path, askpass_content)
+                self.sandbox.commands.run(f"chmod 700 {askpass_path}")
+
                 clone_cmd = (
-                    f"git -c http.extraHeader=\"AUTHORIZATION: basic {auth_val}\" "
-                    f"clone --depth 50 {clean_repo_url} {WORKSPACE_DIR}"
+                    f"GIT_ASKPASS={askpass_path} GIT_TERMINAL_PROMPT=0 "
+                    f"git clone --depth 50 {clean_repo_url} {WORKSPACE_DIR}"
                 )
+                try:
+                    result = self.sandbox.commands.run(clone_cmd)
+                finally:
+                    # Guaranteed cleanup of credential helper immediately after clone
+                    self.sandbox.commands.run(f"rm -f {askpass_path}")
             else:
                 clone_cmd = f"git clone --depth 50 {clean_repo_url} {WORKSPACE_DIR}"
-
-            try:
                 result = self.sandbox.commands.run(clone_cmd)
-                exit_code = getattr(result, "exit_code", 0)
-                if exit_code != 0:
-                    raw_err = getattr(result, 'stderr', '') or getattr(result, 'stdout', '')
-                    return {
-                        "success": False,
-                        "error": f"Failed to clone repository: {sanitize_error_message(raw_err, self.github_token)}",
-                    }
-            except Exception as cmd_err:
-                err_msg = str(cmd_err)
-                if hasattr(cmd_err, "stderr") and getattr(cmd_err, "stderr"):
-                    err_msg = getattr(cmd_err, "stderr")
-                elif hasattr(cmd_err, "stdout") and getattr(cmd_err, "stdout"):
-                    err_msg = getattr(cmd_err, "stdout")
+
+            exit_code = getattr(result, "exit_code", 0)
+            if exit_code != 0:
+                raw_err = getattr(result, 'stderr', '') or getattr(result, 'stdout', '')
                 return {
                     "success": False,
-                    "error": f"Failed to clone repository: {sanitize_error_message(err_msg, self.github_token)}",
+                    "error": f"Failed to clone repository: {sanitize_error_message(raw_err, self.github_token)}",
                 }
 
             # Double-check that .git/config does NOT contain credentials
@@ -122,23 +120,34 @@ class WorkspaceSandbox:
             return {"success": False, "error": sanitize_error_message(str(e), self.github_token)}
 
     def _resolve_path(self, file_path: str) -> str:
-        """Resolves relative or legacy /workspace paths to /home/user/workspace and confines to workspace."""
-        p = file_path.strip()
-        if p.startswith(WORKSPACE_DIR):
-            resolved = p
-        elif p.startswith("/workspace"):
-            p = p[len("/workspace"):].lstrip("/")
-            resolved = f"{WORKSPACE_DIR}/{p}"
-        elif p.startswith("/"):
-            resolved = os.path.normpath(f"{WORKSPACE_DIR}/{p.lstrip('/')}")
-        else:
-            resolved = os.path.normpath(os.path.join(WORKSPACE_DIR, p))
-
-        # Confine path: must not traverse outside WORKSPACE_DIR
+        """Resolves relative or legacy /workspace paths to /home/user/workspace and confines strictly to workspace."""
         norm_workspace = os.path.normpath(WORKSPACE_DIR)
-        if not resolved.startswith(norm_workspace):
+        p = file_path.strip()
+        if not p:
             return norm_workspace
-        return resolved
+
+        if p.startswith("/workspace"):
+            sub = p[len("/workspace"):].lstrip("/")
+            target = os.path.normpath(os.path.join(norm_workspace, sub))
+        elif p.startswith("/"):
+            normalized_abs = os.path.normpath(p)
+            if normalized_abs == norm_workspace or normalized_abs.startswith(norm_workspace + "/"):
+                target = normalized_abs
+            else:
+                # Any absolute path outside workspace is rejected/confined
+                return norm_workspace
+        else:
+            target = os.path.normpath(os.path.join(norm_workspace, p))
+
+        # Check path containment using commonpath to prevent prefix collisions and traversal
+        try:
+            common = os.path.commonpath([norm_workspace, target])
+        except Exception:
+            return norm_workspace
+
+        if common != norm_workspace:
+            return norm_workspace
+        return target
 
     def run_command(self, command: str, cwd: str = WORKSPACE_DIR) -> Dict[str, Any]:
         """Runs any bash command inside the sandbox with truthful exit_code and success flags."""
@@ -197,24 +206,46 @@ class WorkspaceSandbox:
             return {"success": False, "error": sanitize_error_message(str(e), self.github_token)}
 
     def read_file(self, file_path: str) -> Dict[str, Any]:
-        """Reads a file from the repository inside the sandbox."""
+        """Reads a file from the repository inside the sandbox with strict path and symlink checks."""
         if not self.sandbox:
             return {"success": False, "error": "Sandbox is not running."}
 
         full_path = self._resolve_path(file_path)
+        norm_workspace = os.path.normpath(WORKSPACE_DIR)
+
+        # Disallow reading root workspace dir directly as file
+        if full_path == norm_workspace:
+            return {"success": False, "error": "Invalid file path: path points outside workspace or to workspace root."}
+
+        # Check for escaping symlinks via realpath check in sandbox
         try:
+            realpath_check = self.sandbox.commands.run(f"realpath -m {shlex.quote(full_path)}")
+            resolved_real = getattr(realpath_check, "stdout", "").strip()
+            if resolved_real and not (resolved_real == norm_workspace or resolved_real.startswith(norm_workspace + "/")):
+                return {"success": False, "error": "Security violation: symbolic link targets a path outside workspace."}
+
             content = self.sandbox.files.read(full_path)
             return {"success": True, "content": content}
         except Exception as e:
             return {"success": False, "error": sanitize_error_message(str(e), self.github_token)}
 
     def write_file(self, file_path: str, content: str) -> Dict[str, Any]:
-        """Writes or updates a file inside the repository in the sandbox."""
+        """Writes or updates a file inside the repository in the sandbox with strict path and symlink checks."""
         if not self.sandbox:
             return {"success": False, "error": "Sandbox is not running."}
 
         full_path = self._resolve_path(file_path)
+        norm_workspace = os.path.normpath(WORKSPACE_DIR)
+
+        if full_path == norm_workspace:
+            return {"success": False, "error": "Invalid file path: path points outside workspace or to workspace root."}
+
         try:
+            realpath_check = self.sandbox.commands.run(f"realpath -m {shlex.quote(full_path)}")
+            resolved_real = getattr(realpath_check, "stdout", "").strip()
+            if resolved_real and not (resolved_real == norm_workspace or resolved_real.startswith(norm_workspace + "/")):
+                return {"success": False, "error": "Security violation: symbolic link targets a path outside workspace."}
+
             self.sandbox.files.write(full_path, content)
             return {"success": True}
         except Exception as e:
@@ -268,15 +299,22 @@ class WorkspaceSandbox:
                     "error": f"Git commit failed: {sanitize_error_message(raw_err, self.github_token)}",
                 }
 
-            # Push branch using transient header without exposing credentials to remote URL
+            # Push branch using transient askpass helper without exposing credentials to command args or remote URL
             if self.github_token:
-                import base64
-                auth_val = base64.b64encode(f"x-access-token:{self.github_token}".encode()).decode()
-                push_cmd = f"git -c http.extraHeader=\"AUTHORIZATION: basic {auth_val}\" push -u origin {q_branch}"
+                askpass_push = "/home/user/.git_askpass_push_tmp"
+                askpass_content = f"#!/bin/sh\nexec echo {shlex.quote(self.github_token)}\n"
+                self.sandbox.files.write(askpass_push, askpass_content)
+                self.sandbox.commands.run(f"chmod 700 {askpass_push}")
+
+                push_cmd = f"GIT_ASKPASS={askpass_push} GIT_TERMINAL_PROMPT=0 git push -u origin {q_branch}"
+                try:
+                    push_res = self.sandbox.commands.run(push_cmd, cwd=WORKSPACE_DIR)
+                finally:
+                    self.sandbox.commands.run(f"rm -f {askpass_push}")
             else:
                 push_cmd = f"git push -u origin {q_branch}"
+                push_res = self.sandbox.commands.run(push_cmd, cwd=WORKSPACE_DIR)
 
-            push_res = self.sandbox.commands.run(push_cmd, cwd=WORKSPACE_DIR)
             if getattr(push_res, "exit_code", 0) != 0:
                 raw_err = getattr(push_res, "stderr", "") or getattr(push_res, "stdout", "")
                 return {

@@ -3,14 +3,15 @@
 Covers:
 1. PKCE verifiers and OAuth states are cryptographically unpredictable and unique across attempts.
 2. Invalid, mismatched, expired, reused, or cross-session OAuth state is rejected.
-3. Missing or invalid encryption keys prevent secret writes (fail-closed).
+   CRITICAL: Verifies rejection of invalid state even when exactly ONE legitimate pending state exists.
+3. Missing or invalid encryption keys prevent secret writes (fail-closed in encrypt_secret and _save_local_user_data).
 4. Failed decryption does not return ciphertext as a valid plaintext secret.
-5. Git clone URLs and persisted remotes never contain tokens.
+5. Git clone and push do NOT embed credentials in remote URLs or process command strings (uses ephemeral askpass helper).
 6. Tokens are redacted and not exposed through command strings, config, logs, or error messages.
 7. Malicious branch names and commit messages cannot execute arbitrary shell commands.
 8. Nonzero process exit codes are reported accurately (success=False).
 9. Step-limit exhaustion is reported as incomplete (success=False, status='incomplete_step_limit').
-10. Legitimate workflows continue to function as expected.
+10. Strict path confinement: prevents directory traversal (../), prefix collision (/workspace-evil), and escaping symlinks.
 """
 
 import os
@@ -50,22 +51,42 @@ class TestOAuthSecurity:
             assert res1["success"] is True
             assert res2["success"] is True
 
-            assert res1["verifier"] != res2["verifier"]
+            assert "verifier" not in res1  # Verifier must NOT leak in returned dict
             assert res1["state"] != res2["state"]
-            assert len(res1["verifier"]) >= 43
             assert len(res1["state"]) >= 32
 
             # Ensure state is present in the generated authorization URL
             assert f"state={res1['state']}" in res1["url"]
             assert f"state={res2['state']}" in res2["url"]
 
-    def test_oauth_exchange_validates_state_and_rejects_invalid_state(self):
-        """Mismatched or forged OAuth states must be rejected."""
-        with patch.object(db, "get_supabase_client"):
-            fake_state = "unregistered_fake_oauth_state_1234567890"
-            res = db.exchange_oauth_code("test_code", state=fake_state)
+    def test_oauth_exchange_rejects_invalid_state_even_when_single_pending_state_exists(self):
+        """CRITICAL: Mismatched state must be rejected even if exactly one valid state exists."""
+        with patch.object(db, "get_supabase_client") as mock_supabase:
+            mock_client = MagicMock()
+            mock_client.auth._url = "https://example.supabase.co/auth/v1"
+            mock_supabase.return_value = mock_client
+
+            # Generate exactly one legitimate attempt
+            gen_res = db.get_oauth_url("github", "http://localhost:8501")
+            assert gen_res["success"] is True
+            valid_state = gen_res["state"]
+
+            # Attempt exchange with forged / mismatched state
+            forged_state = "forged_attacker_state_12345"
+            res = db.exchange_oauth_code("auth_code_x", state=forged_state)
             assert res["success"] is False
             assert "invalid, expired, or already-used" in res["error"]
+
+            # Also attempt exchange with missing / empty state
+            res_empty = db.exchange_oauth_code("auth_code_x", state="")
+            assert res_empty["success"] is False
+            assert "missing or empty state" in res_empty["error"]
+
+            # The original valid state should still be consumable
+            mock_client.auth._storage_key = "sb"
+            mock_client.auth.exchange_code_for_session.return_value = MagicMock(user=MagicMock(id="user_valid"))
+            valid_res = db.exchange_oauth_code("auth_code_x", state=valid_state)
+            assert valid_res["success"] is True
 
     def test_oauth_exchange_single_use_prevents_replay(self):
         """Consuming an authorization attempt once prevents replay with the same state."""
@@ -95,15 +116,16 @@ class TestOAuthSecurity:
             mock_client.auth._url = "https://example.supabase.co/auth/v1"
             mock_supabase.return_value = mock_client
 
-            # Save state with expired timestamp
             expired_state = "expired_state_9999"
-            states = db._clean_and_load_oauth_states()
-            states[expired_state] = {
-                "verifier": "old_verifier",
-                "provider": "github",
-                "created_at": time.time() - (db.OAUTH_STATE_EXPIRY_SECONDS + 50),
-            }
-            db._save_oauth_states(states)
+
+            def _inject_expired(states):
+                states[expired_state] = {
+                    "verifier": "old_verifier",
+                    "provider": "github",
+                    "created_at": time.time() - (db.OAUTH_STATE_EXPIRY_SECONDS + 50),
+                }
+
+            db._atomic_modify_oauth_states(_inject_expired)
 
             res = db.exchange_oauth_code("auth_code_x", state=expired_state)
             assert res["success"] is False
@@ -111,18 +133,25 @@ class TestOAuthSecurity:
 
 
 # =====================================================================
-# 3 & 4. FAIL-CLOSED ENCRYPTION TESTS
+# 3 & 4. FAIL-CLOSED ENCRYPTION & LOCAL STORAGE TESTS
 # =====================================================================
 
 class TestFailClosedEncryption:
-    """Tests confirming encryption fails closed and never returns raw plaintext or ciphertext."""
+    """Tests confirming encryption fails closed across secret encryption and local storage."""
 
     def test_encrypt_secret_fails_closed_when_key_missing(self, monkeypatch):
-        """Missing ENCRYPTION_KEY must raise EncryptionConfigurationError, never write plaintext."""
+        """Missing ENCRYPTION_KEY must raise EncryptionConfigurationError, never return plaintext."""
         monkeypatch.setattr(db, "_get_fernet", lambda: None)
         with pytest.raises(db.EncryptionConfigurationError) as exc_info:
             db.encrypt_secret("ghp_my_sensitive_pat_12345")
         assert "ENCRYPTION_KEY is not configured" in str(exc_info.value)
+
+    def test_save_local_user_data_fails_closed_when_key_missing(self, monkeypatch):
+        """_save_local_user_data must raise EncryptionConfigurationError and refuse plaintext writes."""
+        monkeypatch.setattr(db, "_get_fernet", lambda: None)
+        with pytest.raises(db.EncryptionConfigurationError) as exc_info:
+            db._save_local_user_data("test_user_id", "test@example.com", {"api_keys": {"openai": "sk-123"}})
+        assert "Refusing to persist local user store in plaintext" in str(exc_info.value)
 
     def test_decrypt_secret_fails_closed_on_invalid_token(self, monkeypatch):
         """Corrupted or mismatched ciphertext must raise DecryptionError, not return ciphertext."""
@@ -158,7 +187,7 @@ class TestFailClosedEncryption:
 # =====================================================================
 
 class TestTokenIsolationAndRedaction:
-    """Tests confirming GitHub tokens are never leaked into URLs, remotes, or command strings."""
+    """Tests confirming GitHub tokens are never leaked into URLs, remotes, or process arguments."""
 
     def test_sanitize_error_message_redacts_tokens(self):
         """GitHub tokens and basic auth headers must be scrubbed from error logs."""
@@ -173,14 +202,16 @@ class TestTokenIsolationAndRedaction:
         assert "[REDACTED_TOKEN]" in cleaned
         assert "x-access-token:[REDACTED]@" in cleaned
 
-    def test_clone_does_not_embed_token_in_url_or_remote(self):
-        """Clone command must use clean repository URL and avoid embedding token in git origin."""
+    def test_clone_does_not_embed_token_in_url_or_command_args(self):
+        """Clone command must use clean URL and transient askpass helper without exposing token in command line."""
         with patch.object(sandbox, "get_e2b_api_key", return_value="fake_e2b_key"):
-            sb = WorkspaceSandbox(repo_name="org/my-project", github_token="ghp_SecretToken12345")
+            token_val = "ghp_SecretToken12345"
+            sb = WorkspaceSandbox(repo_name="org/my-project", github_token=token_val)
             mock_container = MagicMock()
             sb.sandbox = mock_container
 
             executed_commands = []
+            files_written = {}
 
             def fake_run(cmd, **kwargs):
                 executed_commands.append(cmd)
@@ -190,7 +221,11 @@ class TestTokenIsolationAndRedaction:
                 res.stderr = ""
                 return res
 
+            def fake_write(path, content):
+                files_written[path] = content
+
             mock_container.commands.run = fake_run
+            mock_container.files.write = fake_write
 
             with patch("e2b.Sandbox") as mock_e2b:
                 mock_e2b.create.return_value = mock_container
@@ -198,15 +233,15 @@ class TestTokenIsolationAndRedaction:
 
             assert start_res["success"] is True
 
-            # Verify no command executed contains the token embedded inside a URL
+            # Verify no command executed contains the token embedded inside a URL or process argument
             for cmd in executed_commands:
+                assert token_val not in cmd
                 assert "ghp_SecretToken12345@github.com" not in cmd
-                assert "https://x-access-token:" not in cmd
+                assert "AUTHORIZATION: basic" not in cmd
 
-            # Verify that the clone command ran with git -c http.extraHeader or git clone
-            clone_cmds = [c for c in executed_commands if "git clone" in c or "http.extraHeader" in c]
-            assert len(clone_cmds) > 0
-            assert "https://github.com/org/my-project.git" in clone_cmds[0]
+            # Verify askpass script was written and cleaned up
+            assert "/home/user/.git_askpass_tmp" in files_written
+            assert any("rm -f /home/user/.git_askpass_tmp" in cmd for cmd in executed_commands)
 
 
 # =====================================================================
@@ -276,7 +311,6 @@ class TestSafeGitCommandConstruction:
             # The executed commit command must have the commit message safely quoted
             commit_cmds = [c for c in executed_commands if "git commit -m" in c]
             assert len(commit_cmds) > 0
-            # Ensure the raw unescaped subshell is not executable as an unquoted token
             assert '$(touch /tmp/hacked)' not in commit_cmds[0].split(" -m ")[-1].replace("'", "") or "'" in commit_cmds[0]
 
 
@@ -293,7 +327,6 @@ class TestTruthfulOutcomes:
         mock_container = MagicMock()
         sb.sandbox = mock_container
 
-        # Command exited with 1 (e.g. pytest failure)
         mock_res = MagicMock()
         mock_res.exit_code = 1
         mock_res.stdout = "FAILED (failures=2)"
@@ -308,10 +341,8 @@ class TestTruthfulOutcomes:
     def test_step_limit_exhaustion_is_reported_as_incomplete(self):
         """Reaching max_steps must return success=False and status='incomplete_step_limit'."""
         mock_sb = MagicMock()
-        # Mock run_command on sandbox
         mock_sb.run_command.return_value = {"success": True, "stdout": "ok", "stderr": "", "exit_code": 0}
 
-        # Mock an LLM that keeps returning tool calls indefinitely
         mock_tool_call = MagicMock()
         mock_tool_call.id = "call_123"
         mock_tool_call.function.name = "run_terminal_command"
@@ -336,7 +367,68 @@ class TestTruthfulOutcomes:
                 max_steps=2,
             )
 
-            # Must NOT report success=True
             assert turn_res["success"] is False
             assert turn_res["status"] == "incomplete_step_limit"
             assert "Reached maximum steps limit" in turn_res["content"]
+
+
+# =====================================================================
+# 10. STRICT PATH CONFINEMENT & SYMLINK DEFENSE TESTS
+# =====================================================================
+
+class TestPathConfinementAndSymlinks:
+    """Tests verifying traversal attacks, prefix collisions, and symlink escapes are blocked."""
+
+    def test_resolve_path_blocks_directory_traversal(self):
+        """Paths attempting to traverse out of /home/user/workspace must be confined."""
+        sb = WorkspaceSandbox(repo_name="org/repo", github_token="")
+
+        traversal_attempts = [
+            "/home/user/workspace/../../etc/passwd",
+            "/home/user/workspace/../../../root/.ssh/id_rsa",
+            "../../etc/shadow",
+            "/workspace/../../etc/passwd",
+            "/home/user/workspace-evil/secret",
+            "/home/user/workspace_other/file",
+            "/etc/passwd",
+        ]
+
+        workspace_root = "/home/user/workspace"
+        for bad_path in traversal_attempts:
+            resolved = sb._resolve_path(bad_path)
+            assert resolved == workspace_root, f"Path '{bad_path}' resolved to '{resolved}' instead of workspace root!"
+
+    def test_resolve_path_allows_legitimate_subpaths(self):
+        """Legitimate subpaths inside workspace must resolve correctly."""
+        sb = WorkspaceSandbox(repo_name="org/repo", github_token="")
+
+        valid_paths = {
+            "src/app.py": "/home/user/workspace/src/app.py",
+            "README.md": "/home/user/workspace/README.md",
+            "/home/user/workspace/tests/test_app.py": "/home/user/workspace/tests/test_app.py",
+            "/workspace/index.html": "/home/user/workspace/index.html",
+        }
+
+        for rel, expected in valid_paths.items():
+            resolved = sb._resolve_path(rel)
+            assert resolved == expected, f"Failed resolving legitimate path: {rel}"
+
+    def test_read_and_write_file_reject_symlink_escapes(self):
+        """Symlinks pointing outside workspace must be blocked during file read/write."""
+        sb = WorkspaceSandbox(repo_name="org/repo", github_token="")
+        mock_container = MagicMock()
+        sb.sandbox = mock_container
+
+        # Mock realpath returning an escaping host path (/etc/passwd)
+        mock_realpath_res = MagicMock()
+        mock_realpath_res.stdout = "/etc/passwd"
+        mock_realpath_res.exit_code = 0
+        mock_container.commands.run.return_value = mock_realpath_res
+
+        read_res = sb.read_file("evil_symlink.txt")
+        assert read_res["success"] is False
+        assert "symbolic link targets a path outside workspace" in read_res["error"]
+
+        write_res = sb.write_file("evil_symlink.txt", "hacked")
+        assert write_res["success"] is False
+        assert "symbolic link targets a path outside workspace" in write_res["error"]
