@@ -223,8 +223,10 @@ def get_oauth_url(provider: str, redirect_to: str, session_id: Optional[str] = N
 def exchange_oauth_code(code: str, state: Optional[str] = None, session_id: Optional[str] = None) -> Dict[str, Any]:
     """Exchanges an authorization code using the matched single-use PKCE verifier for the state.
     
-    Strictly validates that state is present, matches an active attempt, matches the initiating session_id,
-    and consumes it atomically. Never falls back to other pending states.
+    Strictly validates that state is present, matches an active attempt, and verifies session binding.
+    Fails closed: if the state was bound to a session, rejects consumption when session_id is missing,
+    empty, or mismatched. Preserves the pending state on session mismatch so legitimate users are not DOS'd.
+    Never falls back to other pending states.
     """
     if not state or not isinstance(state, str) or not state.strip():
         return {
@@ -233,19 +235,34 @@ def exchange_oauth_code(code: str, state: Optional[str] = None, session_id: Opti
         }
 
     clean_state = state.strip()
+    clean_session_id = (session_id or "").strip()
 
     def _consume_state(states):
         if clean_state in states:
             val = states.get(clean_state, {})
-            expected_session = val.get("session_id", "")
-            # If session binding was recorded, enforce exact match to prevent login-CSRF / cross-session injection
-            if expected_session and session_id and expected_session != session_id:
-                return "SESSION_MISMATCH"
-            val = states.pop(clean_state)
-            return val.get("verifier")
+            expected_session = val.get("session_id", "").strip()
+
+            # Fail closed session binding check:
+            # If state was bound to a session, caller MUST provide matching non-empty session_id
+            if expected_session:
+                if not clean_session_id:
+                    return "MISSING_SESSION_ID"
+                if expected_session != clean_session_id:
+                    # Do NOT pop/delete the state: preserve it for the legitimate session
+                    return "SESSION_MISMATCH"
+
+            # Valid match: atomically consume state
+            consumed = states.pop(clean_state)
+            return consumed.get("verifier")
         return None
 
     consume_result = _atomic_modify_oauth_states(_consume_state)
+
+    if consume_result == "MISSING_SESSION_ID":
+        return {
+            "success": False,
+            "error": "OAuth authorization failed: session identifier missing. This authorization attempt requires session verification.",
+        }
 
     if consume_result == "SESSION_MISMATCH":
         return {

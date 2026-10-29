@@ -158,10 +158,39 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Initialize Session State
-if "browser_session_id" not in st.session_state:
-    import secrets
-    st.session_state.browser_session_id = secrets.token_hex(16)
+# Initialize Browser Session ID with client-side cookie/storage persistence across redirects
+def _get_or_create_browser_session_id() -> str:
+    """Retrieves or creates a stable browser session ID that survives full OAuth page navigations."""
+    cookie_sid = None
+    try:
+        cookie_sid = st.context.cookies.get("ai_cloud_ws_sid")
+    except Exception:
+        pass
+
+    if cookie_sid and len(cookie_sid) >= 16:
+        st.session_state.browser_session_id = cookie_sid
+        return cookie_sid
+
+    if "browser_session_id" not in st.session_state or not st.session_state.browser_session_id:
+        import secrets
+        st.session_state.browser_session_id = secrets.token_hex(16)
+
+    # Persist via JavaScript cookie (SameSite=Lax, 1 day max-age) so it survives full redirects
+    sid = st.session_state.browser_session_id
+    st.html(
+        f"""<script>
+        (function() {{
+            try {{
+                document.cookie = "ai_cloud_ws_sid={sid}; path=/; max-age=86400; SameSite=Lax";
+            }} catch(e) {{}}
+        }})();
+        </script>"""
+    )
+    return sid
+
+
+_get_or_create_browser_session_id()
+
 if "user" not in st.session_state:
     st.session_state.user = None
 if "current_session_id" not in st.session_state:
@@ -201,10 +230,11 @@ if "code" in st.query_params and not st.session_state.user:
 
     try:
         with st.spinner("Completing authentication..."):
+            cur_sid = _get_or_create_browser_session_id()
             oauth_res = db.exchange_oauth_code(
                 auth_code,
                 state=auth_state,
-                session_id=st.session_state.get("browser_session_id"),
+                session_id=cur_sid,
             )
         if oauth_res.get("success"):
             st.session_state.user = oauth_res["data"].user
@@ -312,7 +342,7 @@ def render_landing_and_auth():
             gh_label = "🐙 Sign Up with GitHub"
 
         o_col1, o_col2 = st.columns(2)
-        cur_browser_sid = st.session_state.get("browser_session_id")
+        cur_browser_sid = _get_or_create_browser_session_id()
         google_auth = db.get_oauth_url("google", redirect_url, session_id=cur_browser_sid)
         github_auth = db.get_oauth_url("github", redirect_url, session_id=cur_browser_sid)
 

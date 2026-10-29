@@ -80,16 +80,60 @@ class TestOAuthSecurity:
             assert gen_res["success"] is True
             state_a = gen_res["state"]
 
-            # Session B attempts to complete login with Session A's state
-            res = db.exchange_oauth_code("auth_code_victim", state=state_a, session_id=session_b)
-            assert res["success"] is False
-            assert "cross-session state mismatch" in res["error"]
+            # Case 1: Session B attempts to complete login with Session A's state -> REJECTED
+            res_b = db.exchange_oauth_code("auth_code_victim", state=state_a, session_id=session_b)
+            assert res_b["success"] is False
+            assert "cross-session state mismatch" in res_b["error"]
 
-            # Session A completing with Session A's state must succeed
+            # Case 2: Attacker omits session_id entirely (session_id=None or "") -> FAIL CLOSED & REJECTED
+            res_none = db.exchange_oauth_code("auth_code_victim", state=state_a, session_id=None)
+            assert res_none["success"] is False
+            assert "session identifier missing" in res_none["error"]
+
+            res_empty_sid = db.exchange_oauth_code("auth_code_victim", state=state_a, session_id="")
+            assert res_empty_sid["success"] is False
+            assert "session identifier missing" in res_empty_sid["error"]
+
+            # Case 3: Verify preservation of legitimate pending state after mismatch attacks
             mock_client.auth._storage_key = "sb"
             mock_client.auth.exchange_code_for_session.return_value = MagicMock(user=MagicMock(id="user_alpha"))
             valid_res = db.exchange_oauth_code("auth_code_victim", state=state_a, session_id=session_a)
             assert valid_res["success"] is True
+
+            # Case 4: Verify single-use replay protection
+            replay_res = db.exchange_oauth_code("auth_code_victim", state=state_a, session_id=session_a)
+            assert replay_res["success"] is False
+            assert "invalid, expired, or already-used" in replay_res["error"]
+
+    def test_oauth_flow_survives_browser_redirect_with_cookie_storage(self):
+        """CRITICAL: Verifies end-to-end that browser session ID persists across full page redirects."""
+        with patch.object(db, "get_supabase_client") as mock_supabase:
+            mock_client = MagicMock()
+            mock_client.auth._url = "https://example.supabase.co/auth/v1"
+            mock_client.auth._storage_key = "sb"
+            mock_client.auth.exchange_code_for_session.return_value = MagicMock(user=MagicMock(id="user_redirect_test"))
+            mock_supabase.return_value = mock_client
+
+            # 1. User arrives on app: stable browser session ID established
+            browser_sid = "persistent_cookie_session_token_12345"
+
+            # 2. User clicks OAuth button: initiating request generated with this session_id
+            init_res = db.get_oauth_url("github", "http://localhost:8501", session_id=browser_sid)
+            assert init_res["success"] is True
+            state_param = init_res["state"]
+
+            # 3. User navigates away to GitHub, completes auth, and is redirected back to http://localhost:8501/?code=xyz&state=...
+            # In a new WebSocket/render connection, cookie provides identical browser_sid
+            callback_sid = browser_sid
+
+            # 4. Callback exchange executes with code, state, and cookie-persisted session_id
+            exchange_res = db.exchange_oauth_code(
+                code="github_auth_code_987",
+                state=state_param,
+                session_id=callback_sid,
+            )
+            assert exchange_res["success"] is True
+            assert exchange_res["data"].user.id == "user_redirect_test"
 
     def test_oauth_exchange_rejects_invalid_state_even_when_single_pending_state_exists(self):
         """CRITICAL: Mismatched state must be rejected even if exactly one valid state exists."""
