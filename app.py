@@ -188,6 +188,7 @@ if "selected_model_label" not in st.session_state:
 
 if "code" in st.query_params and not st.session_state.user:
     auth_code = st.query_params.get("code")
+    auth_state = st.query_params.get("state")
     st.query_params.clear()
 
     # Clear URL bar via JavaScript so stale codes are never re-evaluated
@@ -197,7 +198,7 @@ if "code" in st.query_params and not st.session_state.user:
 
     try:
         with st.spinner("Completing authentication..."):
-            oauth_res = db.exchange_oauth_code(auth_code)
+            oauth_res = db.exchange_oauth_code(auth_code, state=auth_state)
         if oauth_res.get("success"):
             st.session_state.user = oauth_res["data"].user
             st.session_state.auth_flash = (
@@ -1650,8 +1651,12 @@ def render_workspace():
                     )
 
                     if not result.get("success"):
-                        status_box.update(label="❌ AI Execution encountered an issue", state="error")
-                        st.error(result.get("error", "An error occurred during AI execution."))
+                        if result.get("status") == "incomplete_step_limit":
+                            status_box.update(label="⚠️ AI Execution reached step limit (incomplete)", state="error")
+                            st.warning(result.get("content", "Task reached maximum allowed steps before completion."))
+                        else:
+                            status_box.update(label="❌ AI Execution encountered an issue", state="error")
+                            st.error(result.get("error", "An error occurred during AI execution."))
                     else:
                         status_box.update(label="Execution complete!", state="complete")
 

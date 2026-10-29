@@ -205,13 +205,17 @@ def run_agent_turn(
         if not tool_calls:
             return {
                 "success": True,
+                "status": "completed",
                 "content": response_message.content or "Completed task.",
                 "terminal_logs": "\n".join(accumulated_logs),
             }
 
         for tool_call in tool_calls:
             func_name = tool_call.function.name
-            args = json.loads(tool_call.function.arguments)
+            try:
+                args = json.loads(tool_call.function.arguments)
+            except Exception as json_err:
+                args = {}
 
             if status_callback:
                 status_callback(f"Executing `{func_name}` in sandbox...")
@@ -272,6 +276,8 @@ def run_agent_turn(
                     accumulated_logs.append(
                         f"Failed to create PR: {res.get('error')}"
                     )
+            else:
+                tool_result = json.dumps({"success": False, "error": f"Unknown function: {func_name}"})
 
             working_messages.append(
                 {
@@ -283,7 +289,8 @@ def run_agent_turn(
             )
 
     return {
-        "success": True,
-        "content": "Reached maximum steps limit. Please review the terminal logs above.",
+        "success": False,
+        "status": "incomplete_step_limit",
+        "content": f"Reached maximum steps limit ({max_steps}). The task may be incomplete. Please review the terminal logs above.",
         "terminal_logs": "\n".join(accumulated_logs),
     }
