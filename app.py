@@ -158,12 +158,16 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Initialize Browser Session ID with client-side cookie/storage persistence across redirects
+# Initialize Browser Session ID with client-side cookie persistence across redirects
 def _get_or_create_browser_session_id() -> str:
-    """Retrieves or creates a stable browser session ID that survives full OAuth page navigations."""
+    """Retrieves or creates a stable browser session ID that survives full OAuth page navigations.
+    
+    Persists via client-side cookie with SameSite=Lax and Secure (for HTTPS/production).
+    """
     cookie_sid = None
     try:
-        cookie_sid = st.context.cookies.get("ai_cloud_ws_sid")
+        if hasattr(st, "context") and hasattr(st.context, "cookies"):
+            cookie_sid = st.context.cookies.get("ai_cloud_ws_sid")
     except Exception:
         pass
 
@@ -175,16 +179,25 @@ def _get_or_create_browser_session_id() -> str:
         import secrets
         st.session_state.browser_session_id = secrets.token_hex(16)
 
-    # Persist via JavaScript cookie (SameSite=Lax, 1 day max-age) so it survives full redirects
+    # Persist via client-side cookie with SameSite=Lax and Secure for HTTPS
     sid = st.session_state.browser_session_id
-    st.html(
+    import streamlit.components.v1 as components
+    components.html(
         f"""<script>
         (function() {{
             try {{
-                document.cookie = "ai_cloud_ws_sid={sid}; path=/; max-age=86400; SameSite=Lax";
+                var isHttps = (window.location.protocol === "https:" || (window.parent && window.parent.location.protocol === "https:"));
+                var secureFlag = isHttps ? "; Secure" : "";
+                var cookiePayload = "ai_cloud_ws_sid={sid}; path=/; max-age=86400; SameSite=Lax" + secureFlag;
+                if (window.parent && window.parent.document) {{
+                    window.parent.document.cookie = cookiePayload;
+                }}
+                document.cookie = cookiePayload;
             }} catch(e) {{}}
         }})();
-        </script>"""
+        </script>""",
+        height=0,
+        width=0,
     )
     return sid
 
@@ -225,7 +238,8 @@ if "code" in st.query_params and not st.session_state.user:
 
     # Clear URL bar via JavaScript so stale codes are never re-evaluated
     st.html(
-        "<script>window.history.replaceState({}, '', window.location.pathname);</script>"
+        "<script>window.history.replaceState({}, '', window.location.pathname);</script>",
+        unsafe_allow_javascript=True,
     )
 
     try:
