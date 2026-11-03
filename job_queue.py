@@ -1,24 +1,33 @@
 """Durable Job Queue and Storage Engine for AI Cloud Workspace.
 
-Implements Phase B.1 (Hardened):
-- Local-first SQLite in WAL mode with robust busy timeouts (5000ms) and explicit WAL serialization.
-- Thread-safe / Multi-process concurrency: Serializes transactions across threads via internal re-entrant locking,
-  and across processes via SQLite BEGIN IMMEDIATE.
+Implements Phase B.1 (Hardened & Fully Enforced):
+- Local-first SQLite in WAL mode with robust busy timeouts (5000ms).
+- Concurrency Model:
+  - Database-level writer serialization via explicit `BEGIN IMMEDIATE` transactions.
+  - Re-entrant internal thread locking (`threading.RLock`) protects multi-threaded shared queue instances.
+  - Multi-process safety across independent OS processes via SQLite WAL.
 - Monotonic fencing tokens (lease_generation) and strict lease expiration validation:
-  Every worker mutation (record_heartbeat, append_log, update_job_status) enforces:
-  status == 'RUNNING' AND worker_id == expected AND lease_generation == expected AND lease_expires_at >= now.
-  An expired lease CANNOT be revived or mutate the job even before the reaper runs.
-- Cancellation precedence:
-  A job with cancel_requested_at is NEVER re-queued by the reaper. Stale cancelled jobs are transitioned
-  to terminal CANCELLED. Completed status updates cannot overwrite pending cancellation requests.
-- Append-only event restrictions:
-  Only the active, unexpired lease holder of a RUNNING job can append worker events. Terminal jobs reject worker events.
+  - Every worker mutation (record_heartbeat, append_log, update_job_status) strictly requires:
+    `status == 'RUNNING' AND worker_id == expected AND lease_generation == expected`
+    AND `lease_expires_at IS NOT NULL AND lease_expires_at >= now`.
+    Missing or expired leases fail closed immediately with StaleLeaseError.
+- Cancellation Precedence:
+  - User cancellation takes strict precedence over normal completion. If cancellation was requested,
+    `COMPLETED` is rejected with InvalidStateTransitionError.
+  - If a worker transitions to `FAILED` or `TIMED_OUT` while cancellation is pending, status is recorded
+    as `CANCELLED` while preserving the failure diagnostic error in `error_json`.
+  - Stale jobs with pending cancellation are NEVER re-queued by the reaper; they transition directly to CANCELLED.
+- Terminal job protection:
+  - Only the active, unexpired lease holder of a RUNNING job can append worker events. Terminal jobs reject worker events.
 - Strict credential-reference schema:
-  Validates reference structures (provider, key_ref) and rejects raw secret values (PATs, bearer tokens, API keys)
-  in both payload and credential_refs.
+  - Exactly requires `{"key_ref": "..."}`, rejects unknown/missing keys, validates format,
+    and blocks raw secrets in both payload and credential_refs.
+- Rigorous numeric input validation:
+  - Rejects booleans, floats (where integers required), NaNs, infinities, and out-of-range values.
 - Schema versioning and idempotent forward migrations.
 """
 
+import math
 import os
 import re
 import json
@@ -40,7 +49,7 @@ class JobQueueError(Exception):
 
 
 class StaleLeaseError(JobQueueError):
-    """Raised when a worker attempts an update with an expired or superseded lease."""
+    """Raised when a worker attempts an update with an expired, missing, or superseded lease."""
     pass
 
 
@@ -89,7 +98,16 @@ VALID_KEY_REF_PATTERN = re.compile(r"^[a-zA-Z0-9_\-\.]{1,128}$")
 
 
 def validate_credential_references(credential_refs: Optional[Dict[str, Any]]) -> None:
-    """Validates that credential_refs conform to a strict reference schema and contain NO raw secrets."""
+    """Validates that credential_refs conform to an exact schema and contain NO raw secrets.
+    
+    Exact Schema:
+    {
+        "<provider>": {
+            "key_ref": "<string matching VALID_KEY_REF_PATTERN>"
+        }
+    }
+    Any unknown fields, missing key_ref, or non-dict structures are strictly rejected.
+    """
     if credential_refs is None:
         return
     if not isinstance(credential_refs, dict):
@@ -98,24 +116,44 @@ def validate_credential_references(credential_refs: Optional[Dict[str, Any]]) ->
     for provider, ref in credential_refs.items():
         if provider not in ALLOWED_CRED_PROVIDERS:
             raise InvalidCredentialReferenceError(
-                f"Invalid credential provider '{provider}'. Allowed: {sorted(ALLOWED_CRED_PROVIDERS)}"
-            )
-        if not isinstance(ref, (str, dict)):
-            raise InvalidCredentialReferenceError(
-                f"Credential reference for '{provider}' must be a reference string or object, got {type(ref).__name__}."
+                f"Invalid credential provider '{provider}'. Allowed providers: {sorted(ALLOWED_CRED_PROVIDERS)}"
             )
 
-        ref_str = json.dumps(ref)
+        if not isinstance(ref, dict):
+            raise InvalidCredentialReferenceError(
+                f"Credential reference for '{provider}' must be a dictionary object with key_ref, got {type(ref).__name__}."
+            )
+
+        # Disallow unknown keys - only 'key_ref' is permitted
+        allowed_keys = {"key_ref"}
+        extra_keys = set(ref.keys()) - allowed_keys
+        if extra_keys:
+            raise InvalidCredentialReferenceError(
+                f"Unknown field(s) {sorted(extra_keys)} in credential reference for '{provider}'. Only 'key_ref' is allowed."
+            )
+
+        if "key_ref" not in ref:
+            raise InvalidCredentialReferenceError(
+                f"Missing required 'key_ref' field in credential reference for '{provider}'."
+            )
+
+        key_ref_val = ref["key_ref"]
+        if not isinstance(key_ref_val, str) or isinstance(key_ref_val, bool):
+            raise InvalidCredentialReferenceError(
+                f"'key_ref' for provider '{provider}' must be a non-boolean string."
+            )
+
+        # Check raw secret patterns
         for pat in RAW_SECRET_PATTERNS:
-            if pat.search(ref_str):
+            if pat.search(key_ref_val):
                 raise InvalidCredentialReferenceError(
-                    f"Security violation: Raw credential pattern detected in credential_refs for '{provider}'. "
-                    "Only safe reference keys (e.g. key_name, account_id) may be passed."
+                    f"Security violation: Raw credential pattern detected in 'key_ref' for '{provider}'. "
+                    "Only safe reference names (e.g. 'primary_github_pat') may be stored."
                 )
 
-        if isinstance(ref, str) and not VALID_KEY_REF_PATTERN.match(ref):
+        if not VALID_KEY_REF_PATTERN.match(key_ref_val):
             raise InvalidCredentialReferenceError(
-                f"Credential reference string for '{provider}' contains invalid characters or exceeds 128 chars."
+                f"'key_ref' for provider '{provider}' contains invalid characters or exceeds 128 characters."
             )
 
 
@@ -130,6 +168,30 @@ def validate_payload_security(payload: Optional[Dict[str, Any]]) -> None:
                 "Security violation: Raw secret or access token detected in job payload. "
                 "Secrets must be referenced through credential_refs and resolved in worker context."
             )
+
+
+def validate_numeric(
+    val: Any,
+    name: str,
+    min_val: float,
+    max_val: float,
+    require_int: bool = False,
+) -> float:
+    """Strictly validates numeric inputs: rejects booleans, NaN, Infinity, floats-for-ints, and out-of-range values."""
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        raise JobQueueError(f"Invalid type for {name}: expected numeric, got {type(val).__name__}.")
+
+    if math.isnan(val) or math.isinf(val):
+        raise JobQueueError(f"Invalid value for {name}: non-finite numbers (NaN, Inf) are not permitted.")
+
+    if require_int:
+        if not isinstance(val, int) or isinstance(val, bool):
+            raise JobQueueError(f"Invalid type for {name}: expected integer, got {type(val).__name__}.")
+
+    if val < min_val or val > max_val:
+        raise JobQueueError(f"{name} ({val}) out of permitted range [{min_val}, {max_val}].")
+
+    return val
 
 
 def _get_connection(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
@@ -275,10 +337,10 @@ class DurableJobQueue:
             raise JobQueueError("user_id is required.")
         if not repository or not repository.strip():
             raise JobQueueError("repository is required.")
-        if max_retries < 0 or max_retries > 50:
-            raise JobQueueError(f"Invalid max_retries: {max_retries}. Must be between 0 and 50.")
-        if timeout_seconds <= 0 or timeout_seconds > 86400:
-            raise JobQueueError(f"Invalid timeout_seconds: {timeout_seconds}. Must be between 1 and 86400.")
+
+        # Strict numeric validation
+        validate_numeric(max_retries, "max_retries", 0, 50, require_int=True)
+        validate_numeric(timeout_seconds, "timeout_seconds", 1.0, 86400.0, require_int=False)
 
         # Strict credential & payload security validation
         validate_payload_security(payload)
@@ -355,8 +417,8 @@ class DurableJobQueue:
         """Atomically claims the next pending QUEUED job using an atomic lease and incremented fencing token."""
         if not worker_id or not worker_id.strip():
             raise JobQueueError("worker_id is required to claim jobs.")
-        if lease_duration_seconds <= 0 or lease_duration_seconds > 3600:
-            raise JobQueueError(f"Invalid lease_duration_seconds: {lease_duration_seconds}. Must be between 1 and 3600.")
+
+        validate_numeric(lease_duration_seconds, "lease_duration_seconds", 1.0, 3600.0, require_int=False)
 
         now = time.time()
         lease_expires_at = now + lease_duration_seconds
@@ -422,11 +484,11 @@ class DurableJobQueue:
     ) -> bool:
         """Refreshes worker heartbeat and extends lease_expires_at.
         
-        Strict Fencing: Fails closed if the worker is not current, the generation does not match,
-        the status is not RUNNING, OR the current lease has ALREADY expired (even before reaper execution).
+        Strict Fencing: Fails closed if the worker is not current, generation does not match,
+        status is not RUNNING, OR lease_expires_at IS NULL or < now (even before reaper runs).
         """
-        if lease_duration_seconds <= 0 or lease_duration_seconds > 3600:
-            raise JobQueueError(f"Invalid lease_duration_seconds: {lease_duration_seconds}.")
+        validate_numeric(lease_duration_seconds, "lease_duration_seconds", 1.0, 3600.0, require_int=False)
+        validate_numeric(lease_generation, "lease_generation", 1, 1000000000, require_int=True)
 
         now = time.time()
         new_expires_at = now + lease_duration_seconds
@@ -444,13 +506,13 @@ class DurableJobQueue:
                           AND worker_id = ?
                           AND lease_generation = ?
                           AND status = 'RUNNING'
+                          AND lease_expires_at IS NOT NULL
                           AND lease_expires_at >= ?;
                         """,
                         (now, new_expires_at, job_id, worker_id, lease_generation, now),
                     )
 
                     if cursor.rowcount == 0:
-                        # Determine explicit failure cause
                         chk = self.conn.execute(
                             "SELECT worker_id, lease_generation, status, lease_expires_at FROM jobs WHERE id = ?;",
                             (job_id,),
@@ -464,9 +526,9 @@ class DurableJobQueue:
                                 f"Worker '{worker_id}' (gen {lease_generation}) superseded by "
                                 f"worker '{chk['worker_id']}' (gen {chk['lease_generation']})."
                             )
-                        if chk["lease_expires_at"] is not None and chk["lease_expires_at"] < now:
+                        if chk["lease_expires_at"] is None or chk["lease_expires_at"] < now:
                             raise StaleLeaseError(
-                                f"Cannot heartbeat: lease for worker '{worker_id}' expired at {chk['lease_expires_at']} (now {now})."
+                                f"Cannot heartbeat: lease for worker '{worker_id}' is null or expired at {chk['lease_expires_at']} (now {now})."
                             )
                         return False
 
@@ -483,7 +545,8 @@ class DurableJobQueue:
         event_type: str = "LOG",
         data: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Appends an event/log line. Fails closed if the job is not RUNNING, lease is expired, or worker is stale."""
+        """Appends an event/log line. Fails closed if the job is not RUNNING, lease is null/expired, or worker is stale."""
+        validate_numeric(lease_generation, "lease_generation", 1, 1000000000, require_int=True)
         now = time.time()
         data_str = json.dumps(data) if data is not None else None
 
@@ -506,9 +569,9 @@ class DurableJobQueue:
                         raise StaleLeaseError(
                             f"Refusing to append log: worker '{worker_id}' (gen {lease_generation}) is stale for job '{job_id}'."
                         )
-                    if chk["lease_expires_at"] is not None and chk["lease_expires_at"] < now:
+                    if chk["lease_expires_at"] is None or chk["lease_expires_at"] < now:
                         raise StaleLeaseError(
-                            f"Refusing to append log: lease for worker '{worker_id}' expired at {chk['lease_expires_at']} (now {now})."
+                            f"Refusing to append log: lease for worker '{worker_id}' is null or expired at {chk['lease_expires_at']} (now {now})."
                         )
 
                     self.conn.execute(
@@ -531,7 +594,16 @@ class DurableJobQueue:
         error: Optional[Dict[str, Any]] = None,
         sandbox_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Transitions job to target status with strict validation against cancellation overwrites, expiration, and stale leases."""
+        """Transitions job to target status with strict validation against cancellation overwrites, missing/expired leases, and stale generations.
+        
+        Explicit Cancellation Precedence Policy:
+        - If cancellation was requested:
+          1. Target status `COMPLETED` is strictly disallowed and raises InvalidStateTransitionError.
+          2. Target status `FAILED` or `TIMED_OUT` is overridden to `CANCELLED` (user cancellation wins),
+             while the original error diagnostic dictionary is preserved in `error_json`.
+          3. Target status `CANCELLED` is recorded directly.
+        """
+        validate_numeric(lease_generation, "lease_generation", 1, 1000000000, require_int=True)
         now = time.time()
         err_str = json.dumps(error) if error else None
 
@@ -541,7 +613,7 @@ class DurableJobQueue:
                     self.conn.execute("BEGIN IMMEDIATE;")
 
                     cursor = self.conn.execute(
-                        "SELECT status, worker_id, lease_generation, lease_expires_at, cancel_requested_at FROM jobs WHERE id = ?;",
+                        "SELECT status, worker_id, lease_generation, lease_expires_at, cancel_requested_at, error_json FROM jobs WHERE id = ?;",
                         (job_id,),
                     )
                     row = cursor.fetchone()
@@ -551,30 +623,37 @@ class DurableJobQueue:
                     current_status = row["status"]
                     cancel_requested = bool(row["cancel_requested_at"])
 
-                    # Fencing & Expiration check
+                    # Fencing & Expiration check: MUST be non-null and >= now
                     if row["worker_id"] != worker_id or row["lease_generation"] != lease_generation:
                         raise StaleLeaseError(
                             f"Worker '{worker_id}' (gen {lease_generation}) cannot update job '{job_id}': superseded."
                         )
-                    if row["lease_expires_at"] is not None and row["lease_expires_at"] < now:
+                    if row["lease_expires_at"] is None or row["lease_expires_at"] < now:
                         raise StaleLeaseError(
-                            f"Worker '{worker_id}' (gen {lease_generation}) cannot update job '{job_id}': lease expired at {row['lease_expires_at']}."
+                            f"Worker '{worker_id}' (gen {lease_generation}) cannot update job '{job_id}': lease is null or expired at {row['lease_expires_at']}."
                         )
 
-                    # Cancellation precedence: if cancellation requested, worker cannot report COMPLETED
-                    if cancel_requested and target_status == "COMPLETED":
-                        raise InvalidStateTransitionError(
-                            f"Cannot mark job '{job_id}' as COMPLETED: cancellation was requested by the user."
-                        )
+                    # Determine effective target status according to Cancellation Precedence Policy
+                    effective_target = target_status
+                    if cancel_requested:
+                        if target_status == "COMPLETED":
+                            raise InvalidStateTransitionError(
+                                f"Cannot mark job '{job_id}' as COMPLETED: cancellation was requested by the user."
+                            )
+                        elif target_status in ("FAILED", "TIMED_OUT"):
+                            # User cancellation takes precedence over worker error/timeout, but error info is retained
+                            effective_target = "CANCELLED"
+                            if not err_str:
+                                err_str = json.dumps({"note": f"Worker reported {target_status} after user requested cancellation."})
 
-                    # Validate lifecycle transition rules
+                    # Validate lifecycle transition rules against current_status
                     allowed = ALLOWED_TRANSITIONS.get(current_status, set())
-                    if target_status not in allowed:
+                    if effective_target not in allowed:
                         raise InvalidStateTransitionError(
-                            f"Illegal status transition for job '{job_id}': '{current_status}' -> '{target_status}'."
+                            f"Illegal status transition for job '{job_id}': '{current_status}' -> '{effective_target}'."
                         )
 
-                    finished_at = now if target_status in ("COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT") else None
+                    finished_at = now if effective_target in ("COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT") else None
 
                     self.conn.execute(
                         """
@@ -585,7 +664,7 @@ class DurableJobQueue:
                             sandbox_id = COALESCE(?, sandbox_id)
                         WHERE id = ? AND worker_id = ? AND lease_generation = ?;
                         """,
-                        (target_status, finished_at, err_str, sandbox_id, job_id, worker_id, lease_generation),
+                        (effective_target, finished_at, err_str, sandbox_id, job_id, worker_id, lease_generation),
                     )
 
                     self.conn.execute(
@@ -594,7 +673,7 @@ class DurableJobQueue:
                             job_id, event_type, source, worker_id, lease_generation, message, created_at
                         ) VALUES (?, 'STATUS_CHANGE', 'worker', ?, ?, ?, ?);
                         """,
-                        (job_id, worker_id, lease_generation, f"Status updated to '{target_status}'.", now),
+                        (job_id, worker_id, lease_generation, f"Status updated to '{effective_target}'.", now),
                     )
 
                 return self.get_job_by_id_internal(job_id)
@@ -663,7 +742,7 @@ class DurableJobQueue:
                 raise JobQueueError(f"Database error during request_cancellation: {str(e)}") from e
 
     def reap_stale_jobs(self) -> List[str]:
-        """Finds running jobs whose lease has expired, safely marks them RECOVERABLE/QUEUED or FAILED.
+        """Finds running jobs whose lease has expired or is null.
         
         CRITICAL CANCELLATION GUARD: If cancel_requested_at is set, the job is NEVER re-queued.
         Instead, it transitions directly to terminal CANCELLED.
@@ -679,7 +758,7 @@ class DurableJobQueue:
                         """
                         SELECT id, retry_count, max_retries, lease_generation, worker_id, cancel_requested_at
                         FROM jobs
-                        WHERE status = 'RUNNING' AND lease_expires_at < ?;
+                        WHERE status = 'RUNNING' AND (lease_expires_at IS NULL OR lease_expires_at < ?);
                         """,
                         (now,),
                     )

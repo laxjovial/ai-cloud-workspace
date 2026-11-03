@@ -69,7 +69,7 @@ To solve these 10 failure points without introducing heavy external infrastructu
 ### 2.1 Storage & Queue Engine: SQLite with Write-Ahead Logging (WAL)
 - **Why SQLite WAL?**
   - Zero external daemons: No Redis or Celery dependencies required; runs natively on Linux, macOS, and containers.
-  - ACID guarantees: SQLite in `WAL` mode (`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;`) supports multiple concurrent readers and a serialized atomic writer with row-level transaction locks (`BEGIN IMMEDIATE`).
+  - ACID guarantees: SQLite in `WAL` mode (`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;`) supports multiple concurrent readers alongside a serialized writer. Writers are serialized at the database level via explicit `BEGIN IMMEDIATE` transactions (SQLite does not provide row-level writer locks). Write transactions remain short and never encompass LLM or sandbox operations.
   - Perfect fit for hybrid architecture: Mirrors the application's existing fail-closed local storage philosophy while optionally replicating terminal states to Supabase.
 
 ### 2.2 Core Components
@@ -140,10 +140,11 @@ stateDiagram-v2
   Running workers update `heartbeat_at = now()` and `lease_expires_at = now() + lease_duration` every 5 seconds.
 - **Dead-Worker Reaper**:
   If a worker process crashes (SIGKILL, segfault, power loss), its heartbeat stops. The reaper detects `status='RUNNING' AND lease_expires_at < now()`.
-  - If `retry_count < max_retries`, transitions to `RECOVERABLE` then `QUEUED`.
-  - If `retry_count >= max_retries`, transitions to `FAILED` with explicit error: `"Worker crashed or lost heartbeat during execution."`
+  - **Cancellation Precedence**: If `cancel_requested_at` is set on the expired running job, it is **never re-queued**; it transitions directly to terminal `CANCELLED`.
+  - If cancellation was not requested and `retry_count < max_retries`, transitions to `QUEUED` with incremented `lease_generation` (fencing out the dead worker) and `retry_count += 1`.
+  - If `retry_count >= max_retries`, transitions to terminal `FAILED` with explicit error: `"Worker crashed or lost heartbeat during execution."`
 - **Cancellation**:
-  When a user clicks "Cancel", `status` is set to `CANCELLED`. During its execution loop, the worker checks its job's status before each tool execution and LLM step. If `CANCELLED`, it immediately cleans up the sandbox and terminates cleanly.
+  When a user requests cancellation, `cancel_requested_at` is durably set. For queued jobs, status is immediately updated to `CANCELLED`. For running jobs, user cancellation takes strict precedence over normal completion. A worker acknowledging cancellation terminates its tools, cleans up its sandbox, and records `CANCELLED`. If a worker reports `FAILED` or `TIMED_OUT` while cancellation was pending, cancellation precedence applies: status transitions to `CANCELLED` while preserving the failure diagnostic error in `error_json`.
 - **Wall-Clock Timeouts**:
   Jobs specify `timeout_seconds` (default: 600s / 10m). If exceeded, worker forces sandbox termination and marks status `TIMED_OUT`.
 
