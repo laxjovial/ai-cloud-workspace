@@ -1286,8 +1286,13 @@ class DurableJobQueue:
         worker_id: str,
         lease_generation: int,
         confirmed_result: Dict[str, Any],
+        is_recovery: bool = False,
     ) -> None:
-        """Atomically marks a side-effect intent as CONFIRMED with strict lease fencing."""
+        """Atomically marks a side-effect intent as CONFIRMED with strict lease fencing.
+        
+        If is_recovery is True, permits the new lease holder (worker_id, lease_generation)
+        to adopt and confirm an abandoned intent previously created by an older lease holder.
+        """
         now = time.time()
         res_str = canonical_json(confirmed_result)
 
@@ -1295,16 +1300,31 @@ class DurableJobQueue:
             try:
                 with self.conn:
                     self.conn.execute("BEGIN IMMEDIATE;")
-                    cursor = self.conn.execute(
-                        """
-                        UPDATE job_side_effects
-                        SET status = 'CONFIRMED',
-                            confirmed_result = ?,
-                            updated_at = ?
-                        WHERE side_effect_id = ? AND worker_id = ? AND lease_generation = ?;
-                        """,
-                        (res_str, now, side_effect_id, worker_id, lease_generation),
-                    )
+                    if is_recovery:
+                        # Recovery adoption: update row only if status == 'PENDING' and older generation
+                        cursor = self.conn.execute(
+                            """
+                            UPDATE job_side_effects
+                            SET status = 'CONFIRMED',
+                                worker_id = ?,
+                                lease_generation = ?,
+                                confirmed_result = ?,
+                                updated_at = ?
+                            WHERE side_effect_id = ? AND status = 'PENDING' AND lease_generation <= ?;
+                            """,
+                            (worker_id, lease_generation, res_str, now, side_effect_id, lease_generation),
+                        )
+                    else:
+                        cursor = self.conn.execute(
+                            """
+                            UPDATE job_side_effects
+                            SET status = 'CONFIRMED',
+                                confirmed_result = ?,
+                                updated_at = ?
+                            WHERE side_effect_id = ? AND worker_id = ? AND lease_generation = ?;
+                            """,
+                            (res_str, now, side_effect_id, worker_id, lease_generation),
+                        )
 
                     if cursor.rowcount == 0:
                         row = self.conn.execute(
@@ -1325,23 +1345,40 @@ class DurableJobQueue:
         worker_id: str,
         lease_generation: int,
         reason: str,
+        is_recovery: bool = False,
     ) -> None:
-        """Marks a side-effect intent as FAILED_VERIFIED after remote confirmation that it did not execute."""
+        """Marks a side-effect intent as FAILED_VERIFIED after remote confirmation that it did not execute.
+        
+        If is_recovery is True, permits the new lease holder to mark an older abandoned intent FAILED_VERIFIED.
+        """
         now = time.time()
 
         with self._lock:
             try:
                 with self.conn:
                     self.conn.execute("BEGIN IMMEDIATE;")
-                    cursor = self.conn.execute(
-                        """
-                        UPDATE job_side_effects
-                        SET status = 'FAILED_VERIFIED',
-                            updated_at = ?
-                        WHERE side_effect_id = ? AND worker_id = ? AND lease_generation = ?;
-                        """,
-                        (now, side_effect_id, worker_id, lease_generation),
-                    )
+                    if is_recovery:
+                        cursor = self.conn.execute(
+                            """
+                            UPDATE job_side_effects
+                            SET status = 'FAILED_VERIFIED',
+                                worker_id = ?,
+                                lease_generation = ?,
+                                updated_at = ?
+                            WHERE side_effect_id = ? AND status = 'PENDING' AND lease_generation <= ?;
+                            """,
+                            (worker_id, lease_generation, now, side_effect_id, lease_generation),
+                        )
+                    else:
+                        cursor = self.conn.execute(
+                            """
+                            UPDATE job_side_effects
+                            SET status = 'FAILED_VERIFIED',
+                                updated_at = ?
+                            WHERE side_effect_id = ? AND worker_id = ? AND lease_generation = ?;
+                            """,
+                            (now, side_effect_id, worker_id, lease_generation),
+                        )
 
                     if cursor.rowcount == 0:
                         raise StaleLeaseError(f"Worker '{worker_id}' (gen {lease_generation}) cannot fail side effect '{side_effect_id}'.")

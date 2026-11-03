@@ -327,6 +327,7 @@ def execute_job_in_worker(
                 worker_id=worker_id,
                 lease_generation=lease_gen,
                 confirmed_result={"pr_url": matching_pr_url, "adopted": True},
+                is_recovery=True,
             )
             queue.append_log(job_id, worker_id, lease_gen, f"Adopted existing PR '{matching_pr_url}'. Skipping creation.")
         else:
@@ -335,6 +336,7 @@ def execute_job_in_worker(
                 worker_id=worker_id,
                 lease_generation=lease_gen,
                 reason="Verified absent on remote provider.",
+                is_recovery=True,
             )
             queue.append_log(job_id, worker_id, lease_gen, "No remote PR found. Abandoned intent marked FAILED_VERIFIED.")
 
@@ -371,6 +373,7 @@ def execute_job_in_worker(
             sandbox_id=sb_id,
         )
     elif turn_result.get("success"):
+        queue.append_log(job_id, worker_id, lease_gen, "Agent turn completed successfully.")
         queue.update_job_status(
             job_id=job_id,
             target_status="COMPLETED",
@@ -378,7 +381,6 @@ def execute_job_in_worker(
             lease_generation=lease_gen,
             sandbox_id=sb_id,
         )
-        queue.append_log(job_id, worker_id, lease_gen, "Agent turn completed successfully.")
     else:
         status_val = turn_result.get("status", "failed")
         target = "TIMED_OUT" if "timeout" in status_val or "limit" in status_val else "FAILED"
@@ -519,7 +521,8 @@ class WorkerSupervisor:
         self.queue._active_supervisor_key = self.signing_key
         self.reconciler = SandboxReconciler(self.queue, e2b_kill_fn=e2b_kill_fn)
 
-        self._stop_event = multiprocessing.Event()
+        self._ctx = multiprocessing.get_context("spawn")
+        self._stop_event = self._ctx.Event()
         self._workers: Dict[str, Dict[str, Any]] = {}  # slot_id -> {process, instance_id, pid, start_time, crashes}
         self._lock = threading.Lock()
         self._running = False
@@ -527,12 +530,11 @@ class WorkerSupervisor:
     def start_worker_slot(self, slot_id: str, custom_target: Optional[Callable] = None) -> None:
         """Spawns an independent child worker process for a slot with stripped signing key."""
         instance_id = f"worker_{uuid.uuid4().hex[:12]}"
-        ctx = multiprocessing.get_context("spawn")
 
         target_fn = custom_target or worker_child_main
         args = (instance_id, self.db_path, self._stop_event)
 
-        proc = ctx.Process(target=target_fn, args=args)
+        proc = self._ctx.Process(target=target_fn, args=args)
         proc.start()
 
         with self._lock:
@@ -543,6 +545,7 @@ class WorkerSupervisor:
                 "pid": proc.pid,
                 "start_time": time.time(),
                 "crashes": crashes,
+                "custom_target": custom_target,
             }
 
     def stop_worker_slot(self, slot_id: str, grace_seconds: float = 5.0) -> None:
@@ -634,7 +637,8 @@ class WorkerSupervisor:
 
                 # Restart slot if supervisor still active
                 if not self._stop_event.is_set():
-                    self.start_worker_slot(slot_id)
+                    custom_tgt = slot_info.get("custom_target")
+                    self.start_worker_slot(slot_id, custom_target=custom_tgt)
 
         # 2. Reap stale jobs in DB
         self.queue.reap_stale_jobs()
