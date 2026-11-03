@@ -2,14 +2,14 @@
 
 **Repository:** `laxjovial/ai-cloud-workspace`  
 **Working Branch:** `feat/phase-b-durable-execution`  
-**Specification Revision:** 2.4 (Final Authoritative Engineering Contract Before Implementation)  
+**Specification Revision:** 2.5 (Final Authoritative Engineering Contract Before Implementation)  
 **Baseline (`main`):** `5147be6c127c3eed87b6cabb0ca24f65b2550fa7` (strictly untouched)  
-**Specification Baseline Commit:** `49b74ed69bc5867ef7b34c0d3b08d0d66ab3e078`  
+**Specification Baseline Commit:** `9822e697c19c6d84f43d2eb32ab17d40c8fdc02f`  
 **Scope Boundary:** Phase B.2 covers only the background worker engine, process supervisor, heartbeat/fencing watchdog, crash-resilient sandbox registry/reconciler, side-effect intent ledger, and associated tests. It introduces **no Streamlit changes (`app.py` untouched)** and **no Phase C work**.
 
 ---
 
-## 1. Process Supervision, Process Ownership, & Verifiable Child Reap Evidence
+## 1. Process Supervision, Process Ownership, & Cryptographically Bound Supervisor Reap Evidence
 
 ```mermaid
 flowchart TD
@@ -17,15 +17,17 @@ flowchart TD
         SP["WorkerSupervisor (Main Daemon)"]
         PM["Process Pool Manager (concurrency=N)"]
         RC["Reaper & Sandbox Reconciler (10s interval)"]
+        SK["Supervisor Signing Secret (RAM-only, uninherited)"]
         SP --> PM
         SP --> RC
+        SP --> SK
     end
 
     subgraph Workers ["Spawned Worker Child Processes"]
         W1["Worker Child 1 (Instance: worker_inst_uuid_1, PID: 101)"]
         W2["Worker Child 2 (Instance: worker_inst_uuid_2, PID: 102)"]
-        PM -->|spawn with restart backoff| W1
-        PM -->|spawn with restart backoff| W2
+        PM -->|spawn with restart backoff & stripped secret| W1
+        PM -->|spawn with restart backoff & stripped secret| W2
     end
 
     subgraph Store ["SQLite WAL Store (jobs.db)"]
@@ -46,7 +48,7 @@ flowchart TD
   Each worker process generates a cryptographic instance identity at spawn time:
   `worker_instance_id = f"worker_{uuid.uuid4().hex[:12]}_{os.getpid()}"`
 - **Supervisor-Worker Ownership Registry Schema**:
-  The supervisor maintains a durable registry table in `jobs.db` with complete lifecycle and reap accounting:
+  The supervisor maintains a durable registry table in `jobs.db` with complete lifecycle, reap accounting, and cryptographic verification tokens:
   ```sql
   CREATE TABLE IF NOT EXISTS worker_instances (
       instance_id TEXT PRIMARY KEY,
@@ -57,20 +59,28 @@ flowchart TD
       exit_code INTEGER,                   -- Process exit code from os.waitpid
       exit_signal INTEGER,                 -- Signal number if terminated by signal (e.g. 9 for SIGKILL)
       terminated_at REAL,                  -- Timestamp when reap occurred
+      reap_signature TEXT,                 -- HMAC-SHA256 signature issued by supervisor
       reap_token TEXT                      -- Cryptographic supervisor reap verification token (UUID hex)
   );
   ```
   When issuing signals (`SIGTERM`, `SIGKILL`), the supervisor verifies both PID and process creation time (via `/proc/<pid>/stat` start_time on Linux or `psutil.Process(pid).create_time()`) against the recorded `start_time` in `worker_instances` to guarantee it never signals an unrelated recycled OS process.
 
-### 1.2 Durable, Verifiable Child-Process Reap Record & Authoritative Finalization
-`os.waitpid()` is parent-process-specific: only the parent supervisor process can reap its direct child processes; the queue engine cannot execute `waitpid()` a second time.
-To establish non-forgeable reap evidence across process boundaries:
+### 1.2 Cryptographic Supervisor Secret Boundary & Verifiable Child Reap Evidence
+`os.waitpid()` is parent-process-specific: only the parent supervisor process can reap its direct child processes; neither child workers nor the database engine can execute `waitpid()` a second time. Furthermore, child workers with direct database write access must be incapable of fabricating reap records.
 
-1. **Authoritative Supervisor Child Reap Operation (`record_process_reap`)**:
+1. **Supervisor RAM-Only Signing Secret**:
+   - At startup, the supervisor generates a random 256-bit cryptographic signing secret (`supervisor_signing_secret = secrets.token_bytes(32)`).
+   - **Stripped Secret Boundary**: When spawning child worker processes (via `multiprocessing.get_context("spawn")`), the supervisor strictly filters process environment variables and child memory: `supervisor_signing_secret` is kept exclusively in supervisor RAM and is **never passed, inherited, or leaked to worker child processes**.
+2. **Authoritative Child Reap Operation (`record_process_reap`)**:
    When the supervisor reaps a child process via `os.waitpid(pid, os.WNOHANG)` or after a forced `SIGKILL`:
-   - The supervisor derives `exit_code` and `exit_signal` using `os.WEXITSTATUS(status)` and `os.WTERMSIG(status)`.
-   - The supervisor generates a cryptographic one-time `reap_token = uuid.uuid4().hex`.
-   - The supervisor calls:
+   - Extracts `exit_code` and `exit_signal` using `os.WEXITSTATUS(status)` and `os.WTERMSIG(status)`.
+   - Generates `reap_token = uuid.uuid4().hex`.
+   - Computes an HMAC-SHA256 signature binding all reap parameters:
+     ```python
+     reap_payload = f"{instance_id}:{pid}:{exit_code}:{exit_signal}:{terminated_at}:{reap_token}"
+     reap_signature = hmac.new(self.supervisor_signing_secret, reap_payload.encode(), hashlib.sha256).hexdigest()
+     ```
+   - Persists the record into `worker_instances`:
      ```python
      def record_process_reap(
          self,
@@ -79,29 +89,20 @@ To establish non-forgeable reap evidence across process boundaries:
          exit_code: Optional[int],
          exit_signal: Optional[int],
          supervisor_id: str,
-     ) -> str:
-         """Atomically records child reap verification evidence into worker_instances.
-         
-         Invariants:
-         1. Verifies instance_id exists and status != 'DEAD'.
-         2. Sets status = 'DEAD', exit_code, exit_signal, terminated_at = now.
-         3. Issues and returns reap_token.
-         """
+         reap_signature: str,
+         reap_token: str,
+     ) -> None:
+         """Atomically records child reap verification evidence into worker_instances."""
      ```
-2. **Internal Authority Verification in `supervisor_finalize_job`**:
-   The engine validates the supervisor's claim inside the atomic SQLite transaction:
-   - **For `FORCED_KILL`**:
-     Supervisor provides `authority_proof = {"type": "FORCED_KILL", "worker_instance_id": instance_id, "reap_token": reap_token}`.
-     The engine queries `worker_instances`:
-     ```sql
-     SELECT status, exit_signal, reap_token FROM worker_instances WHERE instance_id = ?
-     ```
-     Verifies `status == 'DEAD'`, `reap_token == authority_proof['reap_token']`, and `exit_signal IN (9, 15)`.
-     This proves the child was genuinely killed and reaped by the supervisor.
-   - **For `PROCESS_DEAD`**:
-     Supervisor provides `worker_instance_id`. Engine checks `worker_instances`. If marked `status == 'DEAD'`, accepts; if still marked `ALIVE`, performs OS verification (`/proc/<pid>` absent, zombie status, or start_time mismatch).
-   - **For `LEASE_EXPIRED`**:
-     The engine queries `lease_expires_at` directly from `jobs` and validates `lease_expires_at < strftime('%s', 'now')`. If the lease has not expired, the operation **fails closed**.
+3. **Internal Verification in `supervisor_finalize_job`**:
+   To finalize a job under `FORCED_KILL`:
+   - Supervisor passes `authority_proof = {"type": "FORCED_KILL", "worker_instance_id": instance_id, "reap_token": reap_token, "reap_signature": reap_signature}`.
+   - The engine validates:
+     1. `worker_instances` row has `status == 'DEAD'` and `reap_token == authority_proof['reap_token']`.
+     2. Validates HMAC signature against the supervisor signing secret.
+     3. Checks `exit_signal IN (9, 15)` to verify the process was terminated.
+   - For `PROCESS_DEAD`: Supervisor passes `worker_instance_id`. Engine verifies `worker_instances.status == 'DEAD'`, or checks `/proc/<pid>` non-existence / process creation time mismatch.
+   - For `LEASE_EXPIRED`: Engine validates `lease_expires_at < strftime('%s', 'now')` atomically. If active, fails closed.
 
 ```python
 def supervisor_finalize_job(
@@ -114,16 +115,7 @@ def supervisor_finalize_job(
     reason: str,
     error: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Privileged supervisor finalization with internal proof verification.
-    
-    Invariants:
-    1. Validates proof internally within SQLite transaction against worker_instances and jobs tables.
-    2. Validates lease_generation == expected_lease_generation (fences stale supervisors).
-    3. Requires current status IN ('RUNNING', 'RECOVERABLE').
-    4. Disallows target_status == 'COMPLETED' (supervisors cannot forge successful work).
-    5. Records finalization event in job_events citing supervisor_id, verified authority_proof, reason, and error.
-    6. Increments lease_generation to fence out any delayed/zombie worker activity.
-    """
+    """Privileged supervisor finalization with cryptographic proof verification."""
 ```
 
 ### 1.3 Child Crash & Crash-Loop Protection
@@ -204,18 +196,7 @@ def resolve_manual_cleanup(
     verification_proof: str,  # e.g. "Verified absent via E2B console or CLI"
     admin_auth_token: str,    # Bearer token authenticated against admin credential store
 ) -> Dict[str, Any]:
-    """Operator-authenticated resolution of stuck cloud resources with non-forgeable attribution.
-    
-    Invariants:
-    1. Authenticates admin_auth_token against admin keystore; resolves authenticated_principal_id.
-    2. If action == 'CONFIRMED_DELETED':
-       - Sets sandbox_cleanup_status = 'CLEANED'.
-       - Does NOT alter execution status if already in terminal state ('FAILED', 'CANCELLED', 'TIMED_OUT').
-       - If status == 'RECOVERABLE', transitions status = 'QUEUED' (now safe to re-claim).
-       - Records structured audit event in job_events citing authenticated_principal_id, role, proof.
-    3. If action == 'FORCE_CLEANUP_RETRY':
-       - Resets sandbox_cleanup_attempts = 0, next_retry = now, sandbox_cleanup_status = 'ORPHANED'.
-    """
+    """Operator-authenticated resolution of stuck cloud resources with non-forgeable attribution."""
 ```
 
 ---
@@ -259,13 +240,11 @@ If `poll_worker_status` returns `'STALE'` (or if the database connection fails):
 
 ---
 
-## 4. Dedicated Side-Effect Ledger & Abandoned Intent Recovery Protocol
+## 4. Dedicated Side-Effect Ledger & Two-Phase Intent Recovery Protocol
 
-To guarantee idempotency and prevent duplicate external actions (such as duplicate GitHub PRs or corrupted Git branches) under at-least-once execution semantics:
+To guarantee idempotency and eliminate duplicate external side-effects (such as duplicate GitHub PRs or Git branch conflicts) under at-least-once execution semantics:
 
 ### 4.1 Schema Migration 2: Dedicated Side-Effect Ledger
-Side effects are stored in a dedicated, queryable relational table:
-
 ```sql
 CREATE TABLE IF NOT EXISTS job_side_effects (
     side_effect_id TEXT PRIMARY KEY, -- Full 64-character SHA-256 hex string
@@ -293,65 +272,50 @@ CREATE INDEX IF NOT EXISTS idx_side_effects_job ON job_side_effects (job_id, act
    - If an entry exists with `status = 'PENDING'` for an **active** lease generation: Rejects concurrent execution.
    - If no entry exists: Inserts row with `status = 'PENDING'`, current `worker_id`, and `lease_generation`.
 
-### 4.3 Recovery & Fencing of Abandoned `PENDING` Intents
-Consider the failure scenario:
-- Worker A reserves intent as `PENDING` (generation 1).
-- Worker A creates the PR on GitHub successfully.
-- Worker A crashes or loses its lease before recording `CONFIRMED`.
-- Worker B reclaims the job with a higher lease generation (generation 2).
-
-The recovery protocol defines strict reconciliation before any external action is taken:
+### 4.3 Two-Phase Recovery Protocol for Abandoned `PENDING` Intents
+An expired lease does **not** prove Worker A has stopped executing: Worker A's external HTTP request may still be in flight to GitHub.
+To prevent Worker B from creating a duplicate PR while Worker A's in-flight request finishes, the recovery protocol enforces a strict two-phase gate:
 
 ```mermaid
 flowchart TD
     W2["Worker B Claims Job (Generation 2)"] --> Q["Query job_side_effects for job_id"]
     Q --> Check{"Any intent in PENDING state?"}
     Check -->|No| Safe["Proceed with Normal Step Execution"]
-    Check -->|Yes (e.g. Generation 1 abandoned)| Reconcile["Enforce Remote Reconciliation Protocol"]
+    Check -->|Yes (e.g. Worker A generation 1)| Phase1["Phase 1: Worker Termination Verification"]
     
-    Reconcile --> GH["Query GitHub across state='all' for branch"]
+    Phase1 --> TermCheck{"Is Worker A process confirmed DEAD in worker_instances?"}
+    TermCheck -->|No| WaitKill["Supervisor must terminate & reap Worker A (or wait OS socket timeout 60s)"]
+    WaitKill --> TermCheck
+    TermCheck -->|Yes (Worker A verified DEAD)| Phase2["Phase 2: Remote Reconciliation & Idempotency"]
+    
+    Phase2 --> GH["Query GitHub across state='all' for branch head"]
     GH -->|API Error / Timeout| FailClosed["FAIL CLOSED: Raise SideEffectReconciliationError (Retry later)"]
-    GH -->|Matching PR Found| Adopt["Update intent: status='CONFIRMED', lease_gen=2, worker=Worker B"]
-    GH -->|0 PRs Found| Rollback["Update intent: status='FAILED_VERIFIED', lease_gen=2 (Safe to re-execute)"]
+    GH -->|Matching PR Found| Adopt["Adopt PR: status='CONFIRMED', lease_gen=2, worker=Worker B"]
+    GH -->|0 PRs Found| Rollback["Update intent: status='FAILED_VERIFIED', lease_gen=2"]
     
-    Adopt --> Fenced["Worker A Fenced: Stale lease_gen=1 rejected if zombie awakens"]
-    Rollback --> Fenced
+    Rollback --> IdempotentCreate["Create PR using deterministic branch: ai-cloud/job-{id}"]
 ```
 
-1. **Mandatory Pre-Execution Recovery Check**:
-   Before executing any side-effect tool, the new worker checks for existing `PENDING` intents associated with the `job_id`:
-   ```python
-   def recover_pending_side_effects(self, job_id: str, new_worker_id: str, new_lease_gen: int):
-       pending_intents = db.get_pending_side_effects(job_id)
-       for intent in pending_intents:
-           if intent["lease_generation"] < new_lease_gen:
-               # Older lease abandoned this intent; perform remote reconciliation
-               self._reconcile_abandoned_intent(intent, new_worker_id, new_lease_gen)
-   ```
-2. **Remote Provider Verification (Fail-Closed)**:
-   The new worker queries GitHub across **all states** (`state="all"`):
-   - **Matching PR Exists**:
-     Worker B verifies the PR was indeed created by Worker A.
-     Worker B updates `job_side_effects`:
-     `UPDATE job_side_effects SET status = 'CONFIRMED', worker_id = ?, lease_generation = ?, confirmed_result = ? WHERE side_effect_id = ?`
-     Worker B re-attaches to the existing PR URL and skips creation.
-   - **No PR Exists (Query succeeded with 0 results)**:
-     Worker B confirms Worker A crashed before creating the PR.
-     Worker B updates `job_side_effects`:
-     `UPDATE job_side_effects SET status = 'FAILED_VERIFIED', worker_id = ?, lease_generation = ? WHERE side_effect_id = ?`
-     Worker B is now permitted to reserve a fresh intent and perform the creation.
-   - **Query Inconclusive (API Error / Timeout / Rate Limit)**:
-     **Fails closed**. Worker B raises `SideEffectReconciliationError` and halts execution turn without performing duplicate actions.
-3. **Fencing the Old Worker**:
-   When Worker B updates `lease_generation = new_lease_gen` in `job_side_effects`:
-   If Worker A awakens as a zombie and attempts to update `status = 'CONFIRMED'`, the conditional SQL update:
-   `WHERE side_effect_id = ? AND lease_generation = ?`
-   matches 0 rows. Worker A's update is rejected, and Worker A discovers it is fenced out.
+#### Phase 1: Prior Worker Process Termination Verification (Process-Fencing Gate)
+Before Worker B can treat an absent remote result as proof that Worker A's request did not execute:
+1. Worker B inspects `worker_instances` for the worker instance that created the `PENDING` intent (`intent['worker_id']`).
+2. **Strict Verification**:
+   - Worker B verifies that `worker_instances.status == 'DEAD'`.
+   - If Worker A is **not** confirmed dead: Worker B yields execution and requests supervisor forced termination of Worker A. Worker B **strictly refuses** to re-execute or mark the intent `FAILED_VERIFIED` while Worker A could still be running an in-flight network request.
+   - If the worker instance cannot be verified dead (e.g. supervisor failure), Worker B must wait for the client-side socket/HTTP timeout boundary (**60.0 seconds**) to elapse past Worker A's lease expiration before concluding Worker A's network request has dropped.
 
-4. **Deterministic Branch Scoping**:
-   - Default branch: `ai-cloud/job-{job_id[:8]}`.
-   - Custom branch: `ai-cloud/job-{job_id[:8]}-{custom_branch_name}`.
-   - A worker **never** pushes to or resets a branch that does not begin with its unique job prefix.
+#### Phase 2: Remote Provider Reconciliation & Deterministic Branch Scoping
+Once Worker A is verified terminated:
+1. Worker B queries GitHub across **all states** (`state="all"`):
+   - **Matching PR Exists**: Worker B adopts the existing PR, records `status = 'CONFIRMED'`, and updates `lease_generation = 2`.
+   - **No PR Exists (Query succeeded with 0 results)**:
+     Because Worker A is verified dead and its sockets terminated, no delayed in-flight request can execute. Worker B marks the old intent `status = 'FAILED_VERIFIED'` and advances `lease_generation = 2`.
+   - **Inconclusive Query (Timeout / API Error)**:
+     **Fails closed**. Worker B raises `SideEffectReconciliationError` and halts without duplicating.
+2. **Provider-Level Idempotency Boundary**:
+   GitHub PR creation enforces branch-level uniqueness: only **one open PR** can exist for a given `(head, base)` pair. By enforcing strict, immutable branch scoping:
+   `head = f"ai-cloud/job-{job_id[:8]}"`
+   Even under pathological network partition, if a second concurrent PR creation call reached GitHub for the same head branch, GitHub's API rejects it with HTTP 422: `"A pull request already exists for this branch"`. The worker catches HTTP 422, re-runs remote reconciliation, and safely binds to the existing PR.
 
 ---
 
@@ -391,8 +355,9 @@ sequenceDiagram
     alt Still alive
         Sup->>Sup: os.kill(verified_pid, SIGKILL)
         Sup->>Sup: os.waitpid(verified_pid, 0)
-        Sup->>Sup: reap_token = record_process_reap(...)
-        Sup->>DB: supervisor_finalize_job(proof={'type': 'FORCED_KILL', 'reap_token': reap_token})
+        Sup->>Sup: reap_sig = HMAC(secret, payload)
+        Sup->>DB: record_process_reap(reap_sig, token)
+        Sup->>DB: supervisor_finalize_job(proof={'type': 'FORCED_KILL', 'reap_signature': reap_sig})
         Note over Sup: Slot freed deterministically; orphan reconciler destroys sandbox
     end
 ```
@@ -411,8 +376,8 @@ sequenceDiagram
      - Verifies worker PID against `start_time` in `worker_instances`.
      - Sends `SIGTERM`. If child remains alive after 2.0 seconds, issues `SIGKILL`.
      - Reaps child with `os.waitpid()`, extracting exit status and signal.
-     - Authoritatively records reap evidence with `record_process_reap()`.
-     - Calls `supervisor_finalize_job(target_status='CANCELLED'|'TIMED_OUT', proof={'type': 'FORCED_KILL', 'reap_token': token})`.
+     - Computes HMAC reap signature with RAM-only supervisor secret; authoritatively records reap evidence with `record_process_reap()`.
+     - Calls `supervisor_finalize_job(target_status='CANCELLED'|'TIMED_OUT', proof={'type': 'FORCED_KILL', 'reap_signature': reap_sig})`.
      - Releases the process slot deterministically and schedules background sandbox reconciliation.
 
 ---
@@ -456,21 +421,21 @@ Dedicated test file: `tests/test_phase_b_worker_engine.py`
 | **2** | **Heartbeat Maintenance** | Long-running task (10s) with 3s lease. | Heartbeat continuously extends lease; job never expires. |
 | **3** | **Pre-Step Self-Fencing** | Worker lease expires mid-run; heartbeat returns `'STALE'`. | Worker halts immediately; **zero** subsequent tool calls made; sandbox destroyed locally. |
 | **4** | **Cooperative Cancellation** | User requests cancellation during turn 1 of 3. | Worker detects `CANCEL_REQUESTED`, halts before turn 2, destroys sandbox, records `CANCELLED`. |
-| **5** | **Supervisor Non-Forgeable Authority** | Supervisor attempts `supervisor_finalize_job` on active worker without proof. | Fails closed; requires verified proof (`PROCESS_DEAD`, `FORCED_KILL` with reap token, or `LEASE_EXPIRED`). |
-| **6** | **Supervisor Forced Termination Fallback** | Worker process hangs in socket; watchdog triggers forced kill. | Supervisor sends `SIGTERM`/`SIGKILL`, reaps child, generates reap token, finalizes job, frees slot. |
+| **5** | **Supervisor Non-Forgeable Authority** | Supervisor attempts `supervisor_finalize_job` on active worker without proof. | Fails closed; requires verified HMAC proof (`FORCED_KILL` with reap signature) or database-verified `LEASE_EXPIRED`. |
+| **6** | **Supervisor Forced Termination Fallback** | Worker process hangs in socket; watchdog triggers forced kill. | Supervisor sends `SIGTERM`/`SIGKILL`, reaps child, generates HMAC signature, finalizes job, frees slot. |
 | **7** | **Blocked Command Forced Interruption** | Active tool call hangs; timeout watchdog trips. | Watchdog kills sandbox; synchronous call unblocks; supervisor falls back to SIGKILL if unblocked call fails. |
 | **8** | **Crash & Re-Claim Pre-Condition** | Worker killed via `SIGKILL` while holding active sandbox. | Job has `ORPHANED` status; `claim_next_job()` strictly refuses claim until confirmed `CLEANED`. |
 | **9** | **Cleanup Escalation & Authenticated Operator Resolution** | Reconciler encounters repeated provider 500 errors (10 times). | Status becomes `MANUAL_INTERVENTION_REQUIRED`; operator API validates token, attributes principal, resolves status without reviving terminal job. |
-| **10** | **Abandoned PENDING Side-Effect Recovery** | Worker A crashes after creating PR but before CONFIRMED. | Worker B reclaims job, discovers PENDING intent, verifies existing PR on GitHub, marks CONFIRMED without duplicating PR. Old Worker A fenced. |
+| **10** | **Abandoned Side-Effect Recovery Gate** | Worker A crashes after creating PR but before CONFIRMED; Worker B reclaims. | Worker B verifies Worker A is dead before evaluating absence, queries GitHub, adopts PR, marks CONFIRMED without duplicate PR. |
 | **11** | **Fail-Closed PR Reconciliation** | GitHub API raises 500/timeout during reconciliation check. | Worker fails closed; does **not** create duplicate PR; retries reconciliation cleanly. |
 | **12** | **PR Idempotency across All States** | PR was merged/closed on GitHub before worker retry. | Worker detects existing closed/merged PR in `job_side_effects`, re-attaches cleanly, does not duplicate. |
 | **13** | **Supervisor Crash-Loop Protection** | Child worker process repeatedly crashes on startup. | Supervisor applies exponential backoff ($1s \to 30s$); pauses slot after 5 crashes. |
-| **14** | **Spawned Worker Credential Isolation** | Inspect child process `/proc/<pid>/cmdline`, environment, and `job_events`. | Zero plaintext GitHub tokens or LLM API keys leaked across IPC boundaries. |
+| **14** | **Spawned Worker Credential Isolation** | Inspect child process `/proc/<pid>/cmdline`, environment, and `job_events`. | Zero plaintext GitHub tokens, supervisor signing secrets, or LLM keys leaked across IPC boundaries. |
 
 ---
 
 ## 9. Verification Gate & Commit Evidence
 
-- **Specification Base Commit**: `49b74ed69bc5867ef7b34c0d3b08d0d66ab3e078`
+- **Specification Base Commit**: `9822e697c19c6d84f43d2eb32ab17d40c8fdc02f`
 - **Main Baseline**: `5147be6c127c3eed87b6cabb0ca24f65b2550fa7` (strictly untouched)
 - **Scope Commitment**: `app.py` remains untouched. Phase B.2 implementation (`worker.py`) will not start until this specification is authorized.
