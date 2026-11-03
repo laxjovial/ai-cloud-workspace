@@ -283,12 +283,23 @@ def run_agent_turn(
                 accumulated_logs.append(f"Updated file: {path}")
 
             elif func_name == "create_pull_request":
-                res = sandbox.commit_and_create_pr(
-                    branch_name=args.get("branch_name", "ai-fix"),
-                    commit_message=args.get("commit_message", "AI code update"),
-                    pr_title=args.get("pr_title", "AI Pull Request"),
-                    pr_body=args.get("pr_body", ""),
-                )
+                # Check execution_controller hook for fenced side-effect ledger tracking
+                pr_hook = getattr(execution_controller, "on_create_pull_request", None) if execution_controller else None
+                if pr_hook and callable(pr_hook):
+                    res = pr_hook(
+                        sandbox=sandbox,
+                        branch_name=args.get("branch_name", "ai-fix"),
+                        commit_message=args.get("commit_message", "AI code update"),
+                        pr_title=args.get("pr_title", "AI Pull Request"),
+                        pr_body=args.get("pr_body", ""),
+                    )
+                else:
+                    res = sandbox.commit_and_create_pr(
+                        branch_name=args.get("branch_name", "ai-fix"),
+                        commit_message=args.get("commit_message", "AI code update"),
+                        pr_title=args.get("pr_title", "AI Pull Request"),
+                        pr_body=args.get("pr_body", ""),
+                    )
                 tool_result = json.dumps(res)
                 if res.get("success"):
                     accumulated_logs.append(f"Created PR: {res.get('pr_url')}")

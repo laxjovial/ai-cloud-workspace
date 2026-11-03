@@ -59,6 +59,12 @@ class MockSandbox:
         self.executed_commands = []
         self.is_killed = False
 
+    def start(self):
+        return {"success": True, "sandbox_id": self.sandbox_id}
+
+    def close(self):
+        self.is_killed = True
+
     def run_command(self, cmd: str):
         self.executed_commands.append(cmd)
         return {"stdout": f"Executed: {cmd}", "stderr": "", "exit_code": 0}
@@ -76,12 +82,12 @@ class MockSandbox:
         return {"success": True, "pr_url": f"https://github.com/{self.repo_name}/pull/42"}
 
 
-def crashing_worker_target(instance_id, db_path, stop_event):
+def crashing_worker_target(instance_id, db_path, stop_event, ipc_port=None, ipc_token=None):
     """Top-level function pickleable by multiprocessing spawn context."""
     os._exit(1)
 
 
-def env_inspector_worker_target(instance_id, db_path, stop_event):
+def env_inspector_worker_target(instance_id, db_path, stop_event, ipc_port=None, ipc_token=None):
     """Top-level function pickleable by multiprocessing spawn context."""
     assert "SUPERVISOR_SIGNING_KEY" not in os.environ
     stop_event.set()
