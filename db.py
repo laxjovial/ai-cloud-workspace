@@ -153,7 +153,8 @@ import fcntl
 def _atomic_modify_oauth_states(modifier_fn):
     """Safely reads, modifies, and writes OAuth states using file-level exclusive locking.
     
-    Fails closed: if the state store file exists but cannot be parsed or decoded (corrupted JSON),
+    Fails closed: if the state store file exists but cannot be accessed, read, parsed,
+    or decoded (e.g. empty/whitespace-only, malformed JSON, permission or I/O error),
     raises OAuthStateStorageError and preserves the original file for diagnosis rather than
     silently overwriting or resetting pending login attempts.
     """
@@ -171,19 +172,33 @@ def _atomic_modify_oauth_states(modifier_fn):
                 try:
                     with open(OAUTH_STATES_FILE, "r", encoding="utf-8") as fp:
                         content = fp.read()
-                        if content.strip():
-                            data = json.loads(content)
-                            if isinstance(data, dict):
-                                states = data
-                            else:
-                                raise OAuthStateStorageError(
-                                    f"OAuth state store '{OAUTH_STATES_FILE}' is malformed (expected JSON object, got {type(data).__name__})."
-                                )
+                except OSError as os_err:
+                    raise OAuthStateStorageError(
+                        f"OAuth state store '{OAUTH_STATES_FILE}' cannot be accessed or read: {str(os_err)}. "
+                        "Preserving original file for diagnosis."
+                    ) from os_err
+
+                clean_content = content.strip()
+                if not clean_content:
+                    raise OAuthStateStorageError(
+                        f"OAuth state store '{OAUTH_STATES_FILE}' is empty or whitespace-only. "
+                        "Preserving original file for diagnosis to prevent silent loss of pending attempts."
+                    )
+
+                try:
+                    data = json.loads(clean_content)
+                    if isinstance(data, dict):
+                        states = data
+                    else:
+                        raise OAuthStateStorageError(
+                            f"OAuth state store '{OAUTH_STATES_FILE}' is malformed (expected JSON object, got {type(data).__name__}). "
+                            "Preserving original file for diagnosis."
+                        )
                 except (json.JSONDecodeError, UnicodeDecodeError) as decode_err:
                     raise OAuthStateStorageError(
                         f"OAuth state store '{OAUTH_STATES_FILE}' is corrupted or unreadable: {str(decode_err)}. "
                         "Preserving original file for diagnosis to prevent silent loss of pending attempts."
-                    )
+                    ) from decode_err
 
             # Expire old states
             cleaned = {

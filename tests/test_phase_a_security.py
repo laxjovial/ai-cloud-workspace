@@ -209,26 +209,71 @@ class TestOAuthSecurity:
             assert "invalid, expired, or already-used" in res["error"]
 
     def test_corrupted_oauth_states_file_fails_closed_and_preserves_file(self, tmp_path, monkeypatch):
-        """CRITICAL: Malformed or corrupted OAuth state file must raise OAuthStateStorageError and preserve file."""
+        """CRITICAL: Malformed, non-dict, empty, or unreadable OAuth state file must raise OAuthStateStorageError and preserve file."""
         fake_states_file = tmp_path / ".oauth_states.json"
+
+        # Case 1: Corrupted JSON syntax
         corrupted_content = "{corrupted json syntax: [invalid"
         fake_states_file.write_text(corrupted_content, encoding="utf-8")
-
         monkeypatch.setattr(db, "OAUTH_STATES_FILE", str(fake_states_file))
 
-        # Direct atomic access must fail closed and raise OAuthStateStorageError
         with pytest.raises(db.OAuthStateStorageError) as exc_info:
             db._atomic_modify_oauth_states(lambda states: states)
         assert "corrupted or unreadable" in str(exc_info.value)
-
-        # File contents must be intact and preserved for investigation (not overwritten or reset to empty {})
         assert fake_states_file.read_text(encoding="utf-8") == corrupted_content
 
-        # Calling exchange_oauth_code should report storage error and not crash or reset file
         res = db.exchange_oauth_code("code_123", state="any_state", session_id="sess_123")
         assert res["success"] is False
         assert "storage error" in res["error"]
         assert fake_states_file.read_text(encoding="utf-8") == corrupted_content
+
+        # Case 2: Valid JSON but not a dictionary (e.g. JSON list)
+        list_content = '["state1", "state2"]'
+        fake_states_file.write_text(list_content, encoding="utf-8")
+        with pytest.raises(db.OAuthStateStorageError) as exc_info:
+            db._atomic_modify_oauth_states(lambda states: states)
+        assert "expected JSON object, got list" in str(exc_info.value)
+        assert fake_states_file.read_text(encoding="utf-8") == list_content
+
+        # Case 3: Completely empty file ("")
+        fake_states_file.write_text("", encoding="utf-8")
+        with pytest.raises(db.OAuthStateStorageError) as exc_info:
+            db._atomic_modify_oauth_states(lambda states: states)
+        assert "empty or whitespace-only" in str(exc_info.value)
+        assert fake_states_file.read_text(encoding="utf-8") == ""
+
+        # Case 4: Whitespace-only file ("   \n\t  ")
+        whitespace_content = "   \n\t  "
+        fake_states_file.write_text(whitespace_content, encoding="utf-8")
+        with pytest.raises(db.OAuthStateStorageError) as exc_info:
+            db._atomic_modify_oauth_states(lambda states: states)
+        assert "empty or whitespace-only" in str(exc_info.value)
+        assert fake_states_file.read_text(encoding="utf-8") == whitespace_content
+
+        # Case 5: File access / read PermissionError or OSError
+        valid_json = '{"state_x": {"verifier": "v", "provider": "p", "session_id": "s", "created_at": 9999999999}}'
+        fake_states_file.write_text(valid_json, encoding="utf-8")
+
+        real_open = open
+        def mock_open_failure(file, mode="r", *args, **kwargs):
+            if str(file) == str(fake_states_file) and "r" in mode:
+                raise PermissionError("Simulated permission denied reading OAuth states")
+            return real_open(file, mode, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", mock_open_failure)
+
+        with pytest.raises(db.OAuthStateStorageError) as exc_info:
+            db._atomic_modify_oauth_states(lambda states: states)
+        assert "cannot be accessed or read" in str(exc_info.value)
+        assert isinstance(exc_info.value.__cause__, OSError)
+
+        res_os_err = db.exchange_oauth_code("code_123", state="state_x", session_id="s")
+        assert res_os_err["success"] is False
+        assert "storage error" in res_os_err["error"]
+
+        # Restore open and confirm file on disk was preserved untouched
+        monkeypatch.setattr("builtins.open", real_open)
+        assert fake_states_file.read_text(encoding="utf-8") == valid_json
 
 
 # =====================================================================
