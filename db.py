@@ -172,6 +172,11 @@ def _atomic_modify_oauth_states(modifier_fn):
                 try:
                     with open(OAUTH_STATES_FILE, "r", encoding="utf-8") as fp:
                         content = fp.read()
+                except UnicodeDecodeError as decode_err:
+                    raise OAuthStateStorageError(
+                        f"OAuth state store '{OAUTH_STATES_FILE}' contains invalid UTF-8 bytes and cannot be decoded: {str(decode_err)}. "
+                        "Preserving original file for diagnosis."
+                    ) from decode_err
                 except OSError as os_err:
                     raise OAuthStateStorageError(
                         f"OAuth state store '{OAUTH_STATES_FILE}' cannot be accessed or read: {str(os_err)}. "

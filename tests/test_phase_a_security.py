@@ -275,6 +275,21 @@ class TestOAuthSecurity:
         monkeypatch.setattr("builtins.open", real_open)
         assert fake_states_file.read_text(encoding="utf-8") == valid_json
 
+        # Case 6: Invalid UTF-8 bytes in state file
+        invalid_utf8_bytes = b"\x80abc\xff\xfe"
+        fake_states_file.write_bytes(invalid_utf8_bytes)
+
+        with pytest.raises(db.OAuthStateStorageError) as exc_info:
+            db._atomic_modify_oauth_states(lambda states: states)
+        assert "invalid UTF-8 bytes" in str(exc_info.value)
+        assert isinstance(exc_info.value.__cause__, UnicodeDecodeError)
+        assert fake_states_file.read_bytes() == invalid_utf8_bytes
+
+        res_utf8_err = db.exchange_oauth_code("code_123", state="state_x", session_id="s")
+        assert res_utf8_err["success"] is False
+        assert "storage error" in res_utf8_err["error"]
+        assert fake_states_file.read_bytes() == invalid_utf8_bytes
+
 
 # =====================================================================
 # 3 & 4. FAIL-CLOSED ENCRYPTION & LOCAL STORAGE TESTS
