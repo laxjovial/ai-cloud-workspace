@@ -208,6 +208,28 @@ class TestOAuthSecurity:
             assert res["success"] is False
             assert "invalid, expired, or already-used" in res["error"]
 
+    def test_corrupted_oauth_states_file_fails_closed_and_preserves_file(self, tmp_path, monkeypatch):
+        """CRITICAL: Malformed or corrupted OAuth state file must raise OAuthStateStorageError and preserve file."""
+        fake_states_file = tmp_path / ".oauth_states.json"
+        corrupted_content = "{corrupted json syntax: [invalid"
+        fake_states_file.write_text(corrupted_content, encoding="utf-8")
+
+        monkeypatch.setattr(db, "OAUTH_STATES_FILE", str(fake_states_file))
+
+        # Direct atomic access must fail closed and raise OAuthStateStorageError
+        with pytest.raises(db.OAuthStateStorageError) as exc_info:
+            db._atomic_modify_oauth_states(lambda states: states)
+        assert "corrupted or unreadable" in str(exc_info.value)
+
+        # File contents must be intact and preserved for investigation (not overwritten or reset to empty {})
+        assert fake_states_file.read_text(encoding="utf-8") == corrupted_content
+
+        # Calling exchange_oauth_code should report storage error and not crash or reset file
+        res = db.exchange_oauth_code("code_123", state="any_state", session_id="sess_123")
+        assert res["success"] is False
+        assert "storage error" in res["error"]
+        assert fake_states_file.read_text(encoding="utf-8") == corrupted_content
+
 
 # =====================================================================
 # 3 & 4. FAIL-CLOSED ENCRYPTION & LOCAL STORAGE TESTS

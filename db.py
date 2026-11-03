@@ -45,6 +45,11 @@ class DecryptionError(Exception):
     pass
 
 
+class OAuthStateStorageError(Exception):
+    """Raised when OAuth state store cannot be accessed, read, or contains corrupted data."""
+    pass
+
+
 def _get_fernet() -> Optional[Fernet]:
     """Retrieves Fernet cipher from ENCRYPTION_KEY in secrets or environment."""
     enc_key = ""
@@ -146,7 +151,12 @@ import fcntl
 
 
 def _atomic_modify_oauth_states(modifier_fn):
-    """Safely reads, modifies, and writes OAuth states using file-level exclusive locking."""
+    """Safely reads, modifies, and writes OAuth states using file-level exclusive locking.
+    
+    Fails closed: if the state store file exists but cannot be parsed or decoded (corrupted JSON),
+    raises OAuthStateStorageError and preserves the original file for diagnosis rather than
+    silently overwriting or resetting pending login attempts.
+    """
     # Ensure directory exists
     dir_name = os.path.dirname(os.path.abspath(OAUTH_STATES_FILE))
     os.makedirs(dir_name, exist_ok=True)
@@ -160,11 +170,20 @@ def _atomic_modify_oauth_states(modifier_fn):
             if os.path.exists(OAUTH_STATES_FILE):
                 try:
                     with open(OAUTH_STATES_FILE, "r", encoding="utf-8") as fp:
-                        data = json.load(fp)
-                        if isinstance(data, dict):
-                            states = data
-                except Exception:
-                    states = {}
+                        content = fp.read()
+                        if content.strip():
+                            data = json.loads(content)
+                            if isinstance(data, dict):
+                                states = data
+                            else:
+                                raise OAuthStateStorageError(
+                                    f"OAuth state store '{OAUTH_STATES_FILE}' is malformed (expected JSON object, got {type(data).__name__})."
+                                )
+                except (json.JSONDecodeError, UnicodeDecodeError) as decode_err:
+                    raise OAuthStateStorageError(
+                        f"OAuth state store '{OAUTH_STATES_FILE}' is corrupted or unreadable: {str(decode_err)}. "
+                        "Preserving original file for diagnosis to prevent silent loss of pending attempts."
+                    )
 
             # Expire old states
             cleaned = {
@@ -256,7 +275,13 @@ def exchange_oauth_code(code: str, state: Optional[str] = None, session_id: Opti
             return consumed.get("verifier")
         return None
 
-    consume_result = _atomic_modify_oauth_states(_consume_state)
+    try:
+        consume_result = _atomic_modify_oauth_states(_consume_state)
+    except OAuthStateStorageError as storage_err:
+        return {
+            "success": False,
+            "error": f"OAuth authorization failed due to storage error: {str(storage_err)}",
+        }
 
     if consume_result == "MISSING_SESSION_ID":
         return {
