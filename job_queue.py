@@ -1,19 +1,29 @@
 """Durable Job Queue and Storage Engine for AI Cloud Workspace.
 
-Implements Phase B.1:
-- Local-first SQLite in WAL mode with robust busy timeouts (5000ms).
-- Atomic job claims using conditional SQL transitions and monotonic fencing tokens (lease_generation).
-- Protection against split-brain stale worker mutations.
-- Idempotent job submissions via client-supplied or generated idempotency keys.
-- Append-only job logs and lifecycle events table.
-- Strict multi-tenant isolation (all reads and mutations require user_id).
-- Safe credential references (zero plaintext secrets in payloads).
+Implements Phase B.1 (Hardened):
+- Local-first SQLite in WAL mode with robust busy timeouts (5000ms) and explicit WAL serialization.
+- Thread-safe / Multi-process concurrency: Serializes transactions across threads via internal re-entrant locking,
+  and across processes via SQLite BEGIN IMMEDIATE.
+- Monotonic fencing tokens (lease_generation) and strict lease expiration validation:
+  Every worker mutation (record_heartbeat, append_log, update_job_status) enforces:
+  status == 'RUNNING' AND worker_id == expected AND lease_generation == expected AND lease_expires_at >= now.
+  An expired lease CANNOT be revived or mutate the job even before the reaper runs.
+- Cancellation precedence:
+  A job with cancel_requested_at is NEVER re-queued by the reaper. Stale cancelled jobs are transitioned
+  to terminal CANCELLED. Completed status updates cannot overwrite pending cancellation requests.
+- Append-only event restrictions:
+  Only the active, unexpired lease holder of a RUNNING job can append worker events. Terminal jobs reject worker events.
+- Strict credential-reference schema:
+  Validates reference structures (provider, key_ref) and rejects raw secret values (PATs, bearer tokens, API keys)
+  in both payload and credential_refs.
 - Schema versioning and idempotent forward migrations.
 """
 
 import os
+import re
 import json
 import sqlite3
+import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
@@ -30,7 +40,7 @@ class JobQueueError(Exception):
 
 
 class StaleLeaseError(JobQueueError):
-    """Raised when a worker attempts an update with a superseded or expired lease generation."""
+    """Raised when a worker attempts an update with an expired or superseded lease."""
     pass
 
 
@@ -49,16 +59,77 @@ class JobNotFoundError(JobQueueError):
     pass
 
 
+class InvalidCredentialReferenceError(JobQueueError):
+    """Raised when a credential reference or payload violates security schema."""
+    pass
+
+
 # Allowed state transitions: from_status -> set of allowed target statuses
 ALLOWED_TRANSITIONS: Dict[str, set] = {
     "QUEUED": {"RUNNING", "CANCELLED"},
     "RUNNING": {"COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT", "RECOVERABLE"},
-    "RECOVERABLE": {"QUEUED", "FAILED"},
+    "RECOVERABLE": {"QUEUED", "FAILED", "CANCELLED"},
     "COMPLETED": set(),  # Terminal
     "FAILED": set(),     # Terminal
     "CANCELLED": set(),  # Terminal
     "TIMED_OUT": set(),  # Terminal
 }
+
+# Regex to detect obvious raw secret leaks
+RAW_SECRET_PATTERNS = [
+    re.compile(r"gh[pousr]_[A-Za-z0-9_]{16,}"),
+    re.compile(r"sk-[A-Za-z0-9\-_]{20,}"),
+    re.compile(r"x-access-token:[^@\s]+"),
+    re.compile(r"Bearer\s+[A-Za-z0-9\-_\.]{20,}", re.IGNORECASE),
+]
+
+# Strict credential reference validation schema
+ALLOWED_CRED_PROVIDERS = {"github", "openai", "anthropic", "gemini", "deepseek"}
+VALID_KEY_REF_PATTERN = re.compile(r"^[a-zA-Z0-9_\-\.]{1,128}$")
+
+
+def validate_credential_references(credential_refs: Optional[Dict[str, Any]]) -> None:
+    """Validates that credential_refs conform to a strict reference schema and contain NO raw secrets."""
+    if credential_refs is None:
+        return
+    if not isinstance(credential_refs, dict):
+        raise InvalidCredentialReferenceError("credential_refs must be a dictionary.")
+
+    for provider, ref in credential_refs.items():
+        if provider not in ALLOWED_CRED_PROVIDERS:
+            raise InvalidCredentialReferenceError(
+                f"Invalid credential provider '{provider}'. Allowed: {sorted(ALLOWED_CRED_PROVIDERS)}"
+            )
+        if not isinstance(ref, (str, dict)):
+            raise InvalidCredentialReferenceError(
+                f"Credential reference for '{provider}' must be a reference string or object, got {type(ref).__name__}."
+            )
+
+        ref_str = json.dumps(ref)
+        for pat in RAW_SECRET_PATTERNS:
+            if pat.search(ref_str):
+                raise InvalidCredentialReferenceError(
+                    f"Security violation: Raw credential pattern detected in credential_refs for '{provider}'. "
+                    "Only safe reference keys (e.g. key_name, account_id) may be passed."
+                )
+
+        if isinstance(ref, str) and not VALID_KEY_REF_PATTERN.match(ref):
+            raise InvalidCredentialReferenceError(
+                f"Credential reference string for '{provider}' contains invalid characters or exceeds 128 chars."
+            )
+
+
+def validate_payload_security(payload: Optional[Dict[str, Any]]) -> None:
+    """Scans payload to ensure raw access tokens or API keys are not embedded in plain text."""
+    if not payload:
+        return
+    payload_str = json.dumps(payload)
+    for pat in RAW_SECRET_PATTERNS:
+        if pat.search(payload_str):
+            raise JobQueueError(
+                "Security violation: Raw secret or access token detected in job payload. "
+                "Secrets must be referenced through credential_refs and resolved in worker context."
+            )
 
 
 def _get_connection(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
@@ -71,7 +142,7 @@ def _get_connection(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             db_path,
             timeout=5.0,
             check_same_thread=False,
-            isolation_level=None,  # We manage transactions explicitly via BEGIN / COMMIT
+            isolation_level=None,  # Transactions managed explicitly via BEGIN / COMMIT
         )
         conn.row_factory = sqlite3.Row
         with conn:
@@ -102,7 +173,6 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         row = cursor.fetchone()
         current_version = 0
         if row is not None:
-            # Handle both sqlite3.Row and raw tuple
             val = row[0] if isinstance(row, tuple) else row["max_v"]
             if val is not None:
                 current_version = int(val)
@@ -155,7 +225,6 @@ def run_migrations(conn: sqlite3.Connection) -> None:
                 """
             )
 
-            # Performance indices for workers, status queries, and multi-tenant access
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status_lease ON jobs (status, lease_expires_at);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_user_created ON jobs (user_id, created_at DESC);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_session ON jobs (session_id, created_at DESC);")
@@ -168,20 +237,27 @@ def run_migrations(conn: sqlite3.Connection) -> None:
 
 
 class DurableJobQueue:
-    """Manages transactional job queue operations in SQLite with fencing tokens and tenant isolation."""
+    """Manages transactional job queue operations in SQLite with fencing tokens and tenant isolation.
+    
+    Concurrency Architecture:
+    - Thread-safety within a single process is guaranteed via a re-entrant lock (self._lock).
+    - Multi-process safety is guaranteed via SQLite WAL mode and BEGIN IMMEDIATE atomic write transactions.
+    """
 
     def __init__(self, db_path: str = DEFAULT_DB_PATH):
         self.db_path = db_path
+        self._lock = threading.RLock()
         self.conn = _get_connection(db_path)
         run_migrations(self.conn)
 
     def close(self) -> None:
         """Closes the underlying SQLite database connection."""
-        if self.conn:
-            try:
-                self.conn.close()
-            except Exception:
-                pass
+        with self._lock:
+            if self.conn:
+                try:
+                    self.conn.close()
+                except Exception:
+                    pass
 
     def enqueue_job(
         self,
@@ -189,7 +265,7 @@ class DurableJobQueue:
         session_id: str,
         repository: str,
         payload: Dict[str, Any],
-        credential_refs: Optional[Dict[str, str]] = None,
+        credential_refs: Optional[Dict[str, Any]] = None,
         idempotency_key: Optional[str] = None,
         max_retries: int = 3,
         timeout_seconds: float = 600.0,
@@ -199,6 +275,14 @@ class DurableJobQueue:
             raise JobQueueError("user_id is required.")
         if not repository or not repository.strip():
             raise JobQueueError("repository is required.")
+        if max_retries < 0 or max_retries > 50:
+            raise JobQueueError(f"Invalid max_retries: {max_retries}. Must be between 0 and 50.")
+        if timeout_seconds <= 0 or timeout_seconds > 86400:
+            raise JobQueueError(f"Invalid timeout_seconds: {timeout_seconds}. Must be between 1 and 86400.")
+
+        # Strict credential & payload security validation
+        validate_payload_security(payload)
+        validate_credential_references(credential_refs)
 
         clean_user_id = user_id.strip()
         clean_repo = repository.strip()
@@ -206,70 +290,62 @@ class DurableJobQueue:
         clean_idemp = idempotency_key.strip() if idempotency_key else None
         now = time.time()
 
-        # Sanitize payload: verify no obvious plaintext secret injection
         payload_str = json.dumps(payload or {})
-        for secret_indicator in ["ghp_", "gho_", "sk-", "x-access-token:"]:
-            if secret_indicator in payload_str:
-                raise JobQueueError(
-                    f"Security violation: Plaintext secret pattern '{secret_indicator}' detected in job payload. "
-                    "Secrets must be referenced via credential_refs."
-                )
-
         cred_refs_str = json.dumps(credential_refs or {})
         job_id = str(uuid.uuid4())
 
-        try:
-            with self.conn:
-                self.conn.execute("BEGIN IMMEDIATE;")
+        with self._lock:
+            try:
+                with self.conn:
+                    self.conn.execute("BEGIN IMMEDIATE;")
 
-                # Check for existing idempotency key
-                if clean_idemp:
-                    cursor = self.conn.execute(
-                        "SELECT * FROM jobs WHERE idempotency_key = ?;",
-                        (clean_idemp,),
+                    # Check for existing idempotency key
+                    if clean_idemp:
+                        cursor = self.conn.execute(
+                            "SELECT * FROM jobs WHERE idempotency_key = ?;",
+                            (clean_idemp,),
+                        )
+                        existing = cursor.fetchone()
+                        if existing:
+                            if existing["user_id"] != clean_user_id:
+                                raise JobAccessDeniedError("Idempotency key already exists for another user.")
+                            return self._row_to_dict(existing)
+
+                    self.conn.execute(
+                        """
+                        INSERT INTO jobs (
+                            id, idempotency_key, user_id, session_id, repository,
+                            status, payload_json, credential_refs_json,
+                            retry_count, max_retries, timeout_seconds,
+                            created_at
+                        ) VALUES (?, ?, ?, ?, ?, 'QUEUED', ?, ?, 0, ?, ?, ?);
+                        """,
+                        (
+                            job_id,
+                            clean_idemp,
+                            clean_user_id,
+                            clean_session,
+                            clean_repo,
+                            payload_str,
+                            cred_refs_str,
+                            max_retries,
+                            timeout_seconds,
+                            now,
+                        ),
                     )
-                    existing = cursor.fetchone()
-                    if existing:
-                        # Multi-tenant check: idempotency key must belong to same user
-                        if existing["user_id"] != clean_user_id:
-                            raise JobAccessDeniedError("Idempotency key already exists for another user.")
-                        return self._row_to_dict(existing)
 
-                self.conn.execute(
-                    """
-                    INSERT INTO jobs (
-                        id, idempotency_key, user_id, session_id, repository,
-                        status, payload_json, credential_refs_json,
-                        retry_count, max_retries, timeout_seconds,
-                        created_at
-                    ) VALUES (?, ?, ?, ?, ?, 'QUEUED', ?, ?, 0, ?, ?, ?);
-                    """,
-                    (
-                        job_id,
-                        clean_idemp,
-                        clean_user_id,
-                        clean_session,
-                        clean_repo,
-                        payload_str,
-                        cred_refs_str,
-                        max_retries,
-                        timeout_seconds,
-                        now,
-                    ),
-                )
+                    self.conn.execute(
+                        """
+                        INSERT INTO job_events (
+                            job_id, event_type, source, message, created_at
+                        ) VALUES (?, 'ENQUEUED', 'client', 'Job enqueued and awaiting worker claim.', ?);
+                        """,
+                        (job_id, now),
+                    )
 
-                self.conn.execute(
-                    """
-                    INSERT INTO job_events (
-                        job_id, event_type, source, message, created_at
-                    ) VALUES (?, 'ENQUEUED', 'client', 'Job enqueued and awaiting worker claim.', ?);
-                    """,
-                    (job_id, now),
-                )
-
-            return self.get_job(job_id, user_id=clean_user_id)
-        except sqlite3.Error as e:
-            raise JobQueueError(f"Database error while enqueuing job: {str(e)}") from e
+                return self.get_job(job_id, user_id=clean_user_id)
+            except sqlite3.Error as e:
+                raise JobQueueError(f"Database error while enqueuing job: {str(e)}") from e
 
     def claim_next_job(
         self,
@@ -279,64 +355,63 @@ class DurableJobQueue:
         """Atomically claims the next pending QUEUED job using an atomic lease and incremented fencing token."""
         if not worker_id or not worker_id.strip():
             raise JobQueueError("worker_id is required to claim jobs.")
+        if lease_duration_seconds <= 0 or lease_duration_seconds > 3600:
+            raise JobQueueError(f"Invalid lease_duration_seconds: {lease_duration_seconds}. Must be between 1 and 3600.")
 
         now = time.time()
         lease_expires_at = now + lease_duration_seconds
 
-        try:
-            with self.conn:
-                self.conn.execute("BEGIN IMMEDIATE;")
+        with self._lock:
+            try:
+                with self.conn:
+                    self.conn.execute("BEGIN IMMEDIATE;")
 
-                # Find the oldest queued job
-                cursor = self.conn.execute(
-                    """
-                    SELECT id, lease_generation FROM jobs
-                    WHERE status = 'QUEUED'
-                    ORDER BY created_at ASC
-                    LIMIT 1;
-                    """
-                )
-                row = cursor.fetchone()
-                if not row:
-                    return None
+                    cursor = self.conn.execute(
+                        """
+                        SELECT id, lease_generation FROM jobs
+                        WHERE status = 'QUEUED'
+                        ORDER BY created_at ASC
+                        LIMIT 1;
+                        """
+                    )
+                    row = cursor.fetchone()
+                    if not row:
+                        return None
 
-                job_id = row["id"]
-                current_gen = row["lease_generation"]
-                new_gen = current_gen + 1
+                    job_id = row["id"]
+                    current_gen = row["lease_generation"]
+                    new_gen = current_gen + 1
 
-                # Conditional update: only succeeds if still QUEUED
-                update_cursor = self.conn.execute(
-                    """
-                    UPDATE jobs
-                    SET status = 'RUNNING',
-                        worker_id = ?,
-                        lease_generation = ?,
-                        heartbeat_at = ?,
-                        lease_expires_at = ?,
-                        started_at = COALESCE(started_at, ?)
-                    WHERE id = ? AND status = 'QUEUED';
-                    """,
-                    (worker_id, new_gen, now, lease_expires_at, now, job_id),
-                )
+                    # Conditional update: only succeeds if still QUEUED
+                    update_cursor = self.conn.execute(
+                        """
+                        UPDATE jobs
+                        SET status = 'RUNNING',
+                            worker_id = ?,
+                            lease_generation = ?,
+                            heartbeat_at = ?,
+                            lease_expires_at = ?,
+                            started_at = COALESCE(started_at, ?)
+                        WHERE id = ? AND status = 'QUEUED';
+                        """,
+                        (worker_id, new_gen, now, lease_expires_at, now, job_id),
+                    )
 
-                if update_cursor.rowcount == 0:
-                    # Race condition: claimed by another worker simultaneously
-                    return None
+                    if update_cursor.rowcount == 0:
+                        return None
 
-                # Log claim event
-                self.conn.execute(
-                    """
-                    INSERT INTO job_events (
-                        job_id, event_type, source, worker_id, lease_generation, message, created_at
-                    ) VALUES (?, 'CLAIMED', 'worker', ?, ?, 'Job claimed by worker.', ?);
-                    """,
-                    (job_id, worker_id, new_gen, now),
-                )
+                    self.conn.execute(
+                        """
+                        INSERT INTO job_events (
+                            job_id, event_type, source, worker_id, lease_generation, message, created_at
+                        ) VALUES (?, 'CLAIMED', 'worker', ?, ?, 'Job claimed by worker.', ?);
+                        """,
+                        (job_id, worker_id, new_gen, now),
+                    )
 
-            # Retrieve and return full job row
-            return self.get_job_by_id_internal(job_id)
-        except sqlite3.Error as e:
-            raise JobQueueError(f"Database error during claim_next_job: {str(e)}") from e
+                return self.get_job_by_id_internal(job_id)
+            except sqlite3.Error as e:
+                raise JobQueueError(f"Database error during claim_next_job: {str(e)}") from e
 
     def record_heartbeat(
         self,
@@ -345,41 +420,59 @@ class DurableJobQueue:
         lease_generation: int,
         lease_duration_seconds: float = DEFAULT_LEASE_DURATION_SECONDS,
     ) -> bool:
-        """Refreshes worker heartbeat and extends lease_expires_at. Fails closed if lease_generation is stale."""
+        """Refreshes worker heartbeat and extends lease_expires_at.
+        
+        Strict Fencing: Fails closed if the worker is not current, the generation does not match,
+        the status is not RUNNING, OR the current lease has ALREADY expired (even before reaper execution).
+        """
+        if lease_duration_seconds <= 0 or lease_duration_seconds > 3600:
+            raise JobQueueError(f"Invalid lease_duration_seconds: {lease_duration_seconds}.")
+
         now = time.time()
         new_expires_at = now + lease_duration_seconds
 
-        try:
-            with self.conn:
-                self.conn.execute("BEGIN IMMEDIATE;")
-                cursor = self.conn.execute(
-                    """
-                    UPDATE jobs
-                    SET heartbeat_at = ?,
-                        lease_expires_at = ?
-                    WHERE id = ? AND worker_id = ? AND lease_generation = ? AND status = 'RUNNING';
-                    """,
-                    (now, new_expires_at, job_id, worker_id, lease_generation),
-                )
+        with self._lock:
+            try:
+                with self.conn:
+                    self.conn.execute("BEGIN IMMEDIATE;")
+                    cursor = self.conn.execute(
+                        """
+                        UPDATE jobs
+                        SET heartbeat_at = ?,
+                            lease_expires_at = ?
+                        WHERE id = ?
+                          AND worker_id = ?
+                          AND lease_generation = ?
+                          AND status = 'RUNNING'
+                          AND lease_expires_at >= ?;
+                        """,
+                        (now, new_expires_at, job_id, worker_id, lease_generation, now),
+                    )
 
-                if cursor.rowcount == 0:
-                    # Check why it failed
-                    chk = self.conn.execute(
-                        "SELECT worker_id, lease_generation, status FROM jobs WHERE id = ?;",
-                        (job_id,),
-                    ).fetchone()
-                    if not chk:
-                        raise JobNotFoundError(f"Job '{job_id}' does not exist.")
-                    if chk["lease_generation"] != lease_generation or chk["worker_id"] != worker_id:
-                        raise StaleLeaseError(
-                            f"Worker '{worker_id}' with generation {lease_generation} has been superseded by "
-                            f"worker '{chk['worker_id']}' generation {chk['lease_generation']}."
-                        )
-                    return False
+                    if cursor.rowcount == 0:
+                        # Determine explicit failure cause
+                        chk = self.conn.execute(
+                            "SELECT worker_id, lease_generation, status, lease_expires_at FROM jobs WHERE id = ?;",
+                            (job_id,),
+                        ).fetchone()
+                        if not chk:
+                            raise JobNotFoundError(f"Job '{job_id}' does not exist.")
+                        if chk["status"] != "RUNNING":
+                            raise StaleLeaseError(f"Cannot heartbeat: job '{job_id}' is in status '{chk['status']}'.")
+                        if chk["lease_generation"] != lease_generation or chk["worker_id"] != worker_id:
+                            raise StaleLeaseError(
+                                f"Worker '{worker_id}' (gen {lease_generation}) superseded by "
+                                f"worker '{chk['worker_id']}' (gen {chk['lease_generation']})."
+                            )
+                        if chk["lease_expires_at"] is not None and chk["lease_expires_at"] < now:
+                            raise StaleLeaseError(
+                                f"Cannot heartbeat: lease for worker '{worker_id}' expired at {chk['lease_expires_at']} (now {now})."
+                            )
+                        return False
 
-            return True
-        except sqlite3.Error as e:
-            raise JobQueueError(f"Database error during record_heartbeat: {str(e)}") from e
+                return True
+            except sqlite3.Error as e:
+                raise JobQueueError(f"Database error during record_heartbeat: {str(e)}") from e
 
     def append_log(
         self,
@@ -390,36 +483,44 @@ class DurableJobQueue:
         event_type: str = "LOG",
         data: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Appends an event/log line. Fails closed if the worker lease generation is stale."""
+        """Appends an event/log line. Fails closed if the job is not RUNNING, lease is expired, or worker is stale."""
         now = time.time()
         data_str = json.dumps(data) if data is not None else None
 
-        try:
-            with self.conn:
-                self.conn.execute("BEGIN IMMEDIATE;")
-                # Verify worker lease generation validity
-                chk = self.conn.execute(
-                    "SELECT worker_id, lease_generation, status FROM jobs WHERE id = ?;",
-                    (job_id,),
-                ).fetchone()
+        with self._lock:
+            try:
+                with self.conn:
+                    self.conn.execute("BEGIN IMMEDIATE;")
+                    chk = self.conn.execute(
+                        "SELECT worker_id, lease_generation, status, lease_expires_at FROM jobs WHERE id = ?;",
+                        (job_id,),
+                    ).fetchone()
 
-                if not chk:
-                    raise JobNotFoundError(f"Job '{job_id}' does not exist.")
-                if chk["worker_id"] != worker_id or chk["lease_generation"] != lease_generation:
-                    raise StaleLeaseError(
-                        f"Refusing to append log: worker '{worker_id}' (gen {lease_generation}) is stale for job '{job_id}'."
+                    if not chk:
+                        raise JobNotFoundError(f"Job '{job_id}' does not exist.")
+                    if chk["status"] != "RUNNING":
+                        raise StaleLeaseError(
+                            f"Refusing to append log: job '{job_id}' is in terminal/non-running status '{chk['status']}'."
+                        )
+                    if chk["worker_id"] != worker_id or chk["lease_generation"] != lease_generation:
+                        raise StaleLeaseError(
+                            f"Refusing to append log: worker '{worker_id}' (gen {lease_generation}) is stale for job '{job_id}'."
+                        )
+                    if chk["lease_expires_at"] is not None and chk["lease_expires_at"] < now:
+                        raise StaleLeaseError(
+                            f"Refusing to append log: lease for worker '{worker_id}' expired at {chk['lease_expires_at']} (now {now})."
+                        )
+
+                    self.conn.execute(
+                        """
+                        INSERT INTO job_events (
+                            job_id, event_type, source, worker_id, lease_generation, message, data_json, created_at
+                        ) VALUES (?, ?, 'worker', ?, ?, ?, ?, ?);
+                        """,
+                        (job_id, event_type, worker_id, lease_generation, message, data_str, now),
                     )
-
-                self.conn.execute(
-                    """
-                    INSERT INTO job_events (
-                        job_id, event_type, source, worker_id, lease_generation, message, data_json, created_at
-                    ) VALUES (?, ?, 'worker', ?, ?, ?, ?, ?);
-                    """,
-                    (job_id, event_type, worker_id, lease_generation, message, data_str, now),
-                )
-        except sqlite3.Error as e:
-            raise JobQueueError(f"Database error during append_log: {str(e)}") from e
+            except sqlite3.Error as e:
+                raise JobQueueError(f"Database error during append_log: {str(e)}") from e
 
     def update_job_status(
         self,
@@ -430,70 +531,75 @@ class DurableJobQueue:
         error: Optional[Dict[str, Any]] = None,
         sandbox_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Transitions job to a target status with strict validation against cancellation overwrites and stale leases."""
+        """Transitions job to target status with strict validation against cancellation overwrites, expiration, and stale leases."""
         now = time.time()
         err_str = json.dumps(error) if error else None
 
-        try:
-            with self.conn:
-                self.conn.execute("BEGIN IMMEDIATE;")
+        with self._lock:
+            try:
+                with self.conn:
+                    self.conn.execute("BEGIN IMMEDIATE;")
 
-                cursor = self.conn.execute(
-                    "SELECT status, worker_id, lease_generation, cancel_requested_at FROM jobs WHERE id = ?;",
-                    (job_id,),
-                )
-                row = cursor.fetchone()
-                if not row:
-                    raise JobNotFoundError(f"Job '{job_id}' does not exist.")
+                    cursor = self.conn.execute(
+                        "SELECT status, worker_id, lease_generation, lease_expires_at, cancel_requested_at FROM jobs WHERE id = ?;",
+                        (job_id,),
+                    )
+                    row = cursor.fetchone()
+                    if not row:
+                        raise JobNotFoundError(f"Job '{job_id}' does not exist.")
 
-                current_status = row["status"]
-                cancel_requested = bool(row["cancel_requested_at"])
+                    current_status = row["status"]
+                    cancel_requested = bool(row["cancel_requested_at"])
 
-                # Fencing token check
-                if row["worker_id"] != worker_id or row["lease_generation"] != lease_generation:
-                    raise StaleLeaseError(
-                        f"Worker '{worker_id}' (gen {lease_generation}) cannot update job '{job_id}': superseded."
+                    # Fencing & Expiration check
+                    if row["worker_id"] != worker_id or row["lease_generation"] != lease_generation:
+                        raise StaleLeaseError(
+                            f"Worker '{worker_id}' (gen {lease_generation}) cannot update job '{job_id}': superseded."
+                        )
+                    if row["lease_expires_at"] is not None and row["lease_expires_at"] < now:
+                        raise StaleLeaseError(
+                            f"Worker '{worker_id}' (gen {lease_generation}) cannot update job '{job_id}': lease expired at {row['lease_expires_at']}."
+                        )
+
+                    # Cancellation precedence: if cancellation requested, worker cannot report COMPLETED
+                    if cancel_requested and target_status == "COMPLETED":
+                        raise InvalidStateTransitionError(
+                            f"Cannot mark job '{job_id}' as COMPLETED: cancellation was requested by the user."
+                        )
+
+                    # Validate lifecycle transition rules
+                    allowed = ALLOWED_TRANSITIONS.get(current_status, set())
+                    if target_status not in allowed:
+                        raise InvalidStateTransitionError(
+                            f"Illegal status transition for job '{job_id}': '{current_status}' -> '{target_status}'."
+                        )
+
+                    finished_at = now if target_status in ("COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT") else None
+
+                    self.conn.execute(
+                        """
+                        UPDATE jobs
+                        SET status = ?,
+                            finished_at = COALESCE(finished_at, ?),
+                            error_json = COALESCE(?, error_json),
+                            sandbox_id = COALESCE(?, sandbox_id)
+                        WHERE id = ? AND worker_id = ? AND lease_generation = ?;
+                        """,
+                        (target_status, finished_at, err_str, sandbox_id, job_id, worker_id, lease_generation),
                     )
 
-                # Cancellation protection: if cancel was requested, normal COMPLETED transition is disallowed
-                if cancel_requested and target_status == "COMPLETED":
-                    raise InvalidStateTransitionError(
-                        f"Cannot mark job '{job_id}' as COMPLETED: cancellation was requested by the user."
+                    self.conn.execute(
+                        """
+                        INSERT INTO job_events (
+                            job_id, event_type, source, worker_id, lease_generation, message, created_at
+                        ) VALUES (?, 'STATUS_CHANGE', 'worker', ?, ?, ?, ?);
+                        """,
+                        (job_id, worker_id, lease_generation, f"Status updated to '{target_status}'.", now),
                     )
 
-                # Validate lifecycle transition rules
-                allowed = ALLOWED_TRANSITIONS.get(current_status, set())
-                if target_status not in allowed:
-                    raise InvalidStateTransitionError(
-                        f"Illegal status transition for job '{job_id}': '{current_status}' -> '{target_status}'."
-                    )
-
-                finished_at = now if target_status in ("COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT") else None
-
-                self.conn.execute(
-                    """
-                    UPDATE jobs
-                    SET status = ?,
-                        finished_at = COALESCE(finished_at, ?),
-                        error_json = COALESCE(?, error_json),
-                        sandbox_id = COALESCE(?, sandbox_id)
-                    WHERE id = ? AND worker_id = ? AND lease_generation = ?;
-                    """,
-                    (target_status, finished_at, err_str, sandbox_id, job_id, worker_id, lease_generation),
-                )
-
-                self.conn.execute(
-                    """
-                    INSERT INTO job_events (
-                        job_id, event_type, source, worker_id, lease_generation, message, created_at
-                    ) VALUES (?, 'STATUS_CHANGE', 'worker', ?, ?, ?, ?);
-                    """,
-                    (job_id, worker_id, lease_generation, f"Status updated to '{target_status}'.", now),
-                )
-
-            return self.get_job_by_id_internal(job_id)
-        except sqlite3.Error as e:
-            raise JobQueueError(f"Database error during update_job_status: {str(e)}") from e
+                return self.get_job_by_id_internal(job_id)
+            except sqlite3.Error as e:
+                raise JobQueueError(f"Database error during update_job_status: {str(e)}") from e
 
     def request_cancellation(self, job_id: str, user_id: str) -> Dict[str, Any]:
         """Tenant-authenticated cancellation request. Sets cancel_requested_at and cancels immediately if QUEUED."""
@@ -501,197 +607,218 @@ class DurableJobQueue:
             raise JobAccessDeniedError("user_id required for cancellation.")
 
         now = time.time()
-        try:
-            with self.conn:
-                self.conn.execute("BEGIN IMMEDIATE;")
-                cursor = self.conn.execute(
-                    "SELECT status, user_id FROM jobs WHERE id = ?;",
-                    (job_id,),
-                )
-                row = cursor.fetchone()
-                if not row:
-                    raise JobNotFoundError(f"Job '{job_id}' does not exist.")
-
-                if row["user_id"] != user_id:
-                    raise JobAccessDeniedError("Access denied: cannot cancel a job belonging to another user.")
-
-                current_status = row["status"]
-                if current_status in ("COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"):
-                    # Already terminal
-                    return self._row_to_dict(self.conn.execute("SELECT * FROM jobs WHERE id = ?;", (job_id,)).fetchone())
-
-                if current_status == "QUEUED":
-                    # Instant cancel: not yet claimed by any worker
-                    self.conn.execute(
-                        """
-                        UPDATE jobs
-                        SET status = 'CANCELLED',
-                            cancel_requested_at = ?,
-                            cancel_requested_by = ?,
-                            finished_at = ?
-                        WHERE id = ? AND status = 'QUEUED';
-                        """,
-                        (now, user_id, now, job_id),
+        with self._lock:
+            try:
+                with self.conn:
+                    self.conn.execute("BEGIN IMMEDIATE;")
+                    cursor = self.conn.execute(
+                        "SELECT status, user_id FROM jobs WHERE id = ?;",
+                        (job_id,),
                     )
-                else:
-                    # Running: record request, worker will observe and finalize cancellation
-                    self.conn.execute(
-                        """
-                        UPDATE jobs
-                        SET cancel_requested_at = ?,
-                            cancel_requested_by = ?
-                        WHERE id = ?;
-                        """,
-                        (now, user_id, job_id),
-                    )
+                    row = cursor.fetchone()
+                    if not row:
+                        raise JobNotFoundError(f"Job '{job_id}' does not exist.")
 
-                self.conn.execute(
-                    """
-                    INSERT INTO job_events (
-                        job_id, event_type, source, message, created_at
-                    ) VALUES (?, 'CANCEL_REQUESTED', 'user', 'Cancellation requested by user.', ?);
-                    """,
-                    (job_id, now),
-                )
+                    if row["user_id"] != user_id:
+                        raise JobAccessDeniedError("Access denied: cannot cancel a job belonging to another user.")
 
-            return self.get_job(job_id, user_id=user_id)
-        except sqlite3.Error as e:
-            raise JobQueueError(f"Database error during request_cancellation: {str(e)}") from e
+                    current_status = row["status"]
+                    if current_status in ("COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"):
+                        return self._row_to_dict(self.conn.execute("SELECT * FROM jobs WHERE id = ?;", (job_id,)).fetchone())
 
-    def reap_stale_jobs(self) -> List[str]:
-        """Finds running jobs whose lease has expired, safely marks them RECOVERABLE or FAILED if max retries reached."""
-        now = time.time()
-        reaped_ids = []
-
-        try:
-            with self.conn:
-                self.conn.execute("BEGIN IMMEDIATE;")
-                cursor = self.conn.execute(
-                    """
-                    SELECT id, retry_count, max_retries, lease_generation, worker_id
-                    FROM jobs
-                    WHERE status = 'RUNNING' AND lease_expires_at < ?;
-                    """,
-                    (now,),
-                )
-                stale_jobs = cursor.fetchall()
-
-                for job in stale_jobs:
-                    jid = job["id"]
-                    retries = job["retry_count"]
-                    max_r = job["max_retries"]
-                    gen = job["lease_generation"]
-
-                    if retries < max_r:
-                        # Requeue for another attempt, advance lease_generation to fence out dead worker
+                    if current_status == "QUEUED":
                         self.conn.execute(
                             """
                             UPDATE jobs
-                            SET status = 'QUEUED',
-                                worker_id = NULL,
-                                lease_generation = lease_generation + 1,
-                                retry_count = retry_count + 1,
-                                lease_expires_at = NULL,
-                                heartbeat_at = NULL
-                            WHERE id = ? AND status = 'RUNNING' AND lease_generation = ?;
+                            SET status = 'CANCELLED',
+                                cancel_requested_at = ?,
+                                cancel_requested_by = ?,
+                                finished_at = ?
+                            WHERE id = ? AND status = 'QUEUED';
                             """,
-                            (jid, gen),
+                            (now, user_id, now, job_id),
                         )
-                        event_msg = f"Lease expired. Re-queued for retry ({retries + 1}/{max_r})."
                     else:
-                        # Exhausted retries: fail closed
-                        err_json = json.dumps({
-                            "error": "Execution lease expired and maximum retries exhausted.",
-                            "type": "WorkerHeartbeatTimeout",
-                        })
                         self.conn.execute(
                             """
                             UPDATE jobs
-                            SET status = 'FAILED',
-                                finished_at = ?,
-                                error_json = ?
-                            WHERE id = ? AND status = 'RUNNING' AND lease_generation = ?;
+                            SET cancel_requested_at = ?,
+                                cancel_requested_by = ?
+                            WHERE id = ?;
                             """,
-                            (now, err_json, jid, gen),
+                            (now, user_id, job_id),
                         )
-                        event_msg = "Lease expired. Maximum recovery retries exhausted; job marked FAILED."
 
                     self.conn.execute(
                         """
                         INSERT INTO job_events (
-                            job_id, event_type, source, lease_generation, message, created_at
-                        ) VALUES (?, 'LEASE_EXPIRED', 'reaper', ?, ?, ?);
+                            job_id, event_type, source, message, created_at
+                        ) VALUES (?, 'CANCEL_REQUESTED', 'user', 'Cancellation requested by user.', ?);
                         """,
-                        (jid, gen + 1, event_msg, now),
+                        (job_id, now),
                     )
-                    reaped_ids.append(jid)
 
-            return reaped_ids
-        except sqlite3.Error as e:
-            raise JobQueueError(f"Database error during reap_stale_jobs: {str(e)}") from e
+                return self.get_job(job_id, user_id=user_id)
+            except sqlite3.Error as e:
+                raise JobQueueError(f"Database error during request_cancellation: {str(e)}") from e
+
+    def reap_stale_jobs(self) -> List[str]:
+        """Finds running jobs whose lease has expired, safely marks them RECOVERABLE/QUEUED or FAILED.
+        
+        CRITICAL CANCELLATION GUARD: If cancel_requested_at is set, the job is NEVER re-queued.
+        Instead, it transitions directly to terminal CANCELLED.
+        """
+        now = time.time()
+        reaped_ids = []
+
+        with self._lock:
+            try:
+                with self.conn:
+                    self.conn.execute("BEGIN IMMEDIATE;")
+                    cursor = self.conn.execute(
+                        """
+                        SELECT id, retry_count, max_retries, lease_generation, worker_id, cancel_requested_at
+                        FROM jobs
+                        WHERE status = 'RUNNING' AND lease_expires_at < ?;
+                        """,
+                        (now,),
+                    )
+                    stale_jobs = cursor.fetchall()
+
+                    for job in stale_jobs:
+                        jid = job["id"]
+                        retries = job["retry_count"]
+                        max_r = job["max_retries"]
+                        gen = job["lease_generation"]
+                        cancel_req = bool(job["cancel_requested_at"])
+
+                        if cancel_req:
+                            # User requested cancel, worker abandoned/died -> transition to terminal CANCELLED
+                            self.conn.execute(
+                                """
+                                UPDATE jobs
+                                SET status = 'CANCELLED',
+                                    finished_at = ?,
+                                    lease_generation = lease_generation + 1
+                                WHERE id = ? AND status = 'RUNNING' AND lease_generation = ?;
+                                """,
+                                (now, jid, gen),
+                            )
+                            event_msg = "Lease expired while cancellation pending. Transitioned to CANCELLED."
+                        elif retries < max_r:
+                            # Requeue for retry, advance lease_generation to fence out dead worker
+                            self.conn.execute(
+                                """
+                                UPDATE jobs
+                                SET status = 'QUEUED',
+                                    worker_id = NULL,
+                                    lease_generation = lease_generation + 1,
+                                    retry_count = retry_count + 1,
+                                    lease_expires_at = NULL,
+                                    heartbeat_at = NULL
+                                WHERE id = ? AND status = 'RUNNING' AND lease_generation = ?;
+                                """,
+                                (jid, gen),
+                            )
+                            event_msg = f"Lease expired. Re-queued for retry ({retries + 1}/{max_r})."
+                        else:
+                            # Max retries reached -> mark FAILED
+                            err_json = json.dumps({
+                                "error": "Execution lease expired and maximum retries exhausted.",
+                                "type": "WorkerHeartbeatTimeout",
+                            })
+                            self.conn.execute(
+                                """
+                                UPDATE jobs
+                                SET status = 'FAILED',
+                                    finished_at = ?,
+                                    error_json = ?,
+                                    lease_generation = lease_generation + 1
+                                WHERE id = ? AND status = 'RUNNING' AND lease_generation = ?;
+                                """,
+                                (now, err_json, jid, gen),
+                            )
+                            event_msg = "Lease expired. Maximum recovery retries exhausted; job marked FAILED."
+
+                        self.conn.execute(
+                            """
+                            INSERT INTO job_events (
+                                job_id, event_type, source, lease_generation, message, created_at
+                            ) VALUES (?, 'LEASE_EXPIRED', 'reaper', ?, ?, ?);
+                            """,
+                            (jid, gen + 1, event_msg, now),
+                        )
+                        reaped_ids.append(jid)
+
+                return reaped_ids
+            except sqlite3.Error as e:
+                raise JobQueueError(f"Database error during reap_stale_jobs: {str(e)}") from e
 
     def get_job(self, job_id: str, user_id: str) -> Dict[str, Any]:
         """Tenant-isolated job retrieval. Raises JobAccessDeniedError if user does not own job."""
-        try:
+        with self._lock:
+            try:
+                cursor = self.conn.execute("SELECT * FROM jobs WHERE id = ?;", (job_id,))
+                row = cursor.fetchone()
+                if not row:
+                    raise JobNotFoundError(f"Job '{job_id}' does not exist.")
+                if row["user_id"] != user_id:
+                    raise JobAccessDeniedError(f"Access denied to job '{job_id}'.")
+                return self._row_to_dict(row)
+            except sqlite3.Error as e:
+                raise JobQueueError(f"Database error during get_job: {str(e)}") from e
+
+    def get_job_by_id_internal(self, job_id: str) -> Dict[str, Any]:
+        """Internal lookup without tenant check (used by background worker threads)."""
+        with self._lock:
             cursor = self.conn.execute("SELECT * FROM jobs WHERE id = ?;", (job_id,))
             row = cursor.fetchone()
             if not row:
                 raise JobNotFoundError(f"Job '{job_id}' does not exist.")
-            if row["user_id"] != user_id:
-                raise JobAccessDeniedError(f"Access denied to job '{job_id}'.")
             return self._row_to_dict(row)
-        except sqlite3.Error as e:
-            raise JobQueueError(f"Database error during get_job: {str(e)}") from e
-
-    def get_job_by_id_internal(self, job_id: str) -> Dict[str, Any]:
-        """Internal lookup without tenant check (used by background worker threads)."""
-        cursor = self.conn.execute("SELECT * FROM jobs WHERE id = ?;", (job_id,))
-        row = cursor.fetchone()
-        if not row:
-            raise JobNotFoundError(f"Job '{job_id}' does not exist.")
-        return self._row_to_dict(row)
 
     def list_user_jobs(self, user_id: str, limit: int = 50) -> List[Dict[str, Any]]:
         """Lists recent jobs for a specific tenant."""
-        try:
-            cursor = self.conn.execute(
-                "SELECT * FROM jobs WHERE user_id = ? ORDER BY created_at DESC LIMIT ?;",
-                (user_id, limit),
-            )
-            return [self._row_to_dict(r) for r in cursor.fetchall()]
-        except sqlite3.Error as e:
-            raise JobQueueError(f"Database error during list_user_jobs: {str(e)}") from e
+        with self._lock:
+            try:
+                cursor = self.conn.execute(
+                    "SELECT * FROM jobs WHERE user_id = ? ORDER BY created_at DESC LIMIT ?;",
+                    (user_id, limit),
+                )
+                return [self._row_to_dict(r) for r in cursor.fetchall()]
+            except sqlite3.Error as e:
+                raise JobQueueError(f"Database error during list_user_jobs: {str(e)}") from e
 
     def get_job_events(self, job_id: str, user_id: str, after_id: int = 0) -> List[Dict[str, Any]]:
         """Retrieves append-only logs/events for a job, verifying tenant ownership."""
-        # Check ownership first
         self.get_job(job_id, user_id=user_id)
 
-        try:
-            cursor = self.conn.execute(
-                """
-                SELECT * FROM job_events
-                WHERE job_id = ? AND id > ?
-                ORDER BY id ASC;
-                """,
-                (job_id, after_id),
-            )
-            return [
-                {
-                    "id": r["id"],
-                    "job_id": r["job_id"],
-                    "event_type": r["event_type"],
-                    "source": r["source"],
-                    "worker_id": r["worker_id"],
-                    "lease_generation": r["lease_generation"],
-                    "message": r["message"],
-                    "data": json.loads(r["data_json"]) if r["data_json"] else None,
-                    "created_at": r["created_at"],
-                }
-                for r in cursor.fetchall()
-            ]
-        except sqlite3.Error as e:
-            raise JobQueueError(f"Database error during get_job_events: {str(e)}") from e
+        with self._lock:
+            try:
+                cursor = self.conn.execute(
+                    """
+                    SELECT * FROM job_events
+                    WHERE job_id = ? AND id > ?
+                    ORDER BY id ASC;
+                    """,
+                    (job_id, after_id),
+                )
+                return [
+                    {
+                        "id": r["id"],
+                        "job_id": r["job_id"],
+                        "event_type": r["event_type"],
+                        "source": r["source"],
+                        "worker_id": r["worker_id"],
+                        "lease_generation": r["lease_generation"],
+                        "message": r["message"],
+                        "data": json.loads(r["data_json"]) if r["data_json"] else None,
+                        "created_at": r["created_at"],
+                    }
+                    for r in cursor.fetchall()
+                ]
+            except sqlite3.Error as e:
+                raise JobQueueError(f"Database error during get_job_events: {str(e)}") from e
 
     def _row_to_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
         """Translates an SQLite jobs row into a structured dictionary."""
