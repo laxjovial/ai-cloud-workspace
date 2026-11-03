@@ -2,9 +2,9 @@
 
 **Repository:** `laxjovial/ai-cloud-workspace`  
 **Working Branch:** `feat/phase-b-durable-execution`  
-**Specification Revision:** 2.5 (Final Authoritative Engineering Contract Before Implementation)  
+**Specification Revision:** 2.6 (Authoritative Pre-Implementation Engineering Contract)  
 **Baseline (`main`):** `5147be6c127c3eed87b6cabb0ca24f65b2550fa7` (strictly untouched)  
-**Specification Baseline Commit:** `9822e697c19c6d84f43d2eb32ab17d40c8fdc02f`  
+**Specification Baseline Commit:** `b122fd4a119e04a8827d6f4858d5599ec2e04478`  
 **Scope Boundary:** Phase B.2 covers only the background worker engine, process supervisor, heartbeat/fencing watchdog, crash-resilient sandbox registry/reconciler, side-effect intent ledger, and associated tests. It introduces **no Streamlit changes (`app.py` untouched)** and **no Phase C work**.
 
 ---
@@ -17,7 +17,7 @@ flowchart TD
         SP["WorkerSupervisor (Main Daemon)"]
         PM["Process Pool Manager (concurrency=N)"]
         RC["Reaper & Sandbox Reconciler (10s interval)"]
-        SK["Supervisor Signing Secret (RAM-only, uninherited)"]
+        SK["Persistent Supervisor Signing Key (0600 file / env)"]
         SP --> PM
         SP --> RC
         SP --> SK
@@ -65,20 +65,30 @@ flowchart TD
   ```
   When issuing signals (`SIGTERM`, `SIGKILL`), the supervisor verifies both PID and process creation time (via `/proc/<pid>/stat` start_time on Linux or `psutil.Process(pid).create_time()`) against the recorded `start_time` in `worker_instances` to guarantee it never signals an unrelated recycled OS process.
 
-### 1.2 Cryptographic Supervisor Secret Boundary & Verifiable Child Reap Evidence
+### 1.2 Cryptographic Supervisor Secret Boundary & Lifecycle Across Restarts
 `os.waitpid()` is parent-process-specific: only the parent supervisor process can reap its direct child processes; neither child workers nor the database engine can execute `waitpid()` a second time. Furthermore, child workers with direct database write access must be incapable of fabricating reap records.
 
-1. **Supervisor RAM-Only Signing Secret**:
-   - At startup, the supervisor generates a random 256-bit cryptographic signing secret (`supervisor_signing_secret = secrets.token_bytes(32)`).
-   - **Stripped Secret Boundary**: When spawning child worker processes (via `multiprocessing.get_context("spawn")`), the supervisor strictly filters process environment variables and child memory: `supervisor_signing_secret` is kept exclusively in supervisor RAM and is **never passed, inherited, or leaked to worker child processes**.
-2. **Authoritative Child Reap Operation (`record_process_reap`)**:
+1. **Persistent Supervisor Signing Key (`SUPERVISOR_SIGNING_KEY`)**:
+   - The signing secret must persist across supervisor process restarts so previously signed reap records remain verifiable.
+   - **Storage Boundary**: Loaded from the environment (`SUPERVISOR_SIGNING_KEY`) or from a dedicated local file with strict filesystem permissions (`0600`, owner-read-write only: `.secrets/supervisor_signing_key`).
+   - **Child Isolation**: When spawning child worker processes (via `multiprocessing.get_context("spawn")`), the supervisor strictly filters process environment variables and child memory: `SUPERVISOR_SIGNING_KEY` is kept exclusively in supervisor memory and is **never passed, inherited, or leaked to worker child processes**.
+2. **Supervisor Restart & Orphaned Child Recovery**:
+   When a supervisor restarts:
+   - It reads the persistent `SUPERVISOR_SIGNING_KEY`, allowing it to verify all previously issued reap signatures without losing continuity.
+   - For child processes that were active under the previous supervisor run (`status != 'DEAD'` in `worker_instances`):
+     - The replacement supervisor **did not spawn them** and therefore **cannot call `os.waitpid()` on them**. It **never falsely claims** it reaped them via `waitpid()`.
+     - Instead, the replacement supervisor verifies process status via OS checks:
+       1. Verifies `/proc/<pid>/stat` start_time. If PID is absent or start_time does not match, the OS process is dead.
+       2. If the OS process is still running, the replacement supervisor issues `SIGTERM` followed by `SIGKILL`. Because it is not the parent, it cannot call `os.waitpid()`, but it confirms death by polling `os.kill(pid, 0)` until `ProcessLookupError` is raised.
+     - The replacement supervisor authoritatively signs an OS-death audit record with proof type `'SUPERVISOR_RECOVERY_DEATH'`, binding its own `supervisor_id`, the confirmed dead `pid`, `start_time`, and a fresh `reap_signature`.
+3. **Authoritative Child Reap Operation (`record_process_reap`)**:
    When the supervisor reaps a child process via `os.waitpid(pid, os.WNOHANG)` or after a forced `SIGKILL`:
    - Extracts `exit_code` and `exit_signal` using `os.WEXITSTATUS(status)` and `os.WTERMSIG(status)`.
    - Generates `reap_token = uuid.uuid4().hex`.
    - Computes an HMAC-SHA256 signature binding all reap parameters:
      ```python
-     reap_payload = f"{instance_id}:{pid}:{exit_code}:{exit_signal}:{terminated_at}:{reap_token}"
-     reap_signature = hmac.new(self.supervisor_signing_secret, reap_payload.encode(), hashlib.sha256).hexdigest()
+     reap_payload = f"{instance_id}:{pid}:{start_time}:{exit_code}:{exit_signal}:{terminated_at}:{reap_token}"
+     reap_signature = hmac.new(self.supervisor_signing_key, reap_payload.encode(), hashlib.sha256).hexdigest()
      ```
    - Persists the record into `worker_instances`:
      ```python
@@ -86,6 +96,7 @@ flowchart TD
          self,
          instance_id: str,
          pid: int,
+         start_time: float,
          exit_code: Optional[int],
          exit_signal: Optional[int],
          supervisor_id: str,
@@ -94,14 +105,14 @@ flowchart TD
      ) -> None:
          """Atomically records child reap verification evidence into worker_instances."""
      ```
-3. **Internal Verification in `supervisor_finalize_job`**:
+4. **Internal Verification in `supervisor_finalize_job`**:
    To finalize a job under `FORCED_KILL`:
    - Supervisor passes `authority_proof = {"type": "FORCED_KILL", "worker_instance_id": instance_id, "reap_token": reap_token, "reap_signature": reap_signature}`.
    - The engine validates:
-     1. `worker_instances` row has `status == 'DEAD'` and `reap_token == authority_proof['reap_token']`.
-     2. Validates HMAC signature against the supervisor signing secret.
+     1. Validates HMAC signature against the supervisor signing key using `instance_id`, `pid`, `start_time`, `exit_code`, `exit_signal`, `terminated_at`, and `reap_token`.
+     2. Validates `worker_instances` row has `status == 'DEAD'` and `reap_token == authority_proof['reap_token']`.
      3. Checks `exit_signal IN (9, 15)` to verify the process was terminated.
-   - For `PROCESS_DEAD`: Supervisor passes `worker_instance_id`. Engine verifies `worker_instances.status == 'DEAD'`, or checks `/proc/<pid>` non-existence / process creation time mismatch.
+   - For `PROCESS_DEAD`: Validates HMAC signature for `'SUPERVISOR_RECOVERY_DEATH'`, or checks `/proc/<pid>` non-existence / process creation time mismatch under supervisor authority.
    - For `LEASE_EXPIRED`: Engine validates `lease_expires_at < strftime('%s', 'now')` atomically. If active, fails closed.
 
 ```python
@@ -281,12 +292,11 @@ flowchart TD
     W2["Worker B Claims Job (Generation 2)"] --> Q["Query job_side_effects for job_id"]
     Q --> Check{"Any intent in PENDING state?"}
     Check -->|No| Safe["Proceed with Normal Step Execution"]
-    Check -->|Yes (e.g. Worker A generation 1)| Phase1["Phase 1: Worker Termination Verification"]
+    Check -->|Yes (e.g. Worker A generation 1)| Phase1["Phase 1: Cryptographic Process Reap Verification Gate"]
     
-    Phase1 --> TermCheck{"Is Worker A process confirmed DEAD in worker_instances?"}
-    TermCheck -->|No| WaitKill["Supervisor must terminate & reap Worker A (or wait OS socket timeout 60s)"]
-    WaitKill --> TermCheck
-    TermCheck -->|Yes (Worker A verified DEAD)| Phase2["Phase 2: Remote Reconciliation & Idempotency"]
+    Phase1 --> ReapCheck{"Is Worker A HMAC reap record valid and verified DEAD?"}
+    ReapCheck -->|No (Unverified or alive)| BlockRecovery["BLOCK RECOVERY: Supervisor must terminate & reap Worker A, or operator resolve"]
+    ReapCheck -->|Yes (Cryptographically verified DEAD)| Phase2["Phase 2: Remote Reconciliation & Idempotency"]
     
     Phase2 --> GH["Query GitHub across state='all' for branch head"]
     GH -->|API Error / Timeout| FailClosed["FAIL CLOSED: Raise SideEffectReconciliationError (Retry later)"]
@@ -296,20 +306,24 @@ flowchart TD
     Rollback --> IdempotentCreate["Create PR using deterministic branch: ai-cloud/job-{id}"]
 ```
 
-#### Phase 1: Prior Worker Process Termination Verification (Process-Fencing Gate)
+#### Phase 1: Cryptographic Process Reap Verification Gate (Zero Trust on Bare DB Status)
+Because child workers have direct SQLite write access, a bare `worker_instances.status == 'DEAD'` value written by a rogue or malfunctioning worker must **never** be trusted.
 Before Worker B can treat an absent remote result as proof that Worker A's request did not execute:
-1. Worker B inspects `worker_instances` for the worker instance that created the `PENDING` intent (`intent['worker_id']`).
-2. **Strict Verification**:
-   - Worker B verifies that `worker_instances.status == 'DEAD'`.
-   - If Worker A is **not** confirmed dead: Worker B yields execution and requests supervisor forced termination of Worker A. Worker B **strictly refuses** to re-execute or mark the intent `FAILED_VERIFIED` while Worker A could still be running an in-flight network request.
-   - If the worker instance cannot be verified dead (e.g. supervisor failure), Worker B must wait for the client-side socket/HTTP timeout boundary (**60.0 seconds**) to elapse past Worker A's lease expiration before concluding Worker A's network request has dropped.
+1. Worker B inspects `worker_instances` for `intent['worker_id']` (`instance_id`, `pid`, `start_time`, `exit_code`, `exit_signal`, `terminated_at`, `reap_signature`, `reap_token`).
+2. **Cryptographic Verification**:
+   - The queue engine validates `reap_signature` against `SUPERVISOR_SIGNING_KEY` binding `instance_id`, `pid`, `start_time`, `exit_code`, `exit_signal`, `terminated_at`, and `reap_token`.
+   - Verifies `status == 'DEAD'` and `exit_signal IN (9, 15)` (or verified supervisor recovery death proof).
+3. **Strict Fail-Closed Rule (No Timeout Substitute)**:
+   - If Worker A's cryptographic reap record cannot be verified, **reconciliation remains strictly blocked**.
+   - Socket timeouts or elapsed wall-clock periods are **explicitly disallowed** as a substitute for verified process death. A client-side timeout only indicates the client gave up waiting, not that GitHub did not receive and process the request.
+   - If Worker A is unverified, Worker B raises `SideEffectReconciliationBlockedError("Previous worker process termination cannot be cryptographically verified; halting side-effect reconciliation until supervisor or operator intervention.")`.
 
 #### Phase 2: Remote Provider Reconciliation & Deterministic Branch Scoping
-Once Worker A is verified terminated:
+Once Worker A's process death is cryptographically verified:
 1. Worker B queries GitHub across **all states** (`state="all"`):
    - **Matching PR Exists**: Worker B adopts the existing PR, records `status = 'CONFIRMED'`, and updates `lease_generation = 2`.
    - **No PR Exists (Query succeeded with 0 results)**:
-     Because Worker A is verified dead and its sockets terminated, no delayed in-flight request can execute. Worker B marks the old intent `status = 'FAILED_VERIFIED'` and advances `lease_generation = 2`.
+     Because Worker A is verified dead and its sockets terminated before the query, no delayed in-flight request can execute. Worker B marks the old intent `status = 'FAILED_VERIFIED'` and advances `lease_generation = 2`.
    - **Inconclusive Query (Timeout / API Error)**:
      **Fails closed**. Worker B raises `SideEffectReconciliationError` and halts without duplicating.
 2. **Provider-Level Idempotency Boundary**:
@@ -355,7 +369,7 @@ sequenceDiagram
     alt Still alive
         Sup->>Sup: os.kill(verified_pid, SIGKILL)
         Sup->>Sup: os.waitpid(verified_pid, 0)
-        Sup->>Sup: reap_sig = HMAC(secret, payload)
+        Sup->>Sup: reap_sig = HMAC(signing_key, payload)
         Sup->>DB: record_process_reap(reap_sig, token)
         Sup->>DB: supervisor_finalize_job(proof={'type': 'FORCED_KILL', 'reap_signature': reap_sig})
         Note over Sup: Slot freed deterministically; orphan reconciler destroys sandbox
@@ -376,7 +390,7 @@ sequenceDiagram
      - Verifies worker PID against `start_time` in `worker_instances`.
      - Sends `SIGTERM`. If child remains alive after 2.0 seconds, issues `SIGKILL`.
      - Reaps child with `os.waitpid()`, extracting exit status and signal.
-     - Computes HMAC reap signature with RAM-only supervisor secret; authoritatively records reap evidence with `record_process_reap()`.
+     - Computes HMAC reap signature with persistent supervisor key; authoritatively records reap evidence with `record_process_reap()`.
      - Calls `supervisor_finalize_job(target_status='CANCELLED'|'TIMED_OUT', proof={'type': 'FORCED_KILL', 'reap_signature': reap_sig})`.
      - Releases the process slot deterministically and schedules background sandbox reconciliation.
 
@@ -387,9 +401,9 @@ sequenceDiagram
 To ensure strict tenant isolation and zero credential leakage across detached OS processes:
 
 ### 6.1 Trust Boundary Architecture
-- **Supervisor Role**: Runs with local system permissions and has access to environment variables (`E2B_API_KEY`, `ENCRYPTION_KEY`). It **never** receives, handles, or caches user GitHub PATs or BYOK LLM keys.
+- **Supervisor Role**: Runs with local system permissions and has access to environment variables (`E2B_API_KEY`, `ENCRYPTION_KEY`, `SUPERVISOR_SIGNING_KEY`). It **never** receives, handles, or caches user GitHub PATs or BYOK LLM keys.
 - **Worker Process Isolation**:
-  Spawned child processes inherit `ENCRYPTION_KEY` and `E2B_API_KEY` via standard OS process environment inheritance.
+  Spawned child processes inherit `ENCRYPTION_KEY` and `E2B_API_KEY` via standard OS process environment inheritance. `SUPERVISOR_SIGNING_KEY` is explicitly filtered out.
 - **Authenticated User-Store Resolution**:
   When executing a job:
   1. The worker reads `job["user_id"]` from the cryptographically verified SQLite row.
@@ -421,21 +435,22 @@ Dedicated test file: `tests/test_phase_b_worker_engine.py`
 | **2** | **Heartbeat Maintenance** | Long-running task (10s) with 3s lease. | Heartbeat continuously extends lease; job never expires. |
 | **3** | **Pre-Step Self-Fencing** | Worker lease expires mid-run; heartbeat returns `'STALE'`. | Worker halts immediately; **zero** subsequent tool calls made; sandbox destroyed locally. |
 | **4** | **Cooperative Cancellation** | User requests cancellation during turn 1 of 3. | Worker detects `CANCEL_REQUESTED`, halts before turn 2, destroys sandbox, records `CANCELLED`. |
-| **5** | **Supervisor Non-Forgeable Authority** | Supervisor attempts `supervisor_finalize_job` on active worker without proof. | Fails closed; requires verified HMAC proof (`FORCED_KILL` with reap signature) or database-verified `LEASE_EXPIRED`. |
+| **5** | **Supervisor Non-Forgeable Authority** | Supervisor attempts `supervisor_finalize_job` on active worker without proof. | Fails closed; requires verified HMAC signature (`FORCED_KILL` with reap signature) or database-verified `LEASE_EXPIRED`. |
 | **6** | **Supervisor Forced Termination Fallback** | Worker process hangs in socket; watchdog triggers forced kill. | Supervisor sends `SIGTERM`/`SIGKILL`, reaps child, generates HMAC signature, finalizes job, frees slot. |
 | **7** | **Blocked Command Forced Interruption** | Active tool call hangs; timeout watchdog trips. | Watchdog kills sandbox; synchronous call unblocks; supervisor falls back to SIGKILL if unblocked call fails. |
 | **8** | **Crash & Re-Claim Pre-Condition** | Worker killed via `SIGKILL` while holding active sandbox. | Job has `ORPHANED` status; `claim_next_job()` strictly refuses claim until confirmed `CLEANED`. |
 | **9** | **Cleanup Escalation & Authenticated Operator Resolution** | Reconciler encounters repeated provider 500 errors (10 times). | Status becomes `MANUAL_INTERVENTION_REQUIRED`; operator API validates token, attributes principal, resolves status without reviving terminal job. |
-| **10** | **Abandoned Side-Effect Recovery Gate** | Worker A crashes after creating PR but before CONFIRMED; Worker B reclaims. | Worker B verifies Worker A is dead before evaluating absence, queries GitHub, adopts PR, marks CONFIRMED without duplicate PR. |
-| **11** | **Fail-Closed PR Reconciliation** | GitHub API raises 500/timeout during reconciliation check. | Worker fails closed; does **not** create duplicate PR; retries reconciliation cleanly. |
-| **12** | **PR Idempotency across All States** | PR was merged/closed on GitHub before worker retry. | Worker detects existing closed/merged PR in `job_side_effects`, re-attaches cleanly, does not duplicate. |
-| **13** | **Supervisor Crash-Loop Protection** | Child worker process repeatedly crashes on startup. | Supervisor applies exponential backoff ($1s \to 30s$); pauses slot after 5 crashes. |
-| **14** | **Spawned Worker Credential Isolation** | Inspect child process `/proc/<pid>/cmdline`, environment, and `job_events`. | Zero plaintext GitHub tokens, supervisor signing secrets, or LLM keys leaked across IPC boundaries. |
+| **10** | **Cryptographic Side-Effect Gate (No Raw DB Trust)** | Worker attempts reconciliation on unverified `DEAD` row without HMAC reap proof. | Fails closed; raises `SideEffectReconciliationBlockedError`; zero external PR creation calls. |
+| **11** | **Supervisor Restart Continuity** | Supervisor restarts after recording reap signatures. | Persistent signing key validates previous signatures; recovers un-reaped processes without forging `waitpid`. |
+| **12** | **Fail-Closed PR Reconciliation** | GitHub API raises 500/timeout during reconciliation check. | Worker fails closed; does **not** create duplicate PR; retries reconciliation cleanly. |
+| **13** | **PR Idempotency across All States** | PR was merged/closed on GitHub before worker retry. | Worker detects existing closed/merged PR in `job_side_effects`, re-attaches cleanly, does not duplicate. |
+| **14** | **Supervisor Crash-Loop Protection** | Child worker process repeatedly crashes on startup. | Supervisor applies exponential backoff ($1s \to 30s$); pauses slot after 5 crashes. |
+| **15** | **Spawned Worker Credential Isolation** | Inspect child process `/proc/<pid>/cmdline`, environment, and `job_events`. | Zero plaintext GitHub tokens, supervisor signing keys, or LLM keys leaked across IPC boundaries. |
 
 ---
 
 ## 9. Verification Gate & Commit Evidence
 
-- **Specification Base Commit**: `9822e697c19c6d84f43d2eb32ab17d40c8fdc02f`
+- **Specification Base Commit**: `b122fd4a119e04a8827d6f4858d5599ec2e04478`
 - **Main Baseline**: `5147be6c127c3eed87b6cabb0ca24f65b2550fa7` (strictly untouched)
 - **Scope Commitment**: `app.py` remains untouched. Phase B.2 implementation (`worker.py`) will not start until this specification is authorized.
