@@ -21,14 +21,52 @@ import db
 
 @pytest.fixture(scope="module")
 def streamlit_server():
-    """Spins up a real Streamlit server process on port 8599 for end-to-end browser testing."""
+    """Spins up a real Streamlit server process on port 8599 for end-to-end browser testing.
+    
+    Injects a controlled mock Supabase client into the Streamlit application process
+    so that OAuth callback exchange succeeds end-to-end without external credentials.
+    """
     import socket
     port = "8599"
-    # Pre-import litellm via python -c to prevent module-lock deadlock during streamlit worker bootstrap
+    # Pre-import litellm and inject controlled Supabase client into application process
+    launcher = f"""
+import os
+import sys
+import db
+from unittest.mock import MagicMock
+
+class MockUser:
+    id = 'mock-user-e2e-id'
+    email = 'mock_oauth@example.com'
+    user_metadata = {{'user_name': 'mock_tester'}}
+
+class MockSession:
+    user = MockUser()
+    access_token = 'mock_jwt'
+
+class MockAuthResponse:
+    user = MockUser()
+    session = MockSession()
+
+mock_client = MagicMock()
+mock_client.auth.exchange_code_for_session.return_value = MockAuthResponse()
+mock_client.auth._storage_key = 'sb'
+mock_client.auth._storage = MagicMock()
+mock_client.table.return_value.select.return_value.eq.return_value.execute.return_value.data = []
+
+import supabase
+supabase.create_client = lambda url, key: mock_client
+db.get_supabase_client = lambda: mock_client
+
+import litellm
+import streamlit.web.cli as stcli
+sys.argv = ['streamlit', 'run', 'app.py', '--server.port={port}', '--server.headless=true', '--browser.gatherUsageStats=false']
+sys.exit(stcli.main())
+"""
     cmd = [
         os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".venv/bin/python3"),
         "-c",
-        "import litellm; import streamlit.web.cli as stcli; import sys; sys.argv = ['streamlit', 'run', 'app.py', '--server.port=" + port + "', '--server.headless=true', '--browser.gatherUsageStats=false']; sys.exit(stcli.main())",
+        launcher,
     ]
     proc = subprocess.Popen(
         cmd,
@@ -112,7 +150,9 @@ class TestBrowserOAuthRedirectLifecycle:
             # 5. User is redirected back to app with code and state parameters in a fresh navigation
             callback_url = f"{streamlit_server}/?code=mock_github_auth_code_123&state={state_val}"
             page.goto(callback_url)
-            page.wait_for_selector("text=AI Cloud Workspace", timeout=15000)
+            # Assert successful authentication in the live Streamlit application:
+            # The app callback consumes the code/state and renders the authenticated dashboard
+            page.wait_for_selector("text=Sign Out", timeout=15000)
 
             # 6. Verify that browser preserved the exact initiating session ID cookie upon callback
             return_cookies = context.cookies()
@@ -143,34 +183,22 @@ class TestBrowserOAuthRedirectLifecycle:
             foreign_page.goto(foreign_callback_url)
             foreign_page.wait_for_selector("text=AI Cloud Workspace", timeout=15000)
 
-            # Assert rejection: verify the state was NOT consumed and remains available for the legitimate session
+            # Assert rejection in the foreign context:
+            # Unauthenticated landing page is rendered (no Sign Out button)
+            assert not foreign_page.query_selector("text=Sign Out"), "Foreign context illegally authenticated!"
+            # Verify the state was NOT consumed and remains available for the legitimate session
             time.sleep(1)
             states_after_foreign = db._atomic_modify_oauth_states(lambda s: dict(s))
             assert fail_state_val in states_after_foreign, "Foreign browser context illegally consumed the state!"
 
-            # 9. Verify that the legitimate browser context can now exchange the preserved state with a mock token exchange
-            from unittest.mock import MagicMock
-            mock_client = MagicMock()
-            mock_client.auth.exchange_code_for_session.return_value = MagicMock(
-                user=MagicMock(id="user_123", email="user@example.com"),
-                session=MagicMock(access_token="mock_jwt"),
-            )
-            mock_client.auth._storage_key = "sb"
-            mock_client.auth._storage = MagicMock()
+            # 9. Verify that the legitimate browser context can now navigate back to the callback with fail_state_val
+            # and authenticate successfully through the live Streamlit callback handler
+            legitimate_callback_url = f"{streamlit_server}/?code=mock_legitimate_code_456&state={fail_state_val}"
+            page.goto(legitimate_callback_url)
+            page.wait_for_selector("text=Sign Out", timeout=15000)
 
-            orig_client = db.get_supabase_client
-            db.get_supabase_client = lambda: mock_client
-            try:
-                legitimate_res = db.exchange_oauth_code(
-                    "mock_legitimate_code",
-                    state=fail_state_val,
-                    session_id=initiating_sid,
-                )
-                assert legitimate_res["success"] is True
-                # State must now be atomically consumed
-                states_final = db._atomic_modify_oauth_states(lambda s: dict(s))
-                assert fail_state_val not in states_final
-            finally:
-                db.get_supabase_client = orig_client
+            # Verify that fail_state_val has now been consumed by the app
+            states_final = db._atomic_modify_oauth_states(lambda s: dict(s))
+            assert fail_state_val not in states_final, "State was not consumed after legitimate callback completion!"
 
             browser.close()
