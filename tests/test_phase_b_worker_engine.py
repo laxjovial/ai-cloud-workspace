@@ -25,6 +25,7 @@ import os
 import signal
 import sqlite3
 import tempfile
+import threading
 import time
 import uuid
 import pytest
@@ -115,7 +116,14 @@ def mock_worker_target(inst_id, db_p, stop_ev, sock_p=None, tok=None):
     with q._lock:
         with q.conn:
             q.conn.execute(
-                "INSERT INTO worker_instances (instance_id, pid, start_time, last_heartbeat, status) VALUES (?, ?, ?, ?, 'ALIVE');",
+                """
+                INSERT INTO worker_instances (instance_id, pid, start_time, last_heartbeat, status)
+                VALUES (?, ?, ?, ?, 'ALIVE')
+                ON CONFLICT(instance_id) DO UPDATE SET
+                    pid = excluded.pid,
+                    last_heartbeat = excluded.last_heartbeat,
+                    status = 'ALIVE';
+                """,
                 (inst_id, os.getpid(), time.time(), time.time()),
             )
     q.close()
@@ -123,38 +131,49 @@ def mock_worker_target(inst_id, db_p, stop_ev, sock_p=None, tok=None):
         time.sleep(0.1)
 
 
-def ipc_recovery_worker_target(inst_id, db_p, stop_ev, sock_p=None, tok=None):
-    """Worker target that executes recovery check via IPC from child process."""
+def blocking_sandbox_worker_target(inst_id, db_p, stop_ev, sock_p=None, tok=None):
+    """Top-level function for worker running a genuinely blocked sandbox command in a child process."""
     q = DurableJobQueue(db_path=db_p)
     with q._lock:
         with q.conn:
             q.conn.execute(
-                "INSERT INTO worker_instances (instance_id, pid, start_time, last_heartbeat, status) VALUES (?, ?, ?, ?, 'ALIVE');",
+                """
+                INSERT INTO worker_instances (instance_id, pid, start_time, last_heartbeat, status)
+                VALUES (?, ?, ?, ?, 'ALIVE')
+                ON CONFLICT(instance_id) DO UPDATE SET
+                    pid = excluded.pid,
+                    last_heartbeat = excluded.last_heartbeat,
+                    status = 'ALIVE';
+                """,
                 (inst_id, os.getpid(), time.time(), time.time()),
             )
-    ipc_client = SupervisorIPCClient(socket_path=sock_p, worker_instance_id=inst_id, auth_token=tok)
 
-    # Find job and claim it
-    job = q.conn.execute("SELECT id FROM jobs LIMIT 1;").fetchone()
-    if job:
-        job_id = job["id"]
-        # Find pending recovery side-effect
-        se = q.conn.execute("SELECT * FROM side_effect_ledger WHERE job_id = ?;", (job_id,)).fetchone()
-        if se:
-            is_dead = ipc_client.verify_worker_death(
-                job_id=job_id,
-                instance_id=se["worker_id"],
-                side_effect_id=se["side_effect_id"],
-            )
-            # Record result in a test table or event
-            with q._lock:
-                with q.conn:
-                    q.conn.execute(
-                        "INSERT INTO job_events (job_id, event_type, source, message, created_at) VALUES (?, 'IPC_TEST_RESULT', ?, ?, ?);",
-                        (job_id, inst_id, json.dumps({"is_dead": is_dead}), time.time()),
-                    )
+    claimed = q.claim_next_job(worker_id=inst_id, lease_duration_seconds=30.0)
+    if claimed:
+        job_id = claimed["id"]
+        gen = claimed["lease_generation"]
+        timeout_sec = claimed.get("timeout_seconds", 0.5)
+
+        # Heartbeat loop that simulates worker heartbeat continuing while command is blocked
+        hb_stop = threading.Event()
+        def hb_loop():
+            while not hb_stop.is_set():
+                time.sleep(0.1)
+                if hb_stop.is_set():
+                    break
+                q.poll_worker_status(job_id=job_id, worker_id=inst_id, lease_generation=gen, lease_duration_seconds=30.0)
+
+        t = threading.Thread(target=hb_loop, daemon=True)
+        t.start()
+
+        # Simulate genuinely blocked sandbox operation (unresponsive synchronous call)
+        try:
+            while not stop_ev.is_set():
+                time.sleep(0.1)
+        finally:
+            hb_stop.set()
+
     q.close()
-    stop_ev.set()
 
 
 class TestPhaseB2WorkerEngine:
@@ -426,21 +445,63 @@ class TestPhaseB2WorkerEngine:
         sup.shutdown()
 
     def test_scenario_7_blocked_command_forced_interruption(self, test_env):
-        """7. Active command hangs -> watchdog interrupts and controller halts execution."""
-        controller = ExecutionController(job_id="job_hang", timeout_seconds=0.2)
-        assert not controller.is_aborted()
+        """7. Genuinely blocked worker operation -> supervisor hard timeout watchdog terminates process via SIGTERM/SIGKILL."""
+        db_path = test_env["db_path"]
+        key_path = test_env["key_path"]
 
-        # Simulate command execution loop checking controller status
-        command_interrupted = False
-        start_t = time.monotonic()
-        while time.monotonic() - start_t < 1.0:
-            if controller.is_aborted():
-                command_interrupted = True
+        sup = WorkerSupervisor(db_path=db_path, concurrency=1, signing_key_path=key_path)
+        queue = sup.queue
+
+        # Enqueue job with very short hard timeout (0.5s)
+        job = queue.enqueue_job(
+            user_id="user_alice",
+            session_id="sess_hang",
+            repository="owner/repo",
+            payload={"prompt": "Task running blocked command"},
+        )
+        # Update timeout_seconds to 0.5s in DB
+        with queue._lock:
+            with queue.conn:
+                queue.conn.execute("UPDATE jobs SET timeout_seconds = 0.5 WHERE id = ?;", (job["id"],))
+
+        # Start slot running blocking_sandbox_worker_target in real child process
+        sup.start_worker_slot("slot_blocked", custom_target=blocking_sandbox_worker_target)
+        slot_info = sup._workers["slot_blocked"]
+        worker_pid = slot_info["pid"]
+        worker_inst = slot_info["instance_id"]
+
+        # Wait for worker process to claim job and block
+        claimed_job = None
+        for _ in range(20):
+            time.sleep(0.1)
+            cj = queue.get_job(job["id"], user_id="user_alice")
+            if cj["status"] == "RUNNING":
+                claimed_job = cj
                 break
-            time.sleep(0.05)
 
-        assert command_interrupted
-        assert "timeout" in controller.abort_reason.lower()
+        assert claimed_job is not None
+        assert claimed_job["status"] == "RUNNING"
+        assert claimed_job["worker_id"] == worker_inst
+
+        # Wait past the hard deadline (0.5s)
+        time.sleep(0.8)
+
+        # Trigger supervisor step to enforce hard timeout watchdog
+        sup.supervise_step()
+
+        # Verify child process was terminated and reaped by supervisor
+        reap_row = queue.conn.execute(
+            "SELECT * FROM worker_instances WHERE instance_id = ?;", (worker_inst,)
+        ).fetchone()
+        assert reap_row["status"] == "DEAD"
+        assert reap_row["pid"] == worker_pid
+
+        # Verify job reached terminal TIMED_OUT status via supervisor authority
+        final_job = queue.get_job(job["id"], user_id="user_alice")
+        assert final_job["status"] == "TIMED_OUT"
+        assert final_job["finished_at"] is not None
+
+        sup.shutdown()
 
     def test_scenario_8_crash_and_reclaim_precondition(self, test_env):
         """8. Worker killed leaving ORPHANED sandbox -> claim_next_job strictly refuses until CLEANED."""
@@ -716,9 +777,25 @@ class TestPhaseB2WorkerEngine:
                 raise Exception("GitHub API 500: Server Error / Rate Limit Exceeded.")
 
         claimed = queue.claim_next_job(worker_id=active_worker_id)
-        controller = ExecutionController(job_id=job["id"], ipc_client=ipc_client)
+        controller = ExecutionController(
+            job_id=job["id"],
+            worker_id=active_worker_id,
+            lease_generation=claimed["lease_generation"],
+            queue=queue,
+            ipc_client=ipc_client,
+            github_client_factory=lambda: BrokenGitHubClient(),
+        )
 
         # Worker attempts recovery with broken client -> fails closed
+        def agent_turn_triggering_pr(messages, model, api_key, sandbox, execution_controller):
+            return execution_controller.on_create_pull_request(
+                sandbox=sandbox,
+                branch_name=f"ai-cloud/job-{job['id'][:8]}",
+                commit_message="test pr",
+                pr_title="test pr",
+                pr_body="test body",
+            )
+
         with pytest.raises(Exception, match="GitHub API 500"):
             execute_job_in_worker(
                 job=claimed,
@@ -728,6 +805,7 @@ class TestPhaseB2WorkerEngine:
                 controller=controller,
                 sandbox_factory=lambda repo_name, github_token: MockSandbox(repo_name),
                 github_client_factory=lambda: BrokenGitHubClient(),
+                agent_turn_fn=agent_turn_triggering_pr,
             )
         sup.shutdown()
 
@@ -774,7 +852,26 @@ class TestPhaseB2WorkerEngine:
                 return [{"html_url": "https://github.com/owner/repo/pull/99", "state": "closed"}]
 
         claimed = queue.claim_next_job(worker_id=active_worker_id)
-        controller = ExecutionController(job_id=job["id"], ipc_client=ipc_client)
+        controller = ExecutionController(
+            job_id=job["id"],
+            worker_id=active_worker_id,
+            lease_generation=claimed["lease_generation"],
+            queue=queue,
+            ipc_client=ipc_client,
+            github_client_factory=lambda: PreExistingGitHubClient(),
+        )
+
+        def agent_turn_triggering_pr(messages, model, api_key, sandbox, execution_controller):
+            res = execution_controller.on_create_pull_request(
+                sandbox=sandbox,
+                branch_name=f"ai-cloud/job-{job['id'][:8]}",
+                commit_message="test pr",
+                pr_title="test pr",
+                pr_body="test body",
+            )
+            assert res.get("adopted") is True
+            assert res.get("pr_url") == "https://github.com/owner/repo/pull/99"
+            return {"success": True}
 
         execute_job_in_worker(
             job=claimed,
@@ -784,7 +881,7 @@ class TestPhaseB2WorkerEngine:
             controller=controller,
             sandbox_factory=lambda repo_name, github_token: MockSandbox(repo_name),
             github_client_factory=lambda: PreExistingGitHubClient(),
-            agent_turn_fn=lambda messages, model, api_key, sandbox, execution_controller: {"success": True},
+            agent_turn_fn=agent_turn_triggering_pr,
         )
 
         final_job = queue.get_job(job["id"], user_id="user_alice")

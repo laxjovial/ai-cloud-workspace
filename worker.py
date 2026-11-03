@@ -295,18 +295,31 @@ class SupervisorIPCServer:
         socket_path: Optional[str] = None,
     ):
         self.supervisor = supervisor
-        self.socket_path = socket_path or f"/tmp/ai_cloud_ipc_{supervisor.supervisor_id}.sock"
+        if socket_path:
+            self.socket_path = socket_path
+        else:
+            # Secure 0700 private IPC directory to avoid predictable shared /tmp paths
+            ipc_dir = os.path.expanduser(f"~/.ai_cloud_workspace/ipc")
+            os.makedirs(ipc_dir, mode=0o700, exist_ok=True)
+            try:
+                os.chmod(ipc_dir, 0o700)
+            except OSError as e:
+                raise RuntimeError(f"Failed to set 0700 permissions on supervisor IPC directory '{ipc_dir}': {e}") from e
+            self.socket_path = os.path.join(ipc_dir, f"{supervisor.supervisor_id}.sock")
+
         if os.path.exists(self.socket_path):
             try:
                 os.unlink(self.socket_path)
-            except OSError:
-                pass
+            except OSError as e:
+                raise RuntimeError(f"Failed to unlink existing socket path '{self.socket_path}': {e}") from e
+
         self._server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._server_sock.bind(self.socket_path)
         try:
             os.chmod(self.socket_path, 0o600)
-        except OSError:
-            pass
+        except OSError as e:
+            raise RuntimeError(f"Failed to enforce 0600 permissions on socket '{self.socket_path}': {e}") from e
+
         self._server_sock.listen(10)
         self._stop_event = threading.Event()
         self._thread = threading.Thread(target=self._serve, daemon=True)
@@ -335,6 +348,36 @@ class SupervisorIPCServer:
                 if self._stop_event.is_set():
                     break
 
+    @staticmethod
+    def _read_framed_msg(conn: socket.socket) -> Optional[Dict[str, Any]]:
+        """Reads a 4-byte length-prefixed JSON message with strict read-exact loop."""
+        import struct
+        header = b""
+        while len(header) < 4:
+            chunk = conn.recv(4 - len(header))
+            if not chunk:
+                return None
+            header += chunk
+        msg_len = struct.unpack("!I", header)[0]
+        if msg_len > 65536:
+            raise ValueError(f"IPC payload exceeds maximum length: {msg_len} bytes")
+
+        payload = b""
+        while len(payload) < msg_len:
+            chunk = conn.recv(msg_len - len(payload))
+            if not chunk:
+                raise ValueError("Premature connection close during payload read")
+            payload += chunk
+        return json.loads(payload.decode("utf-8"))
+
+    @staticmethod
+    def _send_framed_msg(conn: socket.socket, msg: Dict[str, Any]) -> None:
+        """Sends a 4-byte length-prefixed JSON message."""
+        import struct
+        payload = json.dumps(msg).encode("utf-8")
+        header = struct.pack("!I", len(payload))
+        conn.sendall(header + payload)
+
     def _handle_client(self, conn: socket.socket) -> None:
         with conn:
             try:
@@ -344,36 +387,43 @@ class SupervisorIPCServer:
                 peer_cred_bytes = conn.getsockopt(socket.SOL_SOCKET, 17, 12)
                 peer_pid, peer_uid, peer_gid = struct.unpack("3i", peer_cred_bytes)
 
-                data = conn.recv(4096).decode("utf-8")
-                if not data:
+                # Security invariant: validate peer UID matches supervisor process UID
+                expected_uid = os.getuid()
+                if peer_uid != expected_uid:
+                    self._send_framed_msg(conn, {
+                        "success": False,
+                        "error": f"UID mismatch rejected: peer UID {peer_uid} does not match supervisor UID {expected_uid}."
+                    })
                     return
-                req = json.loads(data)
+
+                req = self._read_framed_msg(conn)
+                if not req:
+                    return
 
                 worker_instance_id = req.get("worker_instance_id")
                 worker_auth_token = req.get("auth_token", "")
 
                 # 2. Authenticate worker instance: verify per-worker token and match peer PID
-                # Note: Test or external processes may also request verification if matching token and pid
                 slot_info = self.supervisor.get_worker_slot_by_instance(worker_instance_id)
                 registered_pid = slot_info.get("pid") if slot_info else None
                 expected_token = slot_info.get("auth_token", "") if slot_info else None
 
-                # If caller is the supervisor process itself or registered worker instance
+                # Caller must be supervisor itself or registered worker instance matching token and pid
                 caller_is_supervisor = (peer_pid == os.getpid())
                 caller_is_worker = (slot_info and registered_pid == peer_pid and hmac.compare_digest(worker_auth_token, expected_token))
 
                 if not (caller_is_supervisor or caller_is_worker):
                     if not slot_info:
-                        conn.sendall(json.dumps({"success": False, "error": f"Unknown or unmanaged worker instance '{worker_instance_id}'."}).encode("utf-8"))
+                        self._send_framed_msg(conn, {"success": False, "error": f"Unknown or unmanaged worker instance '{worker_instance_id}'."})
                         return
                     if not hmac.compare_digest(worker_auth_token, expected_token):
-                        conn.sendall(json.dumps({"success": False, "error": "Invalid worker authentication token."}).encode("utf-8"))
+                        self._send_framed_msg(conn, {"success": False, "error": "Invalid worker authentication token."})
                         return
                     if registered_pid != peer_pid:
-                        conn.sendall(json.dumps({
+                        self._send_framed_msg(conn, {
                             "success": False,
                             "error": f"PID spoofing rejected: connection peer PID {peer_pid} does not match registered PID {registered_pid} for worker '{worker_instance_id}'."
-                        }).encode("utf-8"))
+                        })
                         return
 
                 action = req.get("action")
@@ -387,10 +437,10 @@ class SupervisorIPCServer:
                         "SELECT worker_id, status FROM jobs WHERE id = ?;", (job_id,)
                     ).fetchone()
                     if not current_job or current_job["worker_id"] != worker_instance_id:
-                        conn.sendall(json.dumps({
+                        self._send_framed_msg(conn, {
                             "success": False,
                             "error": f"Caller worker '{worker_instance_id}' is not the current leaseholder for job '{job_id}'."
-                        }).encode("utf-8"))
+                        })
                         return
 
                     is_dead = self.supervisor.queue.supervisor_verify_worker_death(
@@ -399,11 +449,14 @@ class SupervisorIPCServer:
                         side_effect_id=side_effect_id,
                         supervisor_signing_key=self.supervisor.signing_key,
                     )
-                    conn.sendall(json.dumps({"success": True, "is_dead": is_dead}).encode("utf-8"))
+                    self._send_framed_msg(conn, {"success": True, "is_dead": is_dead})
                 else:
-                    conn.sendall(json.dumps({"success": False, "error": f"Unknown action '{action}'"}).encode("utf-8"))
+                    self._send_framed_msg(conn, {"success": False, "error": f"Unknown action '{action}'"})
             except Exception as e:
-                conn.sendall(json.dumps({"success": False, "error": str(e)}).encode("utf-8"))
+                try:
+                    self._send_framed_msg(conn, {"success": False, "error": str(e)})
+                except Exception:
+                    pass
 
 
 class SupervisorIPCClient:
@@ -415,7 +468,8 @@ class SupervisorIPCClient:
         self.auth_token = auth_token
 
     def verify_worker_death(self, job_id: str, instance_id: str, side_effect_id: str) -> bool:
-        """Requests supervisor verification of prior worker process termination."""
+        """Requests supervisor verification of prior worker process termination using framed length-prefixed IPC."""
+        import struct
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             with sock:
@@ -429,9 +483,27 @@ class SupervisorIPCClient:
                     "instance_id": instance_id,
                     "side_effect_id": side_effect_id,
                 }
-                sock.sendall(json.dumps(req).encode("utf-8"))
-                resp_data = sock.recv(4096).decode("utf-8")
-                resp = json.loads(resp_data)
+                payload = json.dumps(req).encode("utf-8")
+                header = struct.pack("!I", len(payload))
+                sock.sendall(header + payload)
+
+                # Read response length prefix
+                resp_header = b""
+                while len(resp_header) < 4:
+                    chunk = sock.recv(4 - len(resp_header))
+                    if not chunk:
+                        return False
+                    resp_header += chunk
+                resp_len = struct.unpack("!I", resp_header)[0]
+
+                resp_payload = b""
+                while len(resp_payload) < resp_len:
+                    chunk = sock.recv(resp_len - len(resp_payload))
+                    if not chunk:
+                        return False
+                    resp_payload += chunk
+
+                resp = json.loads(resp_payload.decode("utf-8"))
                 if not resp.get("success"):
                     logger.warning(f"Supervisor IPC returned error: {resp.get('error')}")
                 if resp.get("success"):
@@ -538,67 +610,9 @@ def execute_job_in_worker(
         queue.register_sandbox(job_id, sb_id, worker_id, lease_gen)
         queue.append_log(job_id, worker_id, lease_gen, f"Cloud sandbox '{sb_id}' provisioned and registered.")
 
-        # 4. Check for Side-Effect Recovery (Unified through controller hook)
-        # Note: PR reservation, contextual supervisor verification, remote query across all PR states,
-        # and confirmation/failure are authoritative inside controller.on_create_pull_request()
-        # If an abandoned intent exists, check and recover it Authoritatively
-        scoped_branch = f"ai-cloud/job-{job_id[:8]}"
-        action_type = "CREATE_PULL_REQUEST"
-        action_key = f"pr_{job_id[:8]}"
-        se_id, se_status, se_data = queue.reserve_side_effect(
-            job_id=job_id,
-            worker_id=worker_id,
-            lease_generation=lease_gen,
-            action_type=action_type,
-            action_key=action_key,
-            intent_payload={"branch_name": scoped_branch, "repository": repo_name},
-        )
-        if se_status == "PENDING_RECOVERY":
-            prior_worker_id = se_data.get("prior_worker_id")
-            if not controller.ipc_client:
-                raise SideEffectReconciliationBlockedError(
-                    f"IPC client is required for recovery of side effect '{se_id}'. Direct queue bypass prohibited."
-                )
-            is_dead = controller.ipc_client.verify_worker_death(
-                job_id=job_id,
-                instance_id=prior_worker_id,
-                side_effect_id=se_id,
-            )
-            if not is_dead:
-                err_msg = f"Previous worker '{prior_worker_id}' termination cannot be cryptographically verified."
-                queue.append_log(job_id, worker_id, lease_gen, f"Recovery blocked: {err_msg}")
-                raise SideEffectReconciliationBlockedError(err_msg)
-
-            queue.append_log(job_id, worker_id, lease_gen, "Prior worker verified DEAD. Querying GitHub across all states.")
-            pr_found = False
-            matching_pr_url = None
-            if github_client_factory:
-                gh_client = github_client_factory()
-                pulls = gh_client.get_pulls(state="all", head=scoped_branch)
-                if pulls:
-                    pr_found = True
-                    matching_pr_url = pulls[0].get("html_url")
-
-            if pr_found and matching_pr_url:
-                queue.confirm_side_effect(
-                    side_effect_id=se_id,
-                    worker_id=worker_id,
-                    lease_generation=lease_gen,
-                    confirmed_result={"pr_url": matching_pr_url, "adopted": True},
-                    is_recovery=True,
-                )
-                queue.append_log(job_id, worker_id, lease_gen, f"Adopted existing PR '{matching_pr_url}'. Skipping creation.")
-            else:
-                queue.fail_side_effect(
-                    side_effect_id=se_id,
-                    worker_id=worker_id,
-                    lease_generation=lease_gen,
-                    reason="Verified absent on remote provider.",
-                    is_recovery=True,
-                )
-                queue.append_log(job_id, worker_id, lease_gen, "No remote PR found. Abandoned intent marked FAILED_VERIFIED.")
-
-        # 5. Run Agent Turn Loop
+        # 4. Run Agent Turn Loop
+        # Note: All side-effect reservation, contextual prior-worker IPC verification, remote state queries,
+        # adoption, and confirmations are strictly authoritative inside controller.on_create_pull_request().
         messages = payload.get("messages", [{"role": "user", "content": payload.get("prompt", "Analyze repository")}])
         model = payload.get("model", "gemini/gemini-2.5-flash")
 
@@ -645,15 +659,19 @@ def execute_job_in_worker(
                 lease_generation=lease_gen,
                 sandbox_id=sb_id,
             )
-            # Normal completion cleanup: destroy sandbox container locally and mark CLEANED
+            # Normal completion cleanup: destroy sandbox container locally and finalize via fenced cleanup
             try:
                 sandbox.close()
-                with queue._lock:
-                    with queue.conn:
-                        queue.conn.execute("BEGIN IMMEDIATE;")
-                        queue.conn.execute(
-                            "UPDATE jobs SET sandbox_cleanup_status = 'CLEANED' WHERE id = ?;",
-                            (job_id,),
+                # Atomically transition sandbox cleanup from ORPHANED/ACTIVE to CLEANED using owner/generation fencing
+                cleanup_claimed = queue.claim_sandbox_cleanup(owner_id=worker_id, limit=1)
+                for clm in cleanup_claimed:
+                    if clm["id"] == job_id and clm["sandbox_id"] == sb_id:
+                        queue.finalize_sandbox_cleanup(
+                            job_id=job_id,
+                            sandbox_id=sb_id,
+                            owner_id=worker_id,
+                            cleanup_generation=clm["sandbox_cleanup_generation"],
+                            success=True,
                         )
             except Exception as e:
                 queue.append_log(job_id, worker_id, lease_gen, f"Sandbox close error: {str(e)}")
@@ -693,7 +711,7 @@ def worker_child_main(
     start_time = time.time()
     queue = DurableJobQueue(db_path=db_path)
 
-    # Register instance in worker_instances as ALIVE
+    # Register instance in worker_instances as ALIVE (preserve supervisor's authoritative start_time if already set)
     with queue._lock:
         with queue.conn:
             queue.conn.execute("BEGIN IMMEDIATE;")
@@ -704,7 +722,7 @@ def worker_child_main(
                 ) VALUES (?, ?, ?, ?, 'ALIVE')
                 ON CONFLICT(instance_id) DO UPDATE SET
                     pid = excluded.pid,
-                    start_time = excluded.start_time,
+                    start_time = COALESCE(worker_instances.start_time, excluded.start_time),
                     last_heartbeat = excluded.last_heartbeat,
                     status = 'ALIVE';
                 """,
@@ -743,11 +761,18 @@ def worker_child_main(
 
             # Spawn Heartbeat & Watchdog Thread
             watchdog_stop = threading.Event()
+            job_start_time = time.time()
 
             def watchdog_loop():
                 while not watchdog_stop.is_set():
-                    time.sleep(5.0)
+                    time.sleep(1.0)
                     if watchdog_stop.is_set():
+                        break
+
+                    # If execution has exceeded timeout deadline, stop extending lease and trigger abort
+                    if time.time() - job_start_time > timeout_sec:
+                        controller.abort(f"Execution exceeded timeout limit ({timeout_sec}s).")
+                        # Do NOT extend lease beyond job execution timeout
                         break
 
                     status = queue.poll_worker_status(
@@ -759,6 +784,8 @@ def worker_child_main(
 
                     if status == "CANCEL_REQUESTED":
                         controller.abort("User requested cancellation.")
+                        # Do NOT extend lease further once cancellation is requested
+                        break
                     elif status == "STALE":
                         controller.abort("Worker lease expired or superseded (STALE).")
                         break
@@ -842,6 +869,7 @@ class WorkerSupervisor:
         """Spawns an independent child worker process for a slot with unique ephemeral auth token."""
         instance_id = f"worker_{uuid.uuid4().hex[:12]}"
         worker_token = secrets.token_hex(16)
+        spawn_time = time.time()
 
         target_fn = custom_target or worker_child_main
         args = (
@@ -862,10 +890,28 @@ class WorkerSupervisor:
                 "instance_id": instance_id,
                 "auth_token": worker_token,
                 "pid": proc.pid,
-                "start_time": time.time(),
+                "start_time": spawn_time,
                 "crashes": crashes,
                 "custom_target": custom_target,
             }
+
+        # Atomically register instance in worker_instances so start_time is consistent and authoritative
+        with self.queue._lock:
+            with self.queue.conn:
+                self.queue.conn.execute("BEGIN IMMEDIATE;")
+                self.queue.conn.execute(
+                    """
+                    INSERT INTO worker_instances (
+                        instance_id, pid, start_time, last_heartbeat, status
+                    ) VALUES (?, ?, ?, ?, 'ALIVE')
+                    ON CONFLICT(instance_id) DO UPDATE SET
+                        pid = excluded.pid,
+                        start_time = excluded.start_time,
+                        last_heartbeat = excluded.last_heartbeat,
+                        status = 'ALIVE';
+                    """,
+                    (instance_id, proc.pid, spawn_time, spawn_time),
+                )
 
     def stop_worker_slot(self, slot_id: str, grace_seconds: float = 5.0) -> None:
         """Stops a worker process gracefully; falls back to forced SIGKILL."""
@@ -907,7 +953,91 @@ class WorkerSupervisor:
         """Performs one supervisory iteration: checks children, handles crashes, reaps jobs, reconciles sandboxes."""
         now = time.time()
 
-        # 1. Inspect and maintain configured concurrency pool
+        # 1. Supervise active running jobs (Deadlock, hard timeout, and cancellation watchdog for unresponsive child processes)
+        with self.queue._lock:
+            running_jobs = self.queue.conn.execute(
+                """
+                SELECT id, worker_id, lease_generation, lease_expires_at, timeout_seconds, started_at, cancel_requested_at
+                FROM jobs
+                WHERE status = 'RUNNING';
+                """
+            ).fetchall()
+
+        for r_job in running_jobs:
+            w_id = r_job["worker_id"]
+            lease_exp = r_job["lease_expires_at"]
+            started_at = r_job["started_at"] or now
+            timeout_sec = r_job["timeout_seconds"] or 600.0
+            cancel_req_at = r_job["cancel_requested_at"]
+            lease_gen = r_job["lease_generation"]
+
+            # Find if this worker is one of supervisor's managed child slots
+            managed_slot = None
+            with self._lock:
+                for sid, sinfo in self._workers.items():
+                    if sinfo.get("instance_id") == w_id:
+                        managed_slot = (sid, sinfo)
+                        break
+
+            should_terminate = False
+            term_reason = ""
+            term_target_status = "FAILED"
+
+            # Condition A: Hard execution deadline exceeded (even if worker process keeps sending heartbeats)
+            if (now - started_at) > timeout_sec:
+                should_terminate = True
+                term_reason = f"Execution exceeded hard deadline ({timeout_sec}s)."
+                term_target_status = "TIMED_OUT"
+            # Condition B: Cancellation requested and grace period (5.0s) exceeded without worker cooperative halt
+            elif cancel_req_at and (now - cancel_req_at) > 5.0:
+                should_terminate = True
+                term_reason = "Worker failed to halt cooperatively within cancellation grace period."
+                term_target_status = "CANCELLED"
+            # Condition C: Lease expired while process is still alive
+            elif lease_exp and lease_exp < now:
+                should_terminate = True
+                term_reason = "Execution lease expired while worker process was running."
+                term_target_status = "CANCELLED" if cancel_req_at else "FAILED"
+
+            if should_terminate and managed_slot:
+                slot_id, slot_info = managed_slot
+                logger.warning(
+                    f"Job '{r_job['id']}' breached enforcement boundary ({term_reason}). "
+                    f"Supervisor forcefully terminating worker process PID {slot_info['pid']} in slot '{slot_id}'."
+                )
+                self.stop_worker_slot(slot_id, grace_seconds=0.2)
+
+                # Fetch recorded reap proof to authoritatively finalize job
+                inst_row = self.queue.conn.execute(
+                    "SELECT reap_token, reap_signature FROM worker_instances WHERE instance_id = ?;",
+                    (w_id,),
+                ).fetchone()
+
+                if inst_row and inst_row["reap_token"] and inst_row["reap_signature"]:
+                    try:
+                        self.queue.supervisor_finalize_job(
+                            job_id=r_job["id"],
+                            expected_lease_generation=lease_gen,
+                            target_status=term_target_status,
+                            supervisor_id=self.supervisor_id,
+                            authority_proof={
+                                "type": "FORCED_KILL",
+                                "worker_instance_id": w_id,
+                                "reap_token": inst_row["reap_token"],
+                                "reap_signature": inst_row["reap_signature"],
+                            },
+                            reason=term_reason,
+                            supervisor_signing_key=self.signing_key,
+                            error={"error": term_reason, "type": "SupervisorForcedTermination"},
+                        )
+                    except Exception as fin_err:
+                        logger.error(f"Failed to finalize job '{r_job['id']}': {fin_err}")
+
+                # Restart slot for next tasks
+                if not self._stop_event.is_set():
+                    self.start_worker_slot(slot_id, custom_target=slot_info.get("custom_target"))
+
+        # 2. Inspect and maintain configured concurrency pool
         slots_to_start = []
         with self._lock:
             for i in range(self.concurrency):
@@ -936,16 +1066,21 @@ class WorkerSupervisor:
                 exit_code = proc.exitcode
                 exit_signal = 9 if exit_code in (-9, 137) else None
 
-                self.queue.record_process_reap(
-                    instance_id=inst_id,
-                    pid=pid,
-                    start_time=start_time,
-                    exit_code=exit_code,
-                    exit_signal=exit_signal,
-                    supervisor_id=self.supervisor_id,
-                    proof_type="PARENT_WAITPID",
-                    supervisor_signing_key=self.signing_key,
-                )
+                # Only record reap if not already recorded DEAD by stop_worker_slot
+                inst_check = self.queue.conn.execute(
+                    "SELECT status FROM worker_instances WHERE instance_id = ?;", (inst_id,)
+                ).fetchone()
+                if not (inst_check and inst_check["status"] == "DEAD"):
+                    self.queue.record_process_reap(
+                        instance_id=inst_id,
+                        pid=pid,
+                        start_time=start_time,
+                        exit_code=exit_code,
+                        exit_signal=exit_signal,
+                        supervisor_id=self.supervisor_id,
+                        proof_type="PARENT_WAITPID",
+                        supervisor_signing_key=self.signing_key,
+                    )
 
                 if now - start_time < 10.0 and exit_code != 0:
                     crashes += 1
@@ -965,38 +1100,8 @@ class WorkerSupervisor:
                     custom_tgt = slot_info.get("custom_target")
                     self.start_worker_slot(slot_id, custom_target=custom_tgt)
 
-        # 2. Reap stale jobs in DB
+        # 3. Reap stale jobs in DB
         self.queue.reap_stale_jobs()
-
-        # 3. Supervise active running jobs (Deadlock / timeout watchdog for unresponsive child processes)
-        with self.queue._lock:
-            running_jobs = self.queue.conn.execute(
-                """
-                SELECT id, worker_id, lease_generation, lease_expires_at, timeout_seconds, started_at
-                FROM jobs
-                WHERE status = 'RUNNING';
-                """
-            ).fetchall()
-
-        for r_job in running_jobs:
-            w_id = r_job["worker_id"]
-            lease_exp = r_job["lease_expires_at"]
-            # Find if this worker is one of supervisor's managed child slots
-            managed_slot = None
-            with self._lock:
-                for sid, sinfo in self._workers.items():
-                    if sinfo.get("instance_id") == w_id:
-                        managed_slot = (sid, sinfo)
-                        break
-
-            # If job's lease has expired and worker process is still alive, forcefully stop and record reap
-            if lease_exp and lease_exp < now and managed_slot:
-                slot_id, slot_info = managed_slot
-                logger.warning(f"Job '{r_job['id']}' exceeded lease deadline while worker '{w_id}' was running. Terminating slot '{slot_id}'.")
-                self.stop_worker_slot(slot_id, grace_seconds=1.0)
-                # Restart slot for upcoming work
-                if not self._stop_event.is_set():
-                    self.start_worker_slot(slot_id, custom_target=slot_info.get("custom_target"))
 
         # 4. Reconcile orphan sandboxes in cloud
         self.reconciler.reconcile_orphans()
