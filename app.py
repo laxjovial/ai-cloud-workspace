@@ -158,7 +158,52 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Initialize Session State
+# Initialize Browser Session ID with client-side cookie persistence across redirects
+def _get_or_create_browser_session_id() -> str:
+    """Retrieves or creates a stable browser session ID that survives full OAuth page navigations.
+    
+    Persists via client-side cookie with SameSite=Lax and Secure (for HTTPS/production).
+    """
+    cookie_sid = None
+    try:
+        if hasattr(st, "context") and hasattr(st.context, "cookies"):
+            cookie_sid = st.context.cookies.get("ai_cloud_ws_sid")
+    except Exception:
+        pass
+
+    if cookie_sid and len(cookie_sid) >= 16:
+        st.session_state.browser_session_id = cookie_sid
+        return cookie_sid
+
+    if "browser_session_id" not in st.session_state or not st.session_state.browser_session_id:
+        import secrets
+        st.session_state.browser_session_id = secrets.token_hex(16)
+
+    # Persist via client-side cookie with SameSite=Lax and Secure for HTTPS
+    sid = st.session_state.browser_session_id
+    import streamlit.components.v1 as components
+    components.html(
+        f"""<script>
+        (function() {{
+            try {{
+                var isHttps = (window.location.protocol === "https:" || (window.parent && window.parent.location.protocol === "https:"));
+                var secureFlag = isHttps ? "; Secure" : "";
+                var cookiePayload = "ai_cloud_ws_sid={sid}; path=/; max-age=86400; SameSite=Lax" + secureFlag;
+                if (window.parent && window.parent.document) {{
+                    window.parent.document.cookie = cookiePayload;
+                }}
+                document.cookie = cookiePayload;
+            }} catch(e) {{}}
+        }})();
+        </script>""",
+        height=0,
+        width=0,
+    )
+    return sid
+
+
+_get_or_create_browser_session_id()
+
 if "user" not in st.session_state:
     st.session_state.user = None
 if "current_session_id" not in st.session_state:
@@ -188,16 +233,23 @@ if "selected_model_label" not in st.session_state:
 
 if "code" in st.query_params and not st.session_state.user:
     auth_code = st.query_params.get("code")
+    auth_state = st.query_params.get("state")
     st.query_params.clear()
 
     # Clear URL bar via JavaScript so stale codes are never re-evaluated
     st.html(
-        "<script>window.history.replaceState({}, '', window.location.pathname);</script>"
+        "<script>window.history.replaceState({}, '', window.location.pathname);</script>",
+        unsafe_allow_javascript=True,
     )
 
     try:
         with st.spinner("Completing authentication..."):
-            oauth_res = db.exchange_oauth_code(auth_code)
+            cur_sid = _get_or_create_browser_session_id()
+            oauth_res = db.exchange_oauth_code(
+                auth_code,
+                state=auth_state,
+                session_id=cur_sid,
+            )
         if oauth_res.get("success"):
             st.session_state.user = oauth_res["data"].user
             st.session_state.auth_flash = (
@@ -304,8 +356,9 @@ def render_landing_and_auth():
             gh_label = "🐙 Sign Up with GitHub"
 
         o_col1, o_col2 = st.columns(2)
-        google_auth = db.get_oauth_url("google", redirect_url)
-        github_auth = db.get_oauth_url("github", redirect_url)
+        cur_browser_sid = _get_or_create_browser_session_id()
+        google_auth = db.get_oauth_url("google", redirect_url, session_id=cur_browser_sid)
+        github_auth = db.get_oauth_url("github", redirect_url, session_id=cur_browser_sid)
 
         with o_col1:
             if google_auth.get("success"):
@@ -1650,8 +1703,12 @@ def render_workspace():
                     )
 
                     if not result.get("success"):
-                        status_box.update(label="❌ AI Execution encountered an issue", state="error")
-                        st.error(result.get("error", "An error occurred during AI execution."))
+                        if result.get("status") == "incomplete_step_limit":
+                            status_box.update(label="⚠️ AI Execution reached step limit (incomplete)", state="error")
+                            st.warning(result.get("content", "Task reached maximum allowed steps before completion."))
+                        else:
+                            status_box.update(label="❌ AI Execution encountered an issue", state="error")
+                            st.error(result.get("error", "An error occurred during AI execution."))
                     else:
                         status_box.update(label="Execution complete!", state="complete")
 

@@ -1,18 +1,21 @@
-"""Database and Authentication module using Supabase with deterministic PKCE and AES encryption."""
+"""Database and Authentication module using Supabase with dynamic PKCE and fail-closed AES encryption."""
 
+import base64
 import hashlib
 import json
 import os
+import secrets
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 import streamlit as st
 from supabase import Client, create_client
 from supabase_auth._sync.gotrue_client import generate_pkce_challenge
 
-# Deterministic PKCE pair so OAuth code verifiers never get lost or out of sync across reruns
-FIXED_PKCE_VERIFIER = "ai_cloud_workspace_pkce_verifier_secure_key_2026_unique"
-FIXED_PKCE_CHALLENGE = generate_pkce_challenge(FIXED_PKCE_VERIFIER)
+# Storage for pending OAuth PKCE verifiers and states
+OAUTH_STATES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".oauth_states.json")
+OAUTH_STATE_EXPIRY_SECONDS = 600  # 10 minutes
 
 # Local encrypted store directory (AES-128 encrypted, excluded in .gitignore)
 USER_STORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".user_store")
@@ -28,46 +31,83 @@ def _get_safe_filename(key: str) -> str:
 
 
 # ==========================================
-# AES ENCRYPTION FOR BYOK KEYS & TOKENS
+# FAIL-CLOSED AES ENCRYPTION FOR BYOK KEYS & TOKENS
 # ==========================================
 
 
+class EncryptionConfigurationError(Exception):
+    """Raised when encryption is requested but ENCRYPTION_KEY is missing or invalid."""
+    pass
+
+
+class DecryptionError(Exception):
+    """Raised when ciphertext cannot be decrypted."""
+    pass
+
+
+class OAuthStateStorageError(Exception):
+    """Raised when OAuth state store cannot be accessed, read, or contains corrupted data."""
+    pass
+
+
 def _get_fernet() -> Optional[Fernet]:
-    """Retrieves Fernet cipher from ENCRYPTION_KEY in secrets."""
-    enc_key = st.secrets.get("ENCRYPTION_KEY", os.getenv("ENCRYPTION_KEY", ""))
+    """Retrieves Fernet cipher from ENCRYPTION_KEY in secrets or environment."""
+    enc_key = ""
+    try:
+        enc_key = st.secrets.get("ENCRYPTION_KEY", "")
+    except Exception:
+        pass
+    if not enc_key:
+        enc_key = os.getenv("ENCRYPTION_KEY", "")
+
     if enc_key:
         try:
-            return Fernet(enc_key.encode())
+            return Fernet(enc_key.strip().encode())
         except Exception:
             return None
     return None
 
 
 def encrypt_secret(plaintext: str) -> str:
-    """Encrypts a sensitive string (API key or PAT) using AES/Fernet."""
+    """Encrypts a sensitive string (API key or PAT) using AES/Fernet.
+    
+    Fails closed: raises EncryptionConfigurationError if encryption is unavailable.
+    """
     if not plaintext:
         return ""
     f = _get_fernet()
     if not f:
-        return plaintext
-    try:
-        return f.encrypt(plaintext.strip().encode()).decode()
-    except Exception:
-        return plaintext
+        raise EncryptionConfigurationError(
+            "ENCRYPTION_KEY is not configured or is invalid. Refusing to store sensitive secrets in plaintext."
+        )
+    return f.encrypt(plaintext.strip().encode()).decode()
 
 
 def decrypt_secret(ciphertext: str) -> str:
-    """Decrypts a stored ciphertext into plaintext. Falls back gracefully if already plaintext."""
+    """Decrypts a stored ciphertext into plaintext.
+    
+    Fails closed: does NOT return raw ciphertext if decryption fails.
+    Supports backward compatibility for legacy plaintext records that don't match Fernet token format.
+    """
     if not ciphertext:
         return ""
     f = _get_fernet()
     if not f:
-        return ciphertext
-    try:
-        return f.decrypt(ciphertext.encode()).decode()
-    except Exception:
-        # Legacy plaintext fallback
-        return ciphertext
+        raise EncryptionConfigurationError(
+            "ENCRYPTION_KEY is not configured or is invalid. Cannot decrypt secrets."
+        )
+
+    # Fernet tokens start with 'gAAAAA'
+    if ciphertext.startswith("gAAAAA"):
+        try:
+            return f.decrypt(ciphertext.encode()).decode()
+        except InvalidToken:
+            raise DecryptionError("Decryption failed: invalid encryption token or mismatched key.")
+        except Exception as e:
+            raise DecryptionError(f"Decryption failed: {str(e)}")
+
+    # Legacy plaintext backward compatibility
+    return ciphertext
 
 
 def mask_secret(secret: str) -> str:
@@ -82,8 +122,17 @@ def mask_secret(secret: str) -> str:
 
 def get_supabase_client() -> Client:
     """Initializes or retrieves the Supabase client from Streamlit secrets or environment."""
-    url = st.secrets.get("SUPABASE_URL", os.getenv("SUPABASE_URL", ""))
-    key = st.secrets.get("SUPABASE_KEY", os.getenv("SUPABASE_KEY", ""))
+    url = ""
+    key = ""
+    try:
+        url = st.secrets.get("SUPABASE_URL", "")
+        key = st.secrets.get("SUPABASE_KEY", "")
+    except Exception:
+        pass
+    if not url:
+        url = os.getenv("SUPABASE_URL", "")
+    if not key:
+        key = os.getenv("SUPABASE_KEY", "")
 
     if not url or not key:
         raise ValueError(
@@ -94,56 +143,193 @@ def get_supabase_client() -> Client:
 
 
 # ==========================================
-# AUTHENTICATION
+# AUTHENTICATION & SECURE PKCE OAUTH
 # ==========================================
 
 
-def sign_up_with_email(email: str, password: str) -> Dict[str, Any]:
-    """Signs up a new user with email and password."""
+import fcntl
+
+
+def _atomic_modify_oauth_states(modifier_fn):
+    """Safely reads, modifies, and writes OAuth states using file-level exclusive locking.
+    
+    Fails closed: if the state store file exists but cannot be accessed, read, parsed,
+    or decoded (e.g. empty/whitespace-only, malformed JSON, permission or I/O error),
+    raises OAuthStateStorageError and preserves the original file for diagnosis rather than
+    silently overwriting or resetting pending login attempts.
+    """
+    # Ensure directory exists
+    dir_name = os.path.dirname(os.path.abspath(OAUTH_STATES_FILE))
+    os.makedirs(dir_name, exist_ok=True)
+    lock_file = OAUTH_STATES_FILE + ".lock"
+
+    with open(lock_file, "w") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        try:
+            now = time.time()
+            states: Dict[str, Any] = {}
+            if os.path.exists(OAUTH_STATES_FILE):
+                try:
+                    with open(OAUTH_STATES_FILE, "r", encoding="utf-8") as fp:
+                        content = fp.read()
+                except UnicodeDecodeError as decode_err:
+                    raise OAuthStateStorageError(
+                        f"OAuth state store '{OAUTH_STATES_FILE}' contains invalid UTF-8 bytes and cannot be decoded: {str(decode_err)}. "
+                        "Preserving original file for diagnosis."
+                    ) from decode_err
+                except OSError as os_err:
+                    raise OAuthStateStorageError(
+                        f"OAuth state store '{OAUTH_STATES_FILE}' cannot be accessed or read: {str(os_err)}. "
+                        "Preserving original file for diagnosis."
+                    ) from os_err
+
+                clean_content = content.strip()
+                if not clean_content:
+                    raise OAuthStateStorageError(
+                        f"OAuth state store '{OAUTH_STATES_FILE}' is empty or whitespace-only. "
+                        "Preserving original file for diagnosis to prevent silent loss of pending attempts."
+                    )
+
+                try:
+                    data = json.loads(clean_content)
+                    if isinstance(data, dict):
+                        states = data
+                    else:
+                        raise OAuthStateStorageError(
+                            f"OAuth state store '{OAUTH_STATES_FILE}' is malformed (expected JSON object, got {type(data).__name__}). "
+                            "Preserving original file for diagnosis."
+                        )
+                except (json.JSONDecodeError, UnicodeDecodeError) as decode_err:
+                    raise OAuthStateStorageError(
+                        f"OAuth state store '{OAUTH_STATES_FILE}' is corrupted or unreadable: {str(decode_err)}. "
+                        "Preserving original file for diagnosis to prevent silent loss of pending attempts."
+                    ) from decode_err
+
+            # Expire old states
+            cleaned = {
+                st_id: val
+                for st_id, val in states.items()
+                if isinstance(val, dict) and (now - val.get("created_at", 0) < OAUTH_STATE_EXPIRY_SECONDS)
+            }
+
+            result = modifier_fn(cleaned)
+
+            # Write back atomically via temp file
+            tmp_path = OAUTH_STATES_FILE + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as fp:
+                json.dump(cleaned, fp)
+            os.replace(tmp_path, OAUTH_STATES_FILE)
+            return result
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+
+def get_oauth_url(provider: str, redirect_to: str, session_id: Optional[str] = None) -> Dict[str, Any]:
+    """Generates a secure OAuth URL with cryptographically random per-attempt PKCE verifier and state.
+    
+    Binds the attempt to the initiating browser session_id if provided.
+    Does NOT leak the verifier in the returned dictionary.
+    """
     supabase = get_supabase_client()
     try:
-        response = supabase.auth.sign_up({"email": email, "password": password})
-        return {"success": True, "data": response}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+        pkce_verifier = secrets.token_urlsafe(64)
+        pkce_challenge = generate_pkce_challenge(pkce_verifier)
+        oauth_state = secrets.token_urlsafe(32)
 
+        def _record_state(states):
+            states[oauth_state] = {
+                "verifier": pkce_verifier,
+                "provider": provider,
+                "session_id": session_id or "",
+                "created_at": time.time(),
+            }
 
-def sign_in_with_email(email: str, password: str) -> Dict[str, Any]:
-    """Logs in an existing user with email and password."""
-    supabase = get_supabase_client()
-    try:
-        response = supabase.auth.sign_in_with_password(
-            {"email": email, "password": password}
-        )
-        return {"success": True, "data": response}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+        _atomic_modify_oauth_states(_record_state)
 
-
-def get_oauth_url(provider: str, redirect_to: str) -> Dict[str, Any]:
-    """Generates a reliable OAuth URL using the deterministic PKCE challenge."""
-    supabase = get_supabase_client()
-    try:
         auth_url = (
             f"{supabase.auth._url}/authorize?provider={provider}"
             f"&redirect_to={redirect_to}"
-            f"&code_challenge={FIXED_PKCE_CHALLENGE}"
+            f"&code_challenge={pkce_challenge}"
             f"&code_challenge_method=s256"
+            f"&state={oauth_state}"
         )
-        return {"success": True, "url": auth_url}
+        # Note: Do not return 'verifier' to the caller/UI
+        return {"success": True, "url": auth_url, "state": oauth_state}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
-def exchange_oauth_code(code: str) -> Dict[str, Any]:
-    """Exchanges an authorization code using the matched PKCE verifier."""
+def exchange_oauth_code(code: str, state: Optional[str] = None, session_id: Optional[str] = None) -> Dict[str, Any]:
+    """Exchanges an authorization code using the matched single-use PKCE verifier for the state.
+    
+    Strictly validates that state is present, matches an active attempt, and verifies session binding.
+    Fails closed: if the state was bound to a session, rejects consumption when session_id is missing,
+    empty, or mismatched. Preserves the pending state on session mismatch so legitimate users are not DOS'd.
+    Never falls back to other pending states.
+    """
+    if not state or not isinstance(state, str) or not state.strip():
+        return {
+            "success": False,
+            "error": "OAuth authorization failed: missing or empty state parameter.",
+        }
+
+    clean_state = state.strip()
+    clean_session_id = (session_id or "").strip()
+
+    def _consume_state(states):
+        if clean_state in states:
+            val = states.get(clean_state, {})
+            expected_session = val.get("session_id", "").strip()
+
+            # Fail closed session binding check:
+            # If state was bound to a session, caller MUST provide matching non-empty session_id
+            if expected_session:
+                if not clean_session_id:
+                    return "MISSING_SESSION_ID"
+                if expected_session != clean_session_id:
+                    # Do NOT pop/delete the state: preserve it for the legitimate session
+                    return "SESSION_MISMATCH"
+
+            # Valid match: atomically consume state
+            consumed = states.pop(clean_state)
+            return consumed.get("verifier")
+        return None
+
+    try:
+        consume_result = _atomic_modify_oauth_states(_consume_state)
+    except OAuthStateStorageError as storage_err:
+        return {
+            "success": False,
+            "error": f"OAuth authorization failed due to storage error: {str(storage_err)}",
+        }
+
+    if consume_result == "MISSING_SESSION_ID":
+        return {
+            "success": False,
+            "error": "OAuth authorization failed: session identifier missing. This authorization attempt requires session verification.",
+        }
+
+    if consume_result == "SESSION_MISMATCH":
+        return {
+            "success": False,
+            "error": "OAuth authorization failed: cross-session state mismatch. This authorization attempt does not belong to your session.",
+        }
+
+    if not consume_result:
+        return {
+            "success": False,
+            "error": "OAuth authorization failed: invalid, expired, or already-used authorization attempt.",
+        }
+
+    pkce_verifier = consume_result
+
     supabase = get_supabase_client()
     try:
         supabase.auth._storage.set_item(
-            f"{supabase.auth._storage_key}-code-verifier", FIXED_PKCE_VERIFIER
+            f"{supabase.auth._storage_key}-code-verifier", pkce_verifier
         )
         response = supabase.auth.exchange_code_for_session(
-            {"auth_code": code, "code_verifier": FIXED_PKCE_VERIFIER}
+            {"auth_code": code, "code_verifier": pkce_verifier}
         )
         return {"success": True, "data": response}
     except Exception as e:
@@ -168,7 +354,12 @@ def sign_out() -> bool:
 def _load_local_user_data(
     user_id: str, email: Optional[str] = None
 ) -> Dict[str, Any]:
-    """Loads and decrypts user data from .user_store by user_id or email hash."""
+    """Loads and decrypts user data from .user_store by user_id or email hash.
+    
+    Distinguishes legitimate legacy plaintext JSON from encrypted data and corrupted ciphertext.
+    If decryption fails or ciphertext is corrupted/mismatched, raises DecryptionError
+    to prevent partial/empty state from overwriting persisted user data.
+    """
     _ensure_user_store_dir()
     f = _get_fernet()
     candidates = []
@@ -180,38 +371,64 @@ def _load_local_user_data(
     for c in candidates:
         filepath = os.path.join(USER_STORE_DIR, f"{c}.json")
         if os.path.exists(filepath):
-            try:
-                with open(filepath, "r", encoding="utf-8") as fp:
-                    raw = fp.read()
-                if f:
-                    try:
-                        decrypted = f.decrypt(raw.encode()).decode()
-                        data = json.loads(decrypted)
-                    except Exception:
-                        data = json.loads(raw)
-                else:
+            with open(filepath, "r", encoding="utf-8") as fp:
+                raw = fp.read().strip()
+            if not raw:
+                continue
+
+            # Encrypted Fernet payload check
+            if raw.startswith("gAAAAA"):
+                if not f:
+                    raise EncryptionConfigurationError(
+                        "ENCRYPTION_KEY missing or invalid; cannot decrypt existing encrypted user store."
+                    )
+                try:
+                    decrypted = f.decrypt(raw.encode()).decode()
+                    data = json.loads(decrypted)
+                    if isinstance(data, dict):
+                        return data
+                except InvalidToken:
+                    raise DecryptionError(
+                        f"Decryption failed for user store {c}: invalid key or corrupted ciphertext. "
+                        "Preserving existing store without overwrite."
+                    )
+                except Exception as dec_err:
+                    raise DecryptionError(f"Decryption failed for user store {c}: {str(dec_err)}")
+            else:
+                # Legacy plaintext record compatibility
+                try:
                     data = json.loads(raw)
-                if isinstance(data, dict):
-                    return data
-            except Exception:
-                pass
+                    if isinstance(data, dict):
+                        return data
+                except Exception as json_err:
+                    raise DecryptionError(
+                        f"Corrupted user store data in {c}: neither valid ciphertext nor valid JSON ({str(json_err)})."
+                    )
     return {}
 
 
 def _save_local_user_data(
     user_id: str, email: Optional[str], data: Dict[str, Any]
 ):
-    """Encrypts and saves user data to .user_store keyed by both user_id and email."""
+    """Encrypts and saves user data to .user_store keyed by both user_id and email.
+    
+    Fails closed: if ENCRYPTION_KEY is missing, invalid, or encryption fails,
+    raises EncryptionConfigurationError and refuses to write plaintext data.
+    """
     _ensure_user_store_dir()
     f = _get_fernet()
+    if not f:
+        raise EncryptionConfigurationError(
+            "ENCRYPTION_KEY is not configured or is invalid. Refusing to persist local user store in plaintext."
+        )
+
     raw = json.dumps(data)
-    if f:
-        try:
-            payload = f.encrypt(raw.encode()).decode()
-        except Exception:
-            payload = raw
-    else:
-        payload = raw
+    try:
+        payload = f.encrypt(raw.encode()).decode()
+    except Exception as e:
+        raise EncryptionConfigurationError(
+            f"Failed to encrypt user store data: {str(e)}. Aborting local persistence to prevent plaintext exposure."
+        )
 
     keys = []
     if user_id:
@@ -221,11 +438,13 @@ def _save_local_user_data(
 
     for k in keys:
         filepath = os.path.join(USER_STORE_DIR, f"{k}.json")
+        tmp_filepath = filepath + ".tmp"
         try:
-            with open(filepath, "w", encoding="utf-8") as fp:
+            with open(tmp_filepath, "w", encoding="utf-8") as fp:
                 fp.write(payload)
-        except Exception:
-            pass
+            os.replace(tmp_filepath, filepath)
+        except Exception as write_err:
+            raise IOError(f"Failed to atomically persist encrypted user store: {str(write_err)}")
 
 
 def save_user_workspace_state(
@@ -329,6 +548,11 @@ def add_github_account(
     email: Optional[str] = None,
 ) -> bool:
     """Adds a new encrypted GitHub account connection for the user."""
+    # Fail closed check: token must be encryptable if provided
+    encrypted_token = ""
+    if token:
+        encrypted_token = encrypt_secret(token)
+
     data = _load_local_user_data(user_id, email)
     accounts = data.get("github_accounts", [])
     acc_id = f"gh_{int(datetime.now().timestamp())}_{username.lower()}"
@@ -354,7 +578,7 @@ def add_github_account(
                 "user_id": user_id,
                 "account_label": label,
                 "github_username": username,
-                "github_token": encrypt_secret(token),
+                "github_token": encrypted_token,
                 "is_active": True,
             }
         ).execute()
@@ -395,6 +619,10 @@ def attach_pat_to_account(
 ) -> bool:
     """Attaches or updates a Personal Access Token for an existing connected account."""
     clean_tok = token.strip()
+    encrypted_token = ""
+    if clean_tok:
+        encrypted_token = encrypt_secret(clean_tok)
+
     data = _load_local_user_data(user_id, email)
     accounts = data.get("github_accounts", [])
     updated = False
@@ -410,7 +638,7 @@ def attach_pat_to_account(
         try:
             supabase = get_supabase_client()
             supabase.table("user_github_accounts").update(
-                {"github_token": encrypt_secret(clean_tok)}
+                {"github_token": encrypted_token}
             ).eq("id", account_id).eq("user_id", user_id).execute()
         except Exception:
             update_github_token(user_id, clean_tok, email)
@@ -501,6 +729,10 @@ def update_github_token(
     user_id: str, token: str, email: Optional[str] = None
 ) -> bool:
     """Updates the primary GitHub token with encryption."""
+    encrypted_tok = ""
+    if token:
+        encrypted_tok = encrypt_secret(token)
+
     data = _load_local_user_data(user_id, email)
     prof = data.get("profile", {})
     prof["github_token"] = token
@@ -509,7 +741,6 @@ def update_github_token(
 
     try:
         supabase = get_supabase_client()
-        encrypted_tok = encrypt_secret(token)
         supabase.table("profiles").update({"github_token": encrypted_tok}).eq(
             "id", user_id
         ).execute()
@@ -553,6 +784,9 @@ def save_user_api_key(
     if not clean_key:
         return False
 
+    # Fail closed: must encrypt before saving
+    encrypted_key = encrypt_secret(clean_key)
+
     data = _load_local_user_data(user_id, email)
     keys = data.get("api_keys", {})
     keys[clean_prov] = clean_key
@@ -561,7 +795,6 @@ def save_user_api_key(
 
     try:
         supabase = get_supabase_client()
-        encrypted_key = encrypt_secret(clean_key)
         supabase.table("user_api_keys").upsert(
             {
                 "user_id": user_id,
