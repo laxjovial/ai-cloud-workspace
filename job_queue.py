@@ -371,6 +371,10 @@ def run_migrations(conn: sqlite3.Connection) -> None:
                 conn.execute("ALTER TABLE jobs ADD COLUMN sandbox_cleanup_error TEXT;")
             if "sandbox_cleanup_next_retry" not in existing_col_names:
                 conn.execute("ALTER TABLE jobs ADD COLUMN sandbox_cleanup_next_retry REAL;")
+            if "sandbox_cleanup_owner" not in existing_col_names:
+                conn.execute("ALTER TABLE jobs ADD COLUMN sandbox_cleanup_owner TEXT;")
+            if "sandbox_cleanup_generation" not in existing_col_names:
+                conn.execute("ALTER TABLE jobs ADD COLUMN sandbox_cleanup_generation INTEGER NOT NULL DEFAULT 0;")
 
             conn.execute(
                 """
@@ -1384,6 +1388,134 @@ class DurableJobQueue:
                         raise StaleLeaseError(f"Worker '{worker_id}' (gen {lease_generation}) cannot fail side effect '{side_effect_id}'.")
             except sqlite3.Error as e:
                 raise JobQueueError(f"Database error during fail_side_effect: {str(e)}") from e
+
+    def claim_sandbox_cleanup(self, owner_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """Atomically claims orphaned/failed sandboxes for cleanup with owner fencing and generation tokens."""
+        now = time.time()
+        claimed_sandboxes = []
+
+        with self._lock:
+            try:
+                with self.conn:
+                    self.conn.execute("BEGIN IMMEDIATE;")
+                    cursor = self.conn.execute(
+                        """
+                        SELECT id, sandbox_id, sandbox_cleanup_status, sandbox_cleanup_attempts,
+                               sandbox_cleanup_generation
+                        FROM jobs
+                        WHERE sandbox_id IS NOT NULL
+                          AND sandbox_cleanup_status IN ('ORPHANED', 'FAILED', 'MANUAL_INTERVENTION_REQUIRED')
+                          AND (sandbox_cleanup_next_retry IS NULL OR sandbox_cleanup_next_retry <= ?)
+                        ORDER BY sandbox_cleanup_next_retry ASC NULLS FIRST
+                        LIMIT ?;
+                        """,
+                        (now, limit),
+                    )
+                    rows = cursor.fetchall()
+
+                    for r in rows:
+                        job_id = r["id"]
+                        new_gen = (r["sandbox_cleanup_generation"] or 0) + 1
+                        update_cur = self.conn.execute(
+                            """
+                            UPDATE jobs
+                            SET sandbox_cleanup_owner = ?,
+                                sandbox_cleanup_generation = ?
+                            WHERE id = ? AND sandbox_cleanup_status IN ('ORPHANED', 'FAILED', 'MANUAL_INTERVENTION_REQUIRED')
+                              AND sandbox_cleanup_generation = ?;
+                            """,
+                            (owner_id, new_gen, job_id, r["sandbox_cleanup_generation"] or 0),
+                        )
+                        if update_cur.rowcount > 0:
+                            claimed_sandboxes.append({
+                                "id": job_id,
+                                "sandbox_id": r["sandbox_id"],
+                                "sandbox_cleanup_status": r["sandbox_cleanup_status"],
+                                "sandbox_cleanup_attempts": r["sandbox_cleanup_attempts"],
+                                "sandbox_cleanup_generation": new_gen,
+                                "owner_id": owner_id,
+                            })
+
+                return claimed_sandboxes
+            except sqlite3.Error as e:
+                raise JobQueueError(f"Database error during claim_sandbox_cleanup: {str(e)}") from e
+
+    def finalize_sandbox_cleanup(
+        self,
+        job_id: str,
+        sandbox_id: str,
+        owner_id: str,
+        cleanup_generation: int,
+        success: bool,
+        error_message: Optional[str] = None,
+    ) -> bool:
+        """Atomically updates cleanup status conditional on owner_id, sandbox_id, and cleanup_generation."""
+        now = time.time()
+        with self._lock:
+            try:
+                with self.conn:
+                    self.conn.execute("BEGIN IMMEDIATE;")
+                    row = self.conn.execute(
+                        "SELECT sandbox_cleanup_status, sandbox_cleanup_attempts FROM jobs WHERE id = ? AND sandbox_id = ? AND sandbox_cleanup_owner = ? AND sandbox_cleanup_generation = ?;",
+                        (job_id, sandbox_id, owner_id, cleanup_generation),
+                    ).fetchone()
+                    if not row:
+                        return False
+
+                    current_status = row["sandbox_cleanup_status"]
+                    attempts = row["sandbox_cleanup_attempts"] + 1
+
+                    if success:
+                        self.conn.execute(
+                            """
+                            UPDATE jobs
+                            SET sandbox_cleanup_status = 'CLEANED',
+                                sandbox_cleanup_error = NULL,
+                                sandbox_cleanup_owner = NULL
+                            WHERE id = ? AND sandbox_id = ? AND sandbox_cleanup_owner = ? AND sandbox_cleanup_generation = ?;
+                            """,
+                            (job_id, sandbox_id, owner_id, cleanup_generation),
+                        )
+                        self.conn.execute(
+                            """
+                            INSERT INTO job_events (
+                                job_id, event_type, source, message, created_at
+                            ) VALUES (?, 'SANDBOX_CLEANED', 'reconciler', ?, ?);
+                            """,
+                            (job_id, f"Sandbox '{sandbox_id}' successfully destroyed.", now),
+                        )
+                    else:
+                        if current_status == "MANUAL_INTERVENTION_REQUIRED" or attempts >= 10:
+                            new_status = "MANUAL_INTERVENTION_REQUIRED"
+                            next_retry = now + 900.0
+                        else:
+                            new_status = "FAILED"
+                            backoff = min(300.0, 2.0 ** attempts)
+                            next_retry = now + backoff
+
+                        self.conn.execute(
+                            """
+                            UPDATE jobs
+                            SET sandbox_cleanup_status = ?,
+                                sandbox_cleanup_attempts = ?,
+                                sandbox_cleanup_error = ?,
+                                sandbox_cleanup_next_retry = ?,
+                                sandbox_cleanup_owner = NULL
+                            WHERE id = ? AND sandbox_id = ? AND sandbox_cleanup_owner = ? AND sandbox_cleanup_generation = ?;
+                            """,
+                            (new_status, attempts, error_message, next_retry, job_id, sandbox_id, owner_id, cleanup_generation),
+                        )
+                        self.conn.execute(
+                            """
+                            INSERT INTO job_events (
+                                job_id, event_type, source, message, created_at
+                            ) VALUES (?, 'SANDBOX_CLEANUP_FAILED', 'reconciler', ?, ?);
+                            """,
+                            (job_id, f"Sandbox destruction attempt {attempts} failed: {error_message}", now),
+                        )
+                    return True
+            except sqlite3.Error as e:
+                raise JobQueueError(f"Database error during finalize_sandbox_cleanup: {str(e)}") from e
 
     def resolve_manual_cleanup(
         self,

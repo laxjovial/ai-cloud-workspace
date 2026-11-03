@@ -42,6 +42,8 @@ from job_queue import (
 from worker import (
     ExecutionController,
     SandboxReconciler,
+    SupervisorIPCClient,
+    SupervisorIPCServer,
     WorkerSupervisor,
     execute_job_in_worker,
     load_or_create_supervisor_key,
@@ -82,15 +84,77 @@ class MockSandbox:
         return {"success": True, "pr_url": f"https://github.com/{self.repo_name}/pull/42"}
 
 
-def crashing_worker_target(instance_id, db_path, stop_event, ipc_port=None, ipc_token=None):
+def crashing_worker_target(instance_id, db_path, stop_event, ipc_socket_path=None, ipc_token=None):
     """Top-level function pickleable by multiprocessing spawn context."""
     os._exit(1)
 
 
-def env_inspector_worker_target(instance_id, db_path, stop_event, ipc_port=None, ipc_token=None):
+def env_inspector_worker_target(instance_id, db_path, stop_event, ipc_socket_path=None, ipc_token=None):
     """Top-level function pickleable by multiprocessing spawn context."""
     assert "SUPERVISOR_SIGNING_KEY" not in os.environ
     stop_event.set()
+
+
+def hanging_worker_target(inst_id, db_p, stop_ev, sock_p=None, tok=None):
+    """Top-level function pickleable by multiprocessing spawn context."""
+    q = DurableJobQueue(db_path=db_p)
+    with q._lock:
+        with q.conn:
+            q.conn.execute(
+                "INSERT INTO worker_instances (instance_id, pid, start_time, last_heartbeat, status) VALUES (?, ?, ?, ?, 'ALIVE');",
+                (inst_id, os.getpid(), time.time(), time.time()),
+            )
+    q.close()
+    while not stop_ev.is_set():
+        time.sleep(0.1)
+
+
+def mock_worker_target(inst_id, db_p, stop_ev, sock_p=None, tok=None):
+    """Top-level function pickleable by multiprocessing spawn context."""
+    q = DurableJobQueue(db_path=db_p)
+    with q._lock:
+        with q.conn:
+            q.conn.execute(
+                "INSERT INTO worker_instances (instance_id, pid, start_time, last_heartbeat, status) VALUES (?, ?, ?, ?, 'ALIVE');",
+                (inst_id, os.getpid(), time.time(), time.time()),
+            )
+    q.close()
+    while not stop_ev.is_set():
+        time.sleep(0.1)
+
+
+def ipc_recovery_worker_target(inst_id, db_p, stop_ev, sock_p=None, tok=None):
+    """Worker target that executes recovery check via IPC from child process."""
+    q = DurableJobQueue(db_path=db_p)
+    with q._lock:
+        with q.conn:
+            q.conn.execute(
+                "INSERT INTO worker_instances (instance_id, pid, start_time, last_heartbeat, status) VALUES (?, ?, ?, ?, 'ALIVE');",
+                (inst_id, os.getpid(), time.time(), time.time()),
+            )
+    ipc_client = SupervisorIPCClient(socket_path=sock_p, worker_instance_id=inst_id, auth_token=tok)
+
+    # Find job and claim it
+    job = q.conn.execute("SELECT id FROM jobs LIMIT 1;").fetchone()
+    if job:
+        job_id = job["id"]
+        # Find pending recovery side-effect
+        se = q.conn.execute("SELECT * FROM side_effect_ledger WHERE job_id = ?;", (job_id,)).fetchone()
+        if se:
+            is_dead = ipc_client.verify_worker_death(
+                job_id=job_id,
+                instance_id=se["worker_id"],
+                side_effect_id=se["side_effect_id"],
+            )
+            # Record result in a test table or event
+            with q._lock:
+                with q.conn:
+                    q.conn.execute(
+                        "INSERT INTO job_events (job_id, event_type, source, message, created_at) VALUES (?, 'IPC_TEST_RESULT', ?, ?, ?);",
+                        (job_id, inst_id, json.dumps({"is_dead": is_dead}), time.time()),
+                    )
+    q.close()
+    stop_ev.set()
 
 
 class TestPhaseB2WorkerEngine:
@@ -307,23 +371,19 @@ class TestPhaseB2WorkerEngine:
             )
 
     def test_scenario_6_supervisor_forced_termination_fallback(self, test_env):
-        """6. Worker process hangs -> supervisor records reap evidence -> finalizes job."""
+        """6. Real spawned worker child process hangs -> supervisor records reap evidence -> finalizes job."""
         queue = test_env["queue"]
-        signing_key = test_env["signing_key"]
-        inst_id = "worker_hung_1"
-        pid = 99999
+        db_path = test_env["db_path"]
+        key_path = test_env["key_path"]
 
-        reap_proof = queue.record_process_reap(
-            instance_id=inst_id,
-            pid=pid,
-            start_time=time.time() - 30.0,
-            exit_code=-9,
-            exit_signal=9,
-            supervisor_id="supervisor_alpha",
-            proof_type="PARENT_WAITPID",
-            supervisor_signing_key=signing_key,
-        )
+        sup = WorkerSupervisor(db_path=db_path, concurrency=1, signing_key_path=key_path)
 
+        sup.start_worker_slot("slot_hang", custom_target=hanging_worker_target)
+        slot_info = sup._workers["slot_hang"]
+        inst_id = slot_info["instance_id"]
+        pid = slot_info["pid"]
+
+        # Enqueue and claim a job under this real spawned worker child
         job = queue.enqueue_job(
             user_id="user_alice",
             session_id="sess_1",
@@ -333,31 +393,53 @@ class TestPhaseB2WorkerEngine:
         claimed = queue.claim_next_job(worker_id=inst_id, lease_duration_seconds=30.0)
         gen = claimed["lease_generation"]
 
+        # Supervisor terminates the real running child worker and records authoritative reap proof
+        sup.stop_worker_slot("slot_hang", grace_seconds=0.2)
+
+        # Retrieve authoritative reap proof recorded by supervisor
+        reap_row = queue.conn.execute(
+            "SELECT * FROM worker_instances WHERE instance_id = ?;", (inst_id,)
+        ).fetchone()
+        assert reap_row["status"] == "DEAD"
+        assert reap_row["pid"] == pid
+        assert reap_row["reap_token"] is not None
+        assert reap_row["reap_signature"] is not None
+
+        # Supervisor finalizes job using real reap proof
         finalized = queue.supervisor_finalize_job(
             job_id=job["id"],
             expected_lease_generation=gen,
             target_status="CANCELLED",
-            supervisor_id="supervisor_alpha",
+            supervisor_id=sup.supervisor_id,
             authority_proof={
                 "type": "FORCED_KILL",
                 "worker_instance_id": inst_id,
-                "reap_token": reap_proof["reap_token"],
-                "reap_signature": reap_proof["reap_signature"],
+                "reap_token": reap_row["reap_token"],
+                "reap_signature": reap_row["reap_signature"],
             },
             reason="Watchdog detected hung process; SIGKILL executed.",
-            supervisor_signing_key=signing_key,
+            supervisor_signing_key=sup.signing_key,
         )
 
         assert finalized["status"] == "CANCELLED"
         assert finalized["lease_generation"] == gen + 1
+        sup.shutdown()
 
     def test_scenario_7_blocked_command_forced_interruption(self, test_env):
-        """7. Active tool call hangs -> timeout watchdog trips controller.abort()."""
+        """7. Active command hangs -> watchdog interrupts and controller halts execution."""
         controller = ExecutionController(job_id="job_hang", timeout_seconds=0.2)
         assert not controller.is_aborted()
 
-        time.sleep(0.3)
-        assert controller.is_aborted()
+        # Simulate command execution loop checking controller status
+        command_interrupted = False
+        start_t = time.monotonic()
+        while time.monotonic() - start_t < 1.0:
+            if controller.is_aborted():
+                command_interrupted = True
+                break
+            time.sleep(0.05)
+
+        assert command_interrupted
         assert "timeout" in controller.abort_reason.lower()
 
     def test_scenario_8_crash_and_reclaim_precondition(self, test_env):
@@ -460,9 +542,16 @@ class TestPhaseB2WorkerEngine:
         assert resolved["status"] == "FAILED"
 
     def test_scenario_10_contextual_side_effect_gate(self, test_env):
-        """10. Side-effect recovery requires contextual proof of prior worker process termination."""
+        """10. Side-effect recovery requires contextual proof of prior worker process termination via authenticated supervisor IPC."""
         queue = test_env["queue"]
-        signing_key = test_env["signing_key"]
+        db_path = test_env["db_path"]
+        key_path = test_env["key_path"]
+
+        sup = WorkerSupervisor(db_path=db_path, concurrency=1, signing_key_path=key_path)
+
+        sup.start_worker_slot("slot_A", custom_target=mock_worker_target)
+        slot_A = sup._workers["slot_A"]
+        inst_A = slot_A["instance_id"]
 
         job = queue.enqueue_job(
             user_id="user_alice",
@@ -471,82 +560,89 @@ class TestPhaseB2WorkerEngine:
             payload={"prompt": "PR task"},
         )
 
-        # Worker A reserves intent
+        # Worker A claims job and reserves intent
+        claimed_A = queue.claim_next_job(worker_id=inst_A, lease_duration_seconds=30.0)
         se_id, status, _ = queue.reserve_side_effect(
             job_id=job["id"],
-            worker_id="worker_A",
-            lease_generation=1,
+            worker_id=inst_A,
+            lease_generation=claimed_A["lease_generation"],
             action_type="CREATE_PULL_REQUEST",
             action_key="pr_1",
             intent_payload={"branch": "ai-cloud/job-1"},
         )
         assert status == "PENDING"
 
-        # Worker B attempts recovery while Worker A is NOT verified dead
-        is_dead = queue.supervisor_verify_worker_death(
+        # Spawn Worker B to attempt recovery
+        sup.start_worker_slot("slot_B", custom_target=mock_worker_target)
+        slot_B = sup._workers["slot_B"]
+        inst_B = slot_B["instance_id"]
+        ipc_client_B = SupervisorIPCClient(
+            socket_path=sup.ipc_server.socket_path,
+            worker_instance_id=inst_B,
+            auth_token=slot_B["auth_token"],
+        )
+
+        # Worker B attempts recovery over IPC while Worker A is ALIVE -> rejected!
+        is_dead = ipc_client_B.verify_worker_death(
             job_id=job["id"],
-            instance_id="worker_A",
+            instance_id=inst_A,
             side_effect_id=se_id,
-            supervisor_signing_key=signing_key,
         )
         assert not is_dead
 
-        # Now supervisor authoritatively reaps worker A
-        reap_proof = queue.record_process_reap(
-            instance_id="worker_A",
-            pid=12345,
-            start_time=time.time() - 20.0,
-            exit_code=1,
-            exit_signal=None,  # All termination modes accepted!
-            supervisor_id="supervisor_alpha",
-            proof_type="PARENT_WAITPID",
-            supervisor_signing_key=signing_key,
-        )
+        # Now supervisor stops slot A and records authoritative reap proof
+        sup.stop_worker_slot("slot_A", grace_seconds=0.2)
 
-        # Now contextual verification succeeds!
-        is_dead = queue.supervisor_verify_worker_death(
+        # Now Worker B claims expired job and requests IPC verification -> succeeds!
+        with queue._lock:
+            with queue.conn:
+                queue.conn.execute("UPDATE jobs SET status = 'QUEUED', worker_id = NULL, lease_expires_at = NULL WHERE id = ?;", (job["id"],))
+
+        claimed_B = queue.claim_next_job(worker_id=inst_B, lease_duration_seconds=30.0)
+        assert claimed_B is not None
+
+        is_dead = ipc_client_B.verify_worker_death(
             job_id=job["id"],
-            instance_id="worker_A",
+            instance_id=inst_A,
             side_effect_id=se_id,
-            supervisor_signing_key=signing_key,
         )
         assert is_dead
 
-        # Worker B can now safely confirm side effect after remote reconciliation
+        # Worker B confirms side-effect under its lease generation
         queue.confirm_side_effect(
             side_effect_id=se_id,
-            worker_id="worker_B",
-            lease_generation=2,
+            worker_id=inst_B,
+            lease_generation=claimed_B["lease_generation"],
             confirmed_result={"pr_url": "https://github.com/owner/repo/pull/1"},
             is_recovery=True,
         )
 
-        # Old worker A awakens as a zombie and tries to confirm -> strictly fenced!
+        # Stale worker A awakens and tries to confirm -> strictly fenced!
         with pytest.raises(StaleLeaseError):
             queue.confirm_side_effect(
                 side_effect_id=se_id,
-                worker_id="worker_A",
-                lease_generation=1,
+                worker_id=inst_A,
+                lease_generation=claimed_A["lease_generation"],
                 confirmed_result={"pr_url": "https://github.com/owner/repo/pull/zombie"},
             )
 
+        sup.shutdown()
+
     def test_scenario_11_supervisor_restart_continuity(self, test_env):
-        """11. Supervisor restarts after recording reap signatures -> persistent key validates continuity."""
+        """11. Supervisor restarts after terminating real child process -> persistent key validates continuity."""
         db_path = test_env["db_path"]
         key_path = test_env["key_path"]
 
-        # Run supervisor 1
+        # Run supervisor 1 and spawn real worker child
         sup1 = WorkerSupervisor(db_path=db_path, concurrency=1, signing_key_path=key_path)
-        reap_proof = sup1.queue.record_process_reap(
-            instance_id="worker_prior_run",
-            pid=5555,
-            start_time=time.time() - 50.0,
-            exit_code=0,
-            exit_signal=None,
-            supervisor_id=sup1.supervisor_id,
-            proof_type="PARENT_WAITPID",
-            supervisor_signing_key=sup1.signing_key,
-        )
+
+        sup1.start_worker_slot("slot_prior", custom_target=mock_worker_target)
+        slot_info = sup1._workers["slot_prior"]
+        prior_inst_id = slot_info["instance_id"]
+        prior_pid = slot_info["pid"]
+
+        # Terminate real child and record authoritative reap signature
+        sup1.stop_worker_slot("slot_prior", grace_seconds=0.2)
         sup1.shutdown()
 
         # Start replacement supervisor 2 pointing to same persistent key
@@ -555,9 +651,11 @@ class TestPhaseB2WorkerEngine:
 
         # Replacement supervisor verifies signature from supervisor 1 run
         inst_row = sup2.queue.conn.execute(
-            "SELECT * FROM worker_instances WHERE instance_id = 'worker_prior_run';"
+            "SELECT * FROM worker_instances WHERE instance_id = ?;", (prior_inst_id,)
         ).fetchone()
 
+        assert inst_row["status"] == "DEAD"
+        assert inst_row["pid"] == prior_pid
         canonical_payload = {
             "version": "v1",
             "proof_type": inst_row["proof_type"],
@@ -576,10 +674,17 @@ class TestPhaseB2WorkerEngine:
 
     def test_scenario_12_fail_closed_pr_reconciliation(self, test_env):
         """12. GitHub API error during reconciliation check fails closed without creating duplicate PR."""
-        queue = test_env["queue"]
-        signing_key = test_env["signing_key"]
+        db_path = test_env["db_path"]
+        key_path = test_env["key_path"]
 
-        # Simulate prior crashed worker with PENDING intent and verified reap record
+        sup = WorkerSupervisor(db_path=db_path, concurrency=1, signing_key_path=key_path)
+        queue = sup.queue
+
+        # Spawn prior worker, create intent, and reap it via supervisor
+        sup.start_worker_slot("slot_prior_gh", custom_target=mock_worker_target)
+        prior_info = sup._workers["slot_prior_gh"]
+        prior_worker_id = prior_info["instance_id"]
+
         job = queue.enqueue_job(
             user_id="user_alice",
             session_id="sess_1",
@@ -588,46 +693,55 @@ class TestPhaseB2WorkerEngine:
         )
         se_id, _, _ = queue.reserve_side_effect(
             job_id=job["id"],
-            worker_id="prior_worker",
+            worker_id=prior_worker_id,
             lease_generation=1,
             action_type="CREATE_PULL_REQUEST",
             action_key=f"pr_{job['id'][:8]}",
             intent_payload={"branch_name": f"ai-cloud/job-{job['id'][:8]}", "repository": "owner/repo"},
         )
-        queue.record_process_reap(
-            instance_id="prior_worker",
-            pid=8888,
-            start_time=time.time() - 30.0,
-            exit_code=1,
-            exit_signal=None,
-            supervisor_id="supervisor_test",
-            proof_type="PARENT_WAITPID",
-            supervisor_signing_key=signing_key,
+        sup.stop_worker_slot("slot_prior_gh", grace_seconds=0.2)
+
+        # Spawn worker 1 to attempt reconciliation
+        sup.start_worker_slot("slot_active_gh", custom_target=mock_worker_target)
+        active_info = sup._workers["slot_active_gh"]
+        active_worker_id = active_info["instance_id"]
+        ipc_client = SupervisorIPCClient(
+            socket_path=sup.ipc_server.socket_path,
+            worker_instance_id=active_worker_id,
+            auth_token=active_info["auth_token"],
         )
 
         class BrokenGitHubClient:
             def get_pulls(self, **kwargs):
                 raise Exception("GitHub API 500: Server Error / Rate Limit Exceeded.")
 
-        claimed = queue.claim_next_job(worker_id="worker_gh_1")
-        controller = ExecutionController(job_id=job["id"])
+        claimed = queue.claim_next_job(worker_id=active_worker_id)
+        controller = ExecutionController(job_id=job["id"], ipc_client=ipc_client)
 
         # Worker attempts recovery with broken client -> fails closed
         with pytest.raises(Exception, match="GitHub API 500"):
             execute_job_in_worker(
                 job=claimed,
-                worker_id="worker_gh_1",
+                worker_id=active_worker_id,
                 lease_gen=claimed["lease_generation"],
                 queue=queue,
                 controller=controller,
                 sandbox_factory=lambda repo_name, github_token: MockSandbox(repo_name),
                 github_client_factory=lambda: BrokenGitHubClient(),
             )
+        sup.shutdown()
 
     def test_scenario_13_pr_idempotency_across_all_states(self, test_env):
         """13. PR was merged/closed on GitHub before retry -> worker detects and adopts existing PR."""
-        queue = test_env["queue"]
-        signing_key = test_env["signing_key"]
+        db_path = test_env["db_path"]
+        key_path = test_env["key_path"]
+
+        sup = WorkerSupervisor(db_path=db_path, concurrency=1, signing_key_path=key_path)
+        queue = sup.queue
+
+        sup.start_worker_slot("slot_prior_closed", custom_target=mock_worker_target)
+        prior_info = sup._workers["slot_prior_closed"]
+        prior_worker_id = prior_info["instance_id"]
 
         job = queue.enqueue_job(
             user_id="user_alice",
@@ -637,21 +751,21 @@ class TestPhaseB2WorkerEngine:
         )
         se_id, _, _ = queue.reserve_side_effect(
             job_id=job["id"],
-            worker_id="prior_worker_closed",
+            worker_id=prior_worker_id,
             lease_generation=1,
             action_type="CREATE_PULL_REQUEST",
             action_key=f"pr_{job['id'][:8]}",
             intent_payload={"branch_name": f"ai-cloud/job-{job['id'][:8]}", "repository": "owner/repo"},
         )
-        queue.record_process_reap(
-            instance_id="prior_worker_closed",
-            pid=7777,
-            start_time=time.time() - 30.0,
-            exit_code=1,
-            exit_signal=None,
-            supervisor_id="supervisor_test",
-            proof_type="PARENT_WAITPID",
-            supervisor_signing_key=signing_key,
+        sup.stop_worker_slot("slot_prior_closed", grace_seconds=0.2)
+
+        sup.start_worker_slot("slot_active_adopt", custom_target=mock_worker_target)
+        active_info = sup._workers["slot_active_adopt"]
+        active_worker_id = active_info["instance_id"]
+        ipc_client = SupervisorIPCClient(
+            socket_path=sup.ipc_server.socket_path,
+            worker_instance_id=active_worker_id,
+            auth_token=active_info["auth_token"],
         )
 
         class PreExistingGitHubClient:
@@ -659,12 +773,12 @@ class TestPhaseB2WorkerEngine:
                 assert state == "all"
                 return [{"html_url": "https://github.com/owner/repo/pull/99", "state": "closed"}]
 
-        claimed = queue.claim_next_job(worker_id="worker_gh_2")
-        controller = ExecutionController(job_id=job["id"])
+        claimed = queue.claim_next_job(worker_id=active_worker_id)
+        controller = ExecutionController(job_id=job["id"], ipc_client=ipc_client)
 
         execute_job_in_worker(
             job=claimed,
-            worker_id="worker_gh_2",
+            worker_id=active_worker_id,
             lease_gen=claimed["lease_generation"],
             queue=queue,
             controller=controller,
@@ -675,6 +789,7 @@ class TestPhaseB2WorkerEngine:
 
         final_job = queue.get_job(job["id"], user_id="user_alice")
         assert final_job["status"] == "COMPLETED"
+        sup.shutdown()
 
     def test_scenario_14_supervisor_crash_loop_protection(self, test_env):
         """14. Child worker repeatedly crashes on startup -> supervisor applies backoff and pauses slot."""
@@ -691,10 +806,35 @@ class TestPhaseB2WorkerEngine:
         sup.shutdown()
 
     def test_scenario_15_spawned_worker_credential_isolation(self, test_env):
-        """15. Inspect child process environment and memory: zero supervisor keys or LLM keys leaked."""
+        """15. Inspect child process environment and memory: zero supervisor keys leaked and missing credentials fail closed."""
         key_path = test_env["key_path"]
         sup = WorkerSupervisor(db_path=test_env["db_path"], concurrency=1, signing_key_path=key_path)
         sup.start_worker_slot("slot_sec", custom_target=env_inspector_worker_target)
         time.sleep(0.5)
         sup.supervise_step()
         sup.shutdown()
+
+        # Strict Fail-Closed Verification: Job requiring API credentials fails closed if missing from secure tenant store
+        queue = test_env["queue"]
+        job_unauth = queue.enqueue_job(
+            user_id="user_unauth",
+            session_id="sess_unauth",
+            repository="owner/repo",
+            payload={"prompt": "Task with missing credentials", "model": "gemini/gemini-2.5-flash"},
+            credential_refs={"github": {"key_ref": "sec_gh"}, "gemini": {"key_ref": "sec_gem"}},
+        )
+        claimed_unauth = queue.claim_next_job(worker_id="worker_unauth")
+        controller_unauth = ExecutionController(job_id=job_unauth["id"])
+
+        with pytest.raises(JobQueueError, match="Security violation"):
+            execute_job_in_worker(
+                job=claimed_unauth,
+                worker_id="worker_unauth",
+                lease_gen=claimed_unauth["lease_generation"],
+                queue=queue,
+                controller=controller_unauth,
+                sandbox_factory=lambda repo_name, github_token: MockSandbox(repo_name),
+            )
+
+        failed_job = queue.get_job(job_unauth["id"], user_id="user_unauth")
+        assert failed_job["status"] == "FAILED"

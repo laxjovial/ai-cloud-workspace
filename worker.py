@@ -79,6 +79,7 @@ class ExecutionController:
         queue: Optional[DurableJobQueue] = None,
         timeout_seconds: float = 600.0,
         ipc_client: Optional[Any] = None,
+        github_client_factory: Optional[Callable[..., Any]] = None,
     ):
         self.job_id = job_id
         self.worker_id = worker_id
@@ -86,6 +87,7 @@ class ExecutionController:
         self.queue = queue
         self.timeout_seconds = timeout_seconds
         self.ipc_client = ipc_client
+        self.github_client_factory = github_client_factory
 
         self._abort_event = threading.Event()
         self._abort_reason: str = ""
@@ -124,7 +126,10 @@ class ExecutionController:
         pr_title: str,
         pr_body: str,
     ) -> Dict[str, Any]:
-        """Integrated hook executing fenced side-effect reservation, creation, and confirmation."""
+        """Unified authoritative hook executing fenced side-effect reservation, recovery, creation, and confirmation."""
+        if not self.queue:
+            raise JobQueueError("ExecutionController requires active queue for side-effect operations.")
+
         action_type = "CREATE_PULL_REQUEST"
         action_key = f"pr_{self.job_id[:8]}"
         scoped_branch = f"ai-cloud/job-{self.job_id[:8]}"
@@ -146,31 +151,50 @@ class ExecutionController:
         if se_status == "PENDING_RECOVERY":
             prior_worker_id = se_data.get("prior_worker_id")
             # Enforce Phase 1 Process-Fencing Gate via Authenticated Supervisor IPC
-            is_dead = False
-            if self.ipc_client:
-                is_dead = self.ipc_client.verify_worker_death(
-                    job_id=self.job_id,
-                    instance_id=prior_worker_id,
-                    side_effect_id=se_id,
+            if not self.ipc_client:
+                raise SideEffectReconciliationBlockedError(
+                    f"IPC client is required for recovery of side effect '{se_id}'. Direct queue bypass prohibited."
                 )
-            else:
-                # In-process fallback if IPC client unavailable
-                is_dead = self.queue.supervisor_verify_worker_death(
-                    job_id=self.job_id,
-                    instance_id=prior_worker_id,
-                    side_effect_id=se_id,
-                    supervisor_signing_key=getattr(self.queue, "_active_supervisor_key", b"test_key"),
-                )
+
+            is_dead = self.ipc_client.verify_worker_death(
+                job_id=self.job_id,
+                instance_id=prior_worker_id,
+                side_effect_id=se_id,
+            )
 
             if not is_dead:
                 raise SideEffectReconciliationBlockedError(
                     f"Previous worker '{prior_worker_id}' termination cannot be cryptographically verified."
                 )
 
-            # Phase 2: Remote Provider Query
-            # If PR exists remotely, adopt it
-            # Otherwise mark FAILED_VERIFIED and allow new creation
-            pass
+            # Phase 2: Authoritative Remote Provider Query across all PR states
+            pr_found = False
+            matching_pr_url = None
+            if self.github_client_factory:
+                gh_client = self.github_client_factory()
+                pulls = gh_client.get_pulls(state="all", head=scoped_branch)
+                if pulls:
+                    pr_found = True
+                    matching_pr_url = pulls[0].get("html_url")
+
+            if pr_found and matching_pr_url:
+                self.queue.confirm_side_effect(
+                    side_effect_id=se_id,
+                    worker_id=self.worker_id,
+                    lease_generation=self.lease_generation,
+                    confirmed_result={"pr_url": matching_pr_url, "adopted": True},
+                    is_recovery=True,
+                )
+                return {"success": True, "pr_url": matching_pr_url, "adopted": True}
+            else:
+                self.queue.fail_side_effect(
+                    side_effect_id=se_id,
+                    worker_id=self.worker_id,
+                    lease_generation=self.lease_generation,
+                    reason="Verified absent on remote provider.",
+                    is_recovery=True,
+                )
+                # Proceed below to re-execute creation under new lease
 
         # 2. Execute PR creation via sandbox using scoped branch name
         res = sandbox.commit_and_create_pr(
@@ -221,106 +245,68 @@ class SandboxReconciler:
             raise
 
     def reconcile_orphans(self) -> int:
-        """Finds jobs with orphaned, failed, or safety-audit sandboxes and destroys them with concurrency safety."""
+        """Finds jobs with orphaned, failed, or safety-audit sandboxes and destroys them with generation-fenced cleanup ownership."""
         now = time.time()
         cleaned_count = 0
+        owner_id = f"reconciler_{os.getpid()}_{threading.get_ident()}"
 
-        with self.queue._lock:
-            cursor = self.queue.conn.execute(
-                """
-                SELECT id, sandbox_id, sandbox_cleanup_status, sandbox_cleanup_attempts, sandbox_cleanup_next_retry
-                FROM jobs
-                WHERE sandbox_id IS NOT NULL
-                  AND sandbox_cleanup_status IN ('ORPHANED', 'FAILED', 'MANUAL_INTERVENTION_REQUIRED')
-                  AND (sandbox_cleanup_next_retry IS NULL OR sandbox_cleanup_next_retry <= ?);
-                """,
-                (now,),
-            )
-            rows = cursor.fetchall()
+        # 1. Atomically claim cleanup ownership under generation token
+        claimed_jobs = self.queue.claim_sandbox_cleanup(owner_id=owner_id, limit=20)
+        if not claimed_jobs:
+            return 0
 
-        for row in rows:
-            job_id = row["id"]
-            sandbox_id = row["sandbox_id"]
-            current_status = row["sandbox_cleanup_status"]
-            attempts = row["sandbox_cleanup_attempts"] + 1
+        for job in claimed_jobs:
+            job_id = job["id"]
+            sandbox_id = job["sandbox_id"]
+            cleanup_gen = job["sandbox_cleanup_generation"]
 
             try:
                 self.e2b_kill_fn(sandbox_id)
-                # Success -> transition to CLEANED
-                with self.queue._lock:
-                    with self.queue.conn:
-                        self.queue.conn.execute("BEGIN IMMEDIATE;")
-                        self.queue.conn.execute(
-                            """
-                            UPDATE jobs
-                            SET sandbox_cleanup_status = 'CLEANED',
-                                sandbox_cleanup_error = NULL
-                            WHERE id = ?;
-                            """,
-                            (job_id,),
-                        )
-                        self.queue.conn.execute(
-                            """
-                            INSERT INTO job_events (
-                                job_id, event_type, source, message, created_at
-                            ) VALUES (?, 'SANDBOX_CLEANED', 'reconciler', ?, ?);
-                            """,
-                            (job_id, f"Sandbox '{sandbox_id}' successfully destroyed.", time.time()),
-                        )
-                cleaned_count += 1
+                # Success -> finalize cleanup conditionally under ownership and generation
+                finalized = self.queue.finalize_sandbox_cleanup(
+                    job_id=job_id,
+                    sandbox_id=sandbox_id,
+                    owner_id=owner_id,
+                    cleanup_generation=cleanup_gen,
+                    success=True,
+                )
+                if finalized:
+                    cleaned_count += 1
             except Exception as e:
                 err_msg = str(e)
-                if current_status == "MANUAL_INTERVENTION_REQUIRED" or attempts >= 10:
-                    new_status = "MANUAL_INTERVENTION_REQUIRED"
-                    next_retry = now + 900.0  # Periodic 15-minute safety audit cycle
-                else:
-                    new_status = "FAILED"
-                    backoff = min(300.0, 2.0 ** attempts)
-                    next_retry = now + backoff
-
-                with self.queue._lock:
-                    with self.queue.conn:
-                        self.queue.conn.execute("BEGIN IMMEDIATE;")
-                        self.queue.conn.execute(
-                            """
-                            UPDATE jobs
-                            SET sandbox_cleanup_status = ?,
-                                sandbox_cleanup_attempts = ?,
-                                sandbox_cleanup_error = ?,
-                                sandbox_cleanup_next_retry = ?
-                            WHERE id = ?;
-                            """,
-                            (new_status, attempts, err_msg, next_retry, job_id),
-                        )
-                        self.queue.conn.execute(
-                            """
-                            INSERT INTO job_events (
-                                job_id, event_type, source, message, created_at
-                            ) VALUES (?, 'SANDBOX_CLEANUP_FAILED', 'reconciler', ?, ?);
-                            """,
-                            (job_id, f"Sandbox destruction attempt {attempts} failed: {err_msg}", time.time()),
-                        )
+                self.queue.finalize_sandbox_cleanup(
+                    job_id=job_id,
+                    sandbox_id=sandbox_id,
+                    owner_id=owner_id,
+                    cleanup_generation=cleanup_gen,
+                    success=False,
+                    error_message=err_msg,
+                )
 
         return cleaned_count
 
 
 class SupervisorIPCServer:
-    """Loopback IPC server running inside WorkerSupervisor providing authenticated verification to child workers."""
+    """Unix domain socket IPC server running inside WorkerSupervisor providing authenticated verification to child workers."""
 
     def __init__(
         self,
         supervisor: "WorkerSupervisor",
-        auth_token: str,
-        host: str = "127.0.0.1",
-        port: int = 0,
+        socket_path: Optional[str] = None,
     ):
         self.supervisor = supervisor
-        self.auth_token = auth_token
-        self.host = host
-        self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._server_sock.bind((self.host, port))
-        self.port = self._server_sock.getsockname()[1]
+        self.socket_path = socket_path or f"/tmp/ai_cloud_ipc_{supervisor.supervisor_id}.sock"
+        if os.path.exists(self.socket_path):
+            try:
+                os.unlink(self.socket_path)
+            except OSError:
+                pass
+        self._server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._server_sock.bind(self.socket_path)
+        try:
+            os.chmod(self.socket_path, 0o600)
+        except OSError:
+            pass
         self._server_sock.listen(10)
         self._stop_event = threading.Event()
         self._thread = threading.Thread(target=self._serve, daemon=True)
@@ -334,11 +320,16 @@ class SupervisorIPCServer:
             self._server_sock.close()
         except Exception:
             pass
+        if os.path.exists(self.socket_path):
+            try:
+                os.unlink(self.socket_path)
+            except OSError:
+                pass
 
     def _serve(self) -> None:
         while not self._stop_event.is_set():
             try:
-                conn, addr = self._server_sock.accept()
+                conn, _ = self._server_sock.accept()
                 threading.Thread(target=self._handle_client, args=(conn,), daemon=True).start()
             except Exception:
                 if self._stop_event.is_set():
@@ -347,25 +338,64 @@ class SupervisorIPCServer:
     def _handle_client(self, conn: socket.socket) -> None:
         with conn:
             try:
+                # 1. Peer credentials extraction via SO_PEERCRED (Linux)
+                # struct ucred: pid_t pid, uid_t uid, gid_t gid (3 integers, 12 bytes)
+                import struct
+                peer_cred_bytes = conn.getsockopt(socket.SOL_SOCKET, 17, 12)
+                peer_pid, peer_uid, peer_gid = struct.unpack("3i", peer_cred_bytes)
+
                 data = conn.recv(4096).decode("utf-8")
                 if not data:
                     return
                 req = json.loads(data)
 
-                # Verify caller authentication token
-                if not hmac.compare_digest(req.get("auth_token", ""), self.auth_token):
-                    conn.sendall(json.dumps({"success": False, "error": "Unauthorized"}).encode("utf-8"))
-                    return
+                worker_instance_id = req.get("worker_instance_id")
+                worker_auth_token = req.get("auth_token", "")
+
+                # 2. Authenticate worker instance: verify per-worker token and match peer PID
+                # Note: Test or external processes may also request verification if matching token and pid
+                slot_info = self.supervisor.get_worker_slot_by_instance(worker_instance_id)
+                registered_pid = slot_info.get("pid") if slot_info else None
+                expected_token = slot_info.get("auth_token", "") if slot_info else None
+
+                # If caller is the supervisor process itself or registered worker instance
+                caller_is_supervisor = (peer_pid == os.getpid())
+                caller_is_worker = (slot_info and registered_pid == peer_pid and hmac.compare_digest(worker_auth_token, expected_token))
+
+                if not (caller_is_supervisor or caller_is_worker):
+                    if not slot_info:
+                        conn.sendall(json.dumps({"success": False, "error": f"Unknown or unmanaged worker instance '{worker_instance_id}'."}).encode("utf-8"))
+                        return
+                    if not hmac.compare_digest(worker_auth_token, expected_token):
+                        conn.sendall(json.dumps({"success": False, "error": "Invalid worker authentication token."}).encode("utf-8"))
+                        return
+                    if registered_pid != peer_pid:
+                        conn.sendall(json.dumps({
+                            "success": False,
+                            "error": f"PID spoofing rejected: connection peer PID {peer_pid} does not match registered PID {registered_pid} for worker '{worker_instance_id}'."
+                        }).encode("utf-8"))
+                        return
 
                 action = req.get("action")
                 if action == "verify_worker_death":
                     job_id = req.get("job_id")
-                    instance_id = req.get("instance_id")
+                    prior_instance_id = req.get("instance_id")
                     side_effect_id = req.get("side_effect_id")
+
+                    # Verify calling worker currently holds the active lease on job_id
+                    current_job = self.supervisor.queue.conn.execute(
+                        "SELECT worker_id, status FROM jobs WHERE id = ?;", (job_id,)
+                    ).fetchone()
+                    if not current_job or current_job["worker_id"] != worker_instance_id:
+                        conn.sendall(json.dumps({
+                            "success": False,
+                            "error": f"Caller worker '{worker_instance_id}' is not the current leaseholder for job '{job_id}'."
+                        }).encode("utf-8"))
+                        return
 
                     is_dead = self.supervisor.queue.supervisor_verify_worker_death(
                         job_id=job_id,
-                        instance_id=instance_id,
+                        instance_id=prior_instance_id,
                         side_effect_id=side_effect_id,
                         supervisor_signing_key=self.supervisor.signing_key,
                     )
@@ -377,18 +407,22 @@ class SupervisorIPCServer:
 
 
 class SupervisorIPCClient:
-    """Client used by worker child processes to communicate with supervisor IPC server."""
+    """Client used by worker child processes to communicate with supervisor IPC server over Unix domain socket."""
 
-    def __init__(self, port: int, auth_token: str, host: str = "127.0.0.1"):
-        self.port = port
+    def __init__(self, socket_path: str, worker_instance_id: str, auth_token: str):
+        self.socket_path = socket_path
+        self.worker_instance_id = worker_instance_id
         self.auth_token = auth_token
-        self.host = host
 
     def verify_worker_death(self, job_id: str, instance_id: str, side_effect_id: str) -> bool:
         """Requests supervisor verification of prior worker process termination."""
         try:
-            with socket.create_connection((self.host, self.port), timeout=5.0) as sock:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            with sock:
+                sock.settimeout(5.0)
+                sock.connect(self.socket_path)
                 req = {
+                    "worker_instance_id": self.worker_instance_id,
                     "auth_token": self.auth_token,
                     "action": "verify_worker_death",
                     "job_id": job_id,
@@ -398,10 +432,13 @@ class SupervisorIPCClient:
                 sock.sendall(json.dumps(req).encode("utf-8"))
                 resp_data = sock.recv(4096).decode("utf-8")
                 resp = json.loads(resp_data)
+                if not resp.get("success"):
+                    logger.warning(f"Supervisor IPC returned error: {resp.get('error')}")
                 if resp.get("success"):
                     return bool(resp.get("is_dead"))
                 return False
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Supervisor IPC request failed: {e}")
             return False
 
 
@@ -494,16 +531,20 @@ def execute_job_in_worker(
             sb_id = f"sb_{uuid.uuid4().hex[:12]}"
 
         controller.set_sandbox_id(sb_id)
+        if github_client_factory:
+            controller.github_client_factory = github_client_factory
 
         # 3. Register Sandbox Container with Fencing
         queue.register_sandbox(job_id, sb_id, worker_id, lease_gen)
         queue.append_log(job_id, worker_id, lease_gen, f"Cloud sandbox '{sb_id}' provisioned and registered.")
 
-        # 4. Check for Side-Effect Recovery (Phase 1 Process-Death Gate + Phase 2 Remote Query)
+        # 4. Check for Side-Effect Recovery (Unified through controller hook)
+        # Note: PR reservation, contextual supervisor verification, remote query across all PR states,
+        # and confirmation/failure are authoritative inside controller.on_create_pull_request()
+        # If an abandoned intent exists, check and recover it Authoritatively
+        scoped_branch = f"ai-cloud/job-{job_id[:8]}"
         action_type = "CREATE_PULL_REQUEST"
         action_key = f"pr_{job_id[:8]}"
-        scoped_branch = f"ai-cloud/job-{job_id[:8]}"
-
         se_id, se_status, se_data = queue.reserve_side_effect(
             job_id=job_id,
             worker_id=worker_id,
@@ -512,30 +553,17 @@ def execute_job_in_worker(
             action_key=action_key,
             intent_payload={"branch_name": scoped_branch, "repository": repo_name},
         )
-
         if se_status == "PENDING_RECOVERY":
             prior_worker_id = se_data.get("prior_worker_id")
-            queue.append_log(
-                job_id, worker_id, lease_gen,
-                f"Detected abandoned side effect '{se_id}' from worker '{prior_worker_id}'. Requesting supervisor verification.",
+            if not controller.ipc_client:
+                raise SideEffectReconciliationBlockedError(
+                    f"IPC client is required for recovery of side effect '{se_id}'. Direct queue bypass prohibited."
+                )
+            is_dead = controller.ipc_client.verify_worker_death(
+                job_id=job_id,
+                instance_id=prior_worker_id,
+                side_effect_id=se_id,
             )
-
-            # Query supervisor verification (Contextual Verification via IPC or supervisor key)
-            is_dead = False
-            if controller.ipc_client:
-                is_dead = controller.ipc_client.verify_worker_death(
-                    job_id=job_id,
-                    instance_id=prior_worker_id,
-                    side_effect_id=se_id,
-                )
-            else:
-                is_dead = queue.supervisor_verify_worker_death(
-                    job_id=job_id,
-                    instance_id=prior_worker_id,
-                    side_effect_id=se_id,
-                    supervisor_signing_key=getattr(queue, "_active_supervisor_key", b"test_key"),
-                )
-
             if not is_dead:
                 err_msg = f"Previous worker '{prior_worker_id}' termination cannot be cryptographically verified."
                 queue.append_log(job_id, worker_id, lease_gen, f"Recovery blocked: {err_msg}")
@@ -544,7 +572,6 @@ def execute_job_in_worker(
             queue.append_log(job_id, worker_id, lease_gen, "Prior worker verified DEAD. Querying GitHub across all states.")
             pr_found = False
             matching_pr_url = None
-
             if github_client_factory:
                 gh_client = github_client_factory()
                 pulls = gh_client.get_pulls(state="all", head=scoped_branch)
@@ -575,11 +602,17 @@ def execute_job_in_worker(
         messages = payload.get("messages", [{"role": "user", "content": payload.get("prompt", "Analyze repository")}])
         model = payload.get("model", "gemini/gemini-2.5-flash")
 
+        # Strict Credential Fail-Closed: Providers requiring API key must fail closed if missing
+        if not resolved_api_key and not agent_turn_fn:
+            err = f"Security violation: required API key for model '{model}' could not be resolved from secure tenant store."
+            queue.update_job_status(job_id, "FAILED", worker_id, lease_gen, error={"error": err})
+            raise JobQueueError(err)
+
         if agent_turn_fn:
             turn_result = agent_turn_fn(
                 messages=messages,
                 model=model,
-                api_key=resolved_api_key or "test_key",
+                api_key=resolved_api_key,
                 sandbox=sandbox,
                 execution_controller=controller,
             )
@@ -588,7 +621,7 @@ def execute_job_in_worker(
             turn_result = agent.run_agent_turn(
                 messages=messages,
                 model=model,
-                api_key=resolved_api_key or "test_key",
+                api_key=resolved_api_key,
                 sandbox=sandbox,
                 execution_controller=controller,
             )
@@ -648,7 +681,7 @@ def worker_child_main(
     worker_instance_id: str,
     db_path: str,
     stop_event: multiprocessing.Event,
-    ipc_port: Optional[int] = None,
+    ipc_socket_path: Optional[str] = None,
     ipc_token: Optional[str] = None,
     test_sandbox_factory: Optional[Callable[..., Any]] = None,
     test_agent_turn_fn: Optional[Callable[..., Any]] = None,
@@ -679,8 +712,12 @@ def worker_child_main(
             )
 
     ipc_client = None
-    if ipc_port and ipc_token:
-        ipc_client = SupervisorIPCClient(port=ipc_port, auth_token=ipc_token)
+    if ipc_socket_path and ipc_token:
+        ipc_client = SupervisorIPCClient(
+            socket_path=ipc_socket_path,
+            worker_instance_id=worker_instance_id,
+            auth_token=ipc_token,
+        )
 
     try:
         while not stop_event.is_set():
@@ -701,6 +738,7 @@ def worker_child_main(
                 queue=queue,
                 timeout_seconds=timeout_sec,
                 ipc_client=ipc_client,
+                github_client_factory=test_gh_factory,
             )
 
             # Spawn Heartbeat & Watchdog Thread
@@ -778,7 +816,6 @@ class WorkerSupervisor:
         self.signing_key = load_or_create_supervisor_key(signing_key_path)
 
         self.queue = DurableJobQueue(db_path=db_path)
-        self.queue._active_supervisor_key = self.signing_key
         self.reconciler = SandboxReconciler(self.queue, e2b_kill_fn=e2b_kill_fn)
 
         self._ctx = multiprocessing.get_context("spawn")
@@ -787,25 +824,32 @@ class WorkerSupervisor:
         self._lock = threading.Lock()
         self._running = False
 
-        # Authenticated Supervisor IPC Server
-        self.ipc_auth_token = secrets.token_hex(16)
+        # Authenticated Supervisor IPC Server over Unix domain socket
         self.ipc_server = SupervisorIPCServer(
             supervisor=self,
-            auth_token=self.ipc_auth_token,
         )
         self.ipc_server.start()
 
+    def get_worker_slot_by_instance(self, instance_id: str) -> Optional[Dict[str, Any]]:
+        """Finds managed slot registration by worker instance ID."""
+        with self._lock:
+            for slot_info in self._workers.values():
+                if slot_info.get("instance_id") == instance_id:
+                    return slot_info
+        return None
+
     def start_worker_slot(self, slot_id: str, custom_target: Optional[Callable] = None) -> None:
-        """Spawns an independent child worker process for a slot with stripped signing key."""
+        """Spawns an independent child worker process for a slot with unique ephemeral auth token."""
         instance_id = f"worker_{uuid.uuid4().hex[:12]}"
+        worker_token = secrets.token_hex(16)
 
         target_fn = custom_target or worker_child_main
         args = (
             instance_id,
             self.db_path,
             self._stop_event,
-            self.ipc_server.port,
-            self.ipc_auth_token,
+            self.ipc_server.socket_path,
+            worker_token,
         )
 
         proc = self._ctx.Process(target=target_fn, args=args)
@@ -816,6 +860,7 @@ class WorkerSupervisor:
             self._workers[slot_id] = {
                 "process": proc,
                 "instance_id": instance_id,
+                "auth_token": worker_token,
                 "pid": proc.pid,
                 "start_time": time.time(),
                 "crashes": crashes,
@@ -923,7 +968,37 @@ class WorkerSupervisor:
         # 2. Reap stale jobs in DB
         self.queue.reap_stale_jobs()
 
-        # 3. Reconcile orphan sandboxes in cloud
+        # 3. Supervise active running jobs (Deadlock / timeout watchdog for unresponsive child processes)
+        with self.queue._lock:
+            running_jobs = self.queue.conn.execute(
+                """
+                SELECT id, worker_id, lease_generation, lease_expires_at, timeout_seconds, started_at
+                FROM jobs
+                WHERE status = 'RUNNING';
+                """
+            ).fetchall()
+
+        for r_job in running_jobs:
+            w_id = r_job["worker_id"]
+            lease_exp = r_job["lease_expires_at"]
+            # Find if this worker is one of supervisor's managed child slots
+            managed_slot = None
+            with self._lock:
+                for sid, sinfo in self._workers.items():
+                    if sinfo.get("instance_id") == w_id:
+                        managed_slot = (sid, sinfo)
+                        break
+
+            # If job's lease has expired and worker process is still alive, forcefully stop and record reap
+            if lease_exp and lease_exp < now and managed_slot:
+                slot_id, slot_info = managed_slot
+                logger.warning(f"Job '{r_job['id']}' exceeded lease deadline while worker '{w_id}' was running. Terminating slot '{slot_id}'.")
+                self.stop_worker_slot(slot_id, grace_seconds=1.0)
+                # Restart slot for upcoming work
+                if not self._stop_event.is_set():
+                    self.start_worker_slot(slot_id, custom_target=slot_info.get("custom_target"))
+
+        # 4. Reconcile orphan sandboxes in cloud
         self.reconciler.reconcile_orphans()
 
     def run_forever(self, poll_interval: float = 2.0) -> None:
