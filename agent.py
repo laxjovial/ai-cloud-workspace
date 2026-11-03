@@ -138,8 +138,9 @@ def run_agent_turn(
     status_callback: Optional[Callable[[str], None]] = None,
     max_steps: int = 10,
     reasoning_effort: Optional[str] = None,
+    execution_controller: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Runs a multi-turn agent execution loop with sandbox tool calling and optional reasoning effort."""
+    """Runs a multi-turn agent execution loop with sandbox tool calling, optional reasoning effort, and execution controller."""
 
     working_messages = [
         {"role": "system", "content": SYSTEM_PROMPT}
@@ -148,6 +149,15 @@ def run_agent_turn(
     accumulated_logs = []
 
     for step in range(max_steps):
+        # Cooperative interruption check
+        if execution_controller and hasattr(execution_controller, "is_aborted") and execution_controller.is_aborted():
+            return {
+                "success": False,
+                "status": "aborted",
+                "error": getattr(execution_controller, "abort_reason", "Execution cancelled or timed out."),
+                "terminal_logs": "\n".join(accumulated_logs),
+            }
+
         if status_callback:
             status_callback(f"Agent thinking (Step {step + 1}/{max_steps})...")
 
@@ -158,6 +168,7 @@ def run_agent_turn(
             "tool_choice": "auto",
             "api_key": api_key,
             "temperature": 0.2,
+            "timeout": 60.0,  # Bounded LLM operation timeout (Tier 1)
         }
 
         if reasoning_effort and reasoning_effort.lower() in ("low", "medium", "high"):
@@ -211,6 +222,15 @@ def run_agent_turn(
             }
 
         for tool_call in tool_calls:
+            # Check controller before each tool invocation
+            if execution_controller and hasattr(execution_controller, "is_aborted") and execution_controller.is_aborted():
+                return {
+                    "success": False,
+                    "status": "aborted",
+                    "error": getattr(execution_controller, "abort_reason", "Execution cancelled or timed out."),
+                    "terminal_logs": "\n".join(accumulated_logs),
+                }
+
             func_name = tool_call.function.name
             try:
                 args = json.loads(tool_call.function.arguments)
