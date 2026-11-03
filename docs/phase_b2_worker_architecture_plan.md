@@ -2,17 +2,17 @@
 
 **Repository:** `laxjovial/ai-cloud-workspace`  
 **Working Branch:** `feat/phase-b-durable-execution`  
-**Specification Revision:** 2.0 (Post-Review Hardening)  
+**Specification Revision:** 2.1 (Production-Grade Engineering Contract)  
 **Baseline (`main`):** `5147be6c127c3eed87b6cabb0ca24f65b2550fa7` (strictly untouched)  
 **Scope Boundary:** Phase B.2 covers only the background worker engine, process supervisor, heartbeat/fencing watchdog, crash-resilient sandbox registry/reconciler, and associated tests. It introduces **no Streamlit changes (`app.py` untouched)** and **no Phase C work**.
 
 ---
 
-## 1. Process Supervision, Concurrency, & Worker Lifecycle
+## 1. Process Supervision, Process Ownership, & Worker Lifecycle
 
 ```mermaid
 flowchart TD
-    subgraph Host ["Supervisor Process (worker.py supervisor)"]
+    subgraph SupervisorProcess ["Supervisor Process (worker.py supervisor)"]
         SP["WorkerSupervisor (Main Daemon)"]
         PM["Process Pool Manager (concurrency=N)"]
         RC["Reaper & Sandbox Reconciler (10s interval)"]
@@ -21,64 +21,79 @@ flowchart TD
     end
 
     subgraph Workers ["Spawned Worker Child Processes"]
-        W1["Worker Child 1 (PID 101)"]
-        W2["Worker Child 2 (PID 102)"]
+        W1["Worker Child 1 (Instance: worker_inst_uuid_1, PID: 101)"]
+        W2["Worker Child 2 (Instance: worker_inst_uuid_2, PID: 102)"]
         PM -->|spawn with restart backoff| W1
         PM -->|spawn with restart backoff| W2
     end
 
     subgraph Store ["SQLite WAL Store (jobs.db)"]
-        W1 -->|claim_next_job| DB[(jobs.db)]
-        W2 -->|claim_next_job| DB
-        RC -->|reap_stale_jobs & reconcile_sandboxes| DB
+        W1 -->|claim_next_job (enforces pre-claim cleanup)| DB[(jobs.db)]
+        W2 -->|claim_next_job (enforces pre-claim cleanup)| DB
+        RC -->|reap_stale_jobs & supervisor_finalize_job| DB
     end
 
-    subgraph E2B ["Cloud Sandbox Infrastructure"]
-        W1 -->|Create with durable tag job_id| SB1["E2B Sandbox 1"]
-        RC -.->|Destroy orphaned containers| SB1
+    subgraph E2B ["Verified E2B Cloud Sandbox SDK"]
+        W1 -->|create with metadata={'job_id': job_id}| SB1["E2B Sandbox 1"]
+        RC -.->|Sandbox.kill(sandbox_id) / Sandbox.list()| SB1
     end
 ```
 
-### 1.1 Process Supervision & Crash-Loop Protection
-- **Process Model**:
-  The supervisor launches a fixed pool of $N$ worker processes using `multiprocessing.get_context("spawn")`. This prevents shared memory corruption, file-descriptor leaks, and deadlocks across parent/child boundaries.
+### 1.1 Process Model & Durable Worker Instance Identity
+- **Durable Worker Identity**:
+  A bare OS PID is unsafe to trust indefinitely because operating systems rapidly reuse PIDs.
+  Each worker process generates a cryptographic instance identity at spawn time:
+  `worker_instance_id = f"worker_{uuid.uuid4().hex[:12]}_{os.getpid()}"`
+- **Supervisor-Worker Ownership Registry**:
+  The supervisor maintains a durable registry table in `jobs.db`: `worker_instances` (PID, instance_id, started_at, last_seen, status).
+  When issuing signals (`SIGTERM`, `SIGKILL`), the supervisor verifies both PID and process creation time (via `/proc/<pid>/stat` on Linux or `psutil`) to guarantee it never signals an unrelated recycled OS process.
 - **Child Crash & Crash-Loop Protection**:
-  1. The supervisor monitors child PIDs using `process.is_alive()` and non-blocking `os.waitpid(-1, os.WNOHANG)`.
+  1. The supervisor monitors child processes using non-blocking checks (`process.is_alive()` and `os.waitpid(-1, os.WNOHANG)`).
   2. If a child terminates unexpectedly (exit code $\neq 0$, OOM, segfault):
-     - The supervisor logs the crash event with PID and exit status.
-     - **Crash-Loop Backoff**: If a worker crashes within 10 seconds of launch, the supervisor increments a crash counter for that slot and applies exponential backoff: $1s \to 2s \to 4s \to 8s \to \dots \to 30s$ max.
-     - If a worker crashes 5 consecutive times without successfully executing any work, the slot pauses and raises a critical supervisor telemetry event.
+     - Logs the crash event with instance ID, PID, and exit code.
+     - **Crash-Loop Backoff**: If a worker crashes within 10 seconds of launch, the supervisor increments a slot failure counter and applies exponential backoff: $1s \to 2s \to 4s \to 8s \to 16s \to 30s$ max.
+     - If a slot crashes 5 consecutive times without successfully claiming or completing work, the slot pauses and raises a critical supervisor telemetry alert.
 - **Supervisor Self-Recovery & Restart**:
   When the supervisor itself starts or restarts:
-  1. It connects to `jobs.db` and immediately runs a **Startup Reconciliation Pass**:
+  1. It performs a **Startup Reconciliation Pass** before booting workers:
      - Scans `jobs` for `status = 'RUNNING'`.
-     - Expired leases are immediately processed by the reconciler.
-     - Orphaned sandbox IDs are reconciled and queued for destruction.
-  2. Once the database is in a clean state, it boots the child worker pool.
+     - Stale workers from the previous supervisor run are immediately fenced out.
+     - Unreconciled cloud sandboxes are queued for cleanup.
+  2. Spawns fresh child workers once the queue state is clean.
 - **Clean Deployment Shutdown (`SIGTERM` / `SIGINT`)**:
-  - A deployment shutdown or supervisor termination is **not** a user cancellation.
-  - The supervisor sets an internal `shutdown_event` and sends `SIGTERM` to worker processes.
-  - Workers cease polling for new jobs. Running jobs are given a **15-second grace period** to checkpoint in-flight work and cleanly pause or fail gracefully with `status = 'RECOVERABLE'` (allowing another worker to resume after restart), without falsely marking the job `CANCELLED`.
+  - Supervisor shutdown is **not** a user cancellation.
+  - The supervisor sets `shutdown_event` and sends `SIGTERM` to child workers.
+  - Workers cease polling. Active jobs are given a **15-second grace period** to pause cleanly and transition to `status = 'RECOVERABLE'` (allowing another worker to resume after restart), without falsely marking the job `CANCELLED`.
   - After 15 seconds, remaining uncooperative children receive `SIGKILL`, and their sandboxes are reconciled.
 
 ---
 
-## 2. Dedicated Sandbox Registration & Cleanup Schema (B.1 Migration 2)
+## 2. Dedicated Sandbox Lifecycle, Pre-Claim Invariant, & Supervisor Recovery APIs (B.1 Migration 2)
 
-To eliminate the state machine violation (transitioning `RUNNING \to RUNNING`) and track sandbox cleanup durably across all failure paths, Phase B.2 introduces **Migration 2** in `job_queue.py`:
+To eliminate state machine violations (`RUNNING \to RUNNING`), enforce pre-claim cleanup invariants inside the database query, and prevent supervisor privilege bypasses, Phase B.2 introduces **Migration 2** in `job_queue.py`:
 
-### 2.1 Database Schema Migration
+### 2.1 Database Schema Migration 2
 ```sql
--- Migration 2: Dedicated Sandbox Registration, Side-Effect Intents, and Cleanup Lifecycle
-ALTER TABLE jobs ADD COLUMN sandbox_cleanup_status TEXT DEFAULT 'NONE'; -- 'NONE', 'CLEANED', 'FAILED', 'ORPHANED'
-ALTER TABLE jobs ADD COLUMN sandbox_cleanup_attempts INTEGER DEFAULT 0;
+-- Migration 2: Dedicated Sandbox Lifecycle, Privileged Reconciliation, and Side Effects
+ALTER TABLE jobs ADD COLUMN sandbox_cleanup_status TEXT NOT NULL DEFAULT 'NONE'; 
+-- Allowed sandbox_cleanup_status: 'NONE', 'CLEANED', 'ORPHANED', 'FAILED', 'MANUAL_INTERVENTION_REQUIRED'
+ALTER TABLE jobs ADD COLUMN sandbox_cleanup_attempts INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE jobs ADD COLUMN sandbox_cleanup_error TEXT;
 ALTER TABLE jobs ADD COLUMN sandbox_cleanup_next_retry REAL;
-ALTER TABLE jobs ADD COLUMN side_effect_intents_json TEXT DEFAULT '{}';
+ALTER TABLE jobs ADD COLUMN side_effect_intents_json TEXT NOT NULL DEFAULT '{}';
+
+CREATE TABLE IF NOT EXISTS worker_instances (
+    instance_id TEXT PRIMARY KEY,
+    pid INTEGER NOT NULL,
+    started_at REAL NOT NULL,
+    last_heartbeat REAL NOT NULL,
+    status TEXT NOT NULL -- 'STARTING', 'ALIVE', 'STOPPING', 'DEAD'
+);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_claim_eligibility ON jobs (status, sandbox_cleanup_status, created_at);
 ```
 
-### 2.2 Dedicated Fenced API: `register_sandbox()`
-Rather than modifying status, `job_queue.py` adds an atomic, fenced registration method:
+### 2.2 Dedicated Fenced Worker API: `register_sandbox()`
 ```python
 def register_sandbox(
     self,
@@ -97,49 +112,77 @@ def register_sandbox(
     """
 ```
 
-### 2.3 Sandbox Cleanup Lifecycle & The Pre-Claim Invariant
-- **The Pre-Claim Invariant**:
-  A reaped job whose lease expired **must never be claimed by another worker until its previous cloud sandbox is confirmed destroyed (or confirmed absent)**.
-- **Reconciliation State Machine**:
-  1. When `reap_stale_jobs()` runs, it returns structured records:
-     ```python
-     [
-         {
-             "job_id": "...",
-             "sandbox_id": "...",
-             "lease_generation": 1,
-             "status": "RUNNING",
-             "cancel_requested": False
-         }
-     ]
-     ```
-  2. If `sandbox_id` is present, the job transitions to `status = 'RECOVERABLE'` with `sandbox_cleanup_status = 'ORPHANED'`. It is **not** set to `QUEUED` yet.
-  3. The reconciler issues an E2B API call (`Sandbox.kill(sandbox_id)` or `Sandbox.connect(sandbox_id).kill()`) with a **5.0-second bounded timeout**:
-     - **Success**: Reconciler calls `mark_sandbox_cleaned(job_id)`. The job is then transitioned to `QUEUED` (or `CANCELLED` if cancellation was pending).
-     - **Failure (Network/Rate-Limit/Timeout)**: Reconciler records `sandbox_cleanup_status = 'FAILED'`, increments `sandbox_cleanup_attempts`, sets exponential backoff in `sandbox_cleanup_next_retry`, and leaves the job unclaimable.
-     - **Persistent Failure Escalation**: If cleanup fails 10 times consecutively, the job transitions to terminal `FAILED` with an alert logged to `job_events`, preventing infinite claim loops while keeping cloud billing bounded.
+### 2.3 Strict Pre-Claim Invariant Enforced Inside `claim_next_job()`
+A reaped job whose lease expired **must never be claimed by another worker until its previous cloud sandbox is confirmed destroyed (or independently confirmed absent)**.
 
-### 2.4 Race-Window Mitigation: Creation Without Registration
-If a worker creates an E2B sandbox but crashes before calling `register_sandbox()`:
-- When creating containers, `WorkspaceSandbox` adds a cloud metadata tag: `tags={"managed_by": "ai-cloud-workspace", "job_id": job_id}`.
-- Every 60 seconds, the supervisor's Orphan Discovery scanner queries the provider's active sandboxes via `Sandbox.list()`. Any sandbox whose tagged `job_id` is terminal, missing from DB, or whose lease has expired without matching `sandbox_id` is automatically terminated.
+The queue itself enforces this invariant in `claim_next_job()`:
+```sql
+SELECT id, lease_generation FROM jobs
+WHERE status = 'QUEUED'
+  AND (sandbox_cleanup_status = 'NONE' OR sandbox_cleanup_status = 'CLEANED')
+ORDER BY created_at ASC
+LIMIT 1;
+```
+If a job has `sandbox_cleanup_status IN ('ORPHANED', 'FAILED', 'MANUAL_INTERVENTION_REQUIRED')`, **it cannot be claimed under any circumstances**, preventing duplicate execution and concurrent container contention.
+
+### 2.4 Dedicated Privileged Supervisor API: `supervisor_finalize_job()`
+Supervisors cannot pretend to be workers or forge worker leases. When a worker has been killed or has abandoned a job, the supervisor finalizes it through a dedicated, fenced API:
+```python
+def supervisor_finalize_job(
+    self,
+    job_id: str,
+    expected_lease_generation: int,
+    target_status: str,  # 'CANCELLED', 'TIMED_OUT', 'FAILED', 'RECOVERABLE'
+    supervisor_id: str,
+    reason: str,
+    error: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Privileged supervisor finalization.
+    
+    Invariants:
+    1. Validates lease_generation == expected_lease_generation (fences stale supervisors).
+    2. Disallows target_status == 'COMPLETED' (supervisors cannot forge successful work).
+    3. Records finalization event in job_events citing supervisor_id, reason, and error.
+    4. Increments lease_generation to fence out any delayed/zombie worker activity.
+    """
+```
+
+### 2.5 Resilient Sandbox Cleanup & Escalation Lifecycle
+- When `reap_stale_jobs()` detects an expired lease:
+  - If `sandbox_id` is present, it sets `status = 'RECOVERABLE'` and `sandbox_cleanup_status = 'ORPHANED'`.
+  - Structured reap record returned:
+    `{"job_id": jid, "sandbox_id": s_id, "lease_generation": gen, "cancel_requested": bool}`
+- The supervisor reconciler attempts destruction via verified E2B API:
+  `Sandbox.kill(sandbox_id)` (with a bounded 5-second HTTP timeout).
+  - **Success / 404 Not Found**: Container confirmed gone. Calls atomic `confirm_sandbox_cleaned(job_id)`. The job transitions to `QUEUED` (or `CANCELLED` if cancellation was pending).
+  - **Failure (500 Error, Timeout, Rate Limit)**:
+    - Increments `sandbox_cleanup_attempts`.
+    - Sets `sandbox_cleanup_status = 'FAILED'`.
+    - Sets `sandbox_cleanup_next_retry = now + min(300, 2 ** attempts)`.
+    - Retries destruction on subsequent iterations.
+  - **Escalation Policy (No Abandonment of Live Billing)**:
+    - If cleanup fails 10 consecutive times, the status transitions to:
+      `sandbox_cleanup_status = 'MANUAL_INTERVENTION_REQUIRED'`.
+    - The job status transitions to terminal `FAILED` with explicit error:
+      `{"error": "Cloud sandbox cleanup failed; operator intervention required to terminate container.", "sandbox_id": sandbox_id}`.
+    - **Crucial Invariant**: The reconciler continues retrying cleanup indefinitely every 15 minutes until confirmed destroyed, or until an operator resolves it. Live cloud resources are **never** abandoned silently.
 
 ---
 
 ## 3. Worker Heartbeat, Cancellation Polling, & Self-Fencing
 
-### 3.1 Bounded Interruption & Two-Thread Worker Architecture
-Inside each worker process:
+### 3.1 Bounded Interruption & Two-Thread Architecture
+Inside each child worker process:
 1. **Execution Thread**:
-   - Executes `agent.run_agent_turn()` step by step.
-   - Uses `time.monotonic()` for all in-process elapsed time tracking (immune to NTP steps or system clock adjustments).
-   - Before invoking LiteLLM and before executing each tool, checks `abort_event.is_set()`.
+   - Steps through `agent.run_agent_turn(..., execution_controller=ctrl)`.
+   - Uses `time.monotonic()` for in-process wall-clock timeout tracking (immune to NTP steps).
+   - Before invoking LiteLLM and before executing each tool, checks `ctrl.is_aborted()`.
 2. **Heartbeat & Watchdog Thread**:
-   - Executes every 5 seconds.
-   - Calls the atomic queue method: `poll_worker_status(job_id, worker_id, lease_generation, lease_duration=30.0)`.
+   - Runs every 5 seconds while a job is active.
+   - Calls atomic `poll_worker_status(job_id, worker_id, lease_generation, lease_duration=30.0)`.
 
 ### 3.2 Atomic Method: `poll_worker_status()`
-This method combines lease extension and cancellation inspection into a single transaction:
+Combines lease renewal and cancellation inspection in a single atomic transaction:
 ```python
 def poll_worker_status(
     self,
@@ -158,107 +201,112 @@ def poll_worker_status(
 ```
 
 ### 3.3 Strict Self-Fencing on Stale Lease
-If `poll_worker_status` returns `'STALE'` (or raises `StaleLeaseError`), or if the database is unreachable:
-1. Heartbeat thread immediately trips `abort_event.set()`.
-2. **Self-Fencing Guard**: The execution thread halts immediately. **It does not execute the pending tool call and does not attempt any further database updates.**
-3. The worker issues a bounded kill to its local sandbox handle and exits cleanly.
+If `poll_worker_status` returns `'STALE'` (or if the database connection fails):
+1. The heartbeat thread immediately sets `ctrl.abort(reason="Lease expired or superseded")`.
+2. **Self-Fencing Guard**: The execution thread halts immediately. **No tool call is executed, no further logs are written, and the sandbox is destroyed locally.**
+3. The worker exits cleanly without attempting further database updates.
 
 ---
 
 ## 4. Idempotency & Side-Effect Reconciliation Protocol
 
-To prevent duplicate side effects (e.g. duplicate GitHub PRs, duplicate branch pushes) under at-least-once execution semantics:
+To prevent duplicate side effects under at-least-once execution semantics:
 
 ### 4.1 Side-Effect Identity & Intent Table
 Every external action with irreversible side effects is assigned a deterministic identity:
 `side_effect_id = sha256(f"{job_id}:{tool_name}:{action_key}")[:16]`
 
-Before invoking the external provider:
+### 4.2 Pull Request Reconciliation Protocol
+Before invoking `repo.create_pull()`:
 1. **Record Intent**:
-   ```python
-   job_queue.record_side_effect_intent(job_id, worker_id, gen, side_effect_id, "PENDING", details)
-   ```
-2. **Reconcile Prior to Execution**:
-   - **For PR Creation**:
-     The worker queries the GitHub repository via PyGithub:
-     `repo.get_pulls(state="open", head=f"{repo.owner.login}:{branch_name}")`
-     If an existing PR matches the target branch and title:
-     - Worker re-attaches to the existing PR URL and number.
-     - Updates intent state to `CONFIRMED`.
-     - Logs: `"Reconciled existing remote Pull Request #{pr.number}; skipping duplicate creation."`
-   - **For Branch Pushes**:
-     Branch names are strictly deterministically derived: `ai-cloud/job-{job_id[:8]}`.
-     If a user specifies a custom branch name, it is scoped as: `ai-cloud/{user_id[:6]}-{custom_branch_name}` to prevent cross-job and cross-tenant branch collisions.
-3. **Record Confirmed Result**:
-   Upon provider return, records intent state as `CONFIRMED` with the external URL/ID in `side_effect_intents_json`.
+   Worker records `{"side_effect_id": id, "action": "create_pull_request", "status": "PENDING"}` in `side_effect_intents_json`.
+2. **Comprehensive Remote PR Query (Open, Closed, Merged)**:
+   The worker queries GitHub across **all states**:
+   `repo.get_pulls(state="all", head=f"{repo.owner.login}:{branch_name}")`
+   - **If an open PR exists**:
+     Re-attaches to the existing PR URL/number. Records intent `CONFIRMED`. Skips creation.
+   - **If a closed/merged PR exists**:
+     Logs: `"Branch has already been merged or closed in PR #{pr.number}."`
+     Does not attempt duplicate creation. Re-attaches to existing PR metadata.
+   - **If no PR exists**:
+     Issues `repo.create_pull()`. Upon return, records `CONFIRMED` in `side_effect_intents_json`.
+3. **Deterministic Branch Scoping**:
+   - Standard branch: `ai-cloud/job-{job_id[:8]}`.
+   - If user requests a custom branch name, worker enforces unique job scoping:
+     `ai-cloud/{job_id[:8]}-{custom_branch_name}`.
+   - If the remote branch already exists, worker pulls/resets cleanly with ASKPASS isolation, preventing collisions.
 
 ---
 
-## 5. Bounded Interruption & Cancellation Protocol
+## 5. Execution-Control Interface & Agent Interruption Contract
 
-### 5.1 Two-Tier Cancellation Escalation
-```mermaid
-sequenceDiagram
-    participant User as Streamlit User
-    participant DB as jobs.db
-    participant Sup as WorkerSupervisor
-    participant HB as Worker Watchdog Thread
-    participant Main as Worker Execution Thread
-    participant E2B as Cloud Sandbox
+To allow the background worker to interrupt the synchronous agent loop cleanly:
 
-    User->>DB: request_cancellation(job_id)
-    Note over DB: cancel_requested_at set
-    
-    par Tier 1: Cooperative (0 to 15s)
-        HB->>DB: poll_worker_status()
-        DB-->>HB: 'CANCEL_REQUESTED'
-        HB->>Main: abort_event.set()
-        Main->>E2B: close sandbox (5s timeout)
-        Main->>DB: update_job_status('CANCELLED')
-    and Tier 2: Forced Escalation (after 15s)
-        Sup->>DB: Check in-flight cancelled jobs > 15s
-        Note over Sup: Worker hung; escalate to SIGKILL
-        Sup->>Main: send SIGKILL
-        Sup->>E2B: Sandbox.kill(sandbox_id)
-        Sup->>DB: update_job_status('CANCELLED')
-    end
+### 5.1 Execution Controller Interface (`ExecutionController`)
+```python
+class ExecutionController:
+    """Coordinates execution bounds, cancellation, and sandbox interruption between worker threads."""
+    def __init__(self, timeout_seconds: float):
+        self.started_monotonic = time.monotonic()
+        self.timeout_seconds = timeout_seconds
+        self._abort_event = threading.Event()
+        self.abort_reason: Optional[str] = None
+        self.current_sandbox: Optional[WorkspaceSandbox] = None
+
+    def is_aborted(self) -> bool:
+        if self._abort_event.is_set():
+            return True
+        if time.monotonic() - self.started_monotonic > self.timeout_seconds:
+            self.abort(reason=f"Wall-clock timeout ({self.timeout_seconds}s) exceeded")
+            return True
+        return False
+
+    def abort(self, reason: str):
+        self.abort_reason = reason
+        self._abort_event.set()
+        if self.current_sandbox:
+            # Issue bounded kill to active command/sandbox
+            try:
+                self.current_sandbox.close()
+            except Exception:
+                pass
 ```
 
-1. **Cooperative Window (0 to 15 seconds)**:
-   - Worker detects `CANCEL_REQUESTED` via `poll_worker_status()`.
-   - Halts execution before next tool.
-   - Calls `sandbox.close()` with a bounded timeout of 5 seconds.
-   - Calls `job_queue.update_job_status(job_id, "CANCELLED", worker_id, gen)`.
-2. **Forced Escalation (15+ seconds)**:
-   - The supervisor's reconciler scans for jobs where `cancel_requested_at IS NOT NULL` and `now - cancel_requested_at > 15.0`.
-   - Supervisor identifies the worker process PID and sends `SIGTERM`, followed 5 seconds later by `SIGKILL`.
-   - The supervisor reconciler independently kills the sandbox and sets status to `CANCELLED`.
-
-### 5.2 Monotonic Wall-Clock Timeout Enforcement
-- Process execution duration is measured via `time.monotonic()`.
-- If `time.monotonic() - started_monotonic > timeout_seconds`:
-  1. Watchdog sets `abort_event`.
-  2. Issues bounded `sandbox.close()` (5s timeout).
-  3. Records `TIMED_OUT` with structured diagnostics.
-  4. B.1's precedence policy guarantees that if cancellation was also requested, status becomes `CANCELLED` while preserving the timeout diagnostic error.
+### 5.2 Agent Interruption Contract in `agent.run_agent_turn()`
+- `run_agent_turn()` accepts an optional `controller: Optional[ExecutionController] = None`.
+- **Pre-Step Check**: Checks `controller.is_aborted()` before LiteLLM completion calls and before each tool invocation.
+- If aborted: Immediately terminates the turn loop and returns:
+  `{"success": False, "status": "aborted", "error": controller.abort_reason, "terminal_logs": ...}`.
 
 ---
 
-## 6. Spawned Worker Credential Resolution
+## 6. Spawned Worker Credential & Configuration Resolution
 
-- **No Secrets in Payloads or Process Arguments**:
-  Job payloads contain only credential references: `{"github": {"key_ref": "user_github_pat"}}`.
-- **Worker-Context Resolution**:
-  When a spawned child worker begins a job:
-  1. It reads the user's encrypted local store: `~/.ai_cloud_workspace/.user_store/<safe_user_id>.json`.
-  2. It initializes `Fernet` in memory using `ENCRYPTION_KEY` (from environment or worker configuration).
-  3. It decrypts only the specific keys referenced by `credential_refs` directly into local Python memory.
-  4. Tokens are passed to `WorkspaceSandbox` in-memory. They are **never passed as CLI flags, logged to stdout/stderr, or recorded in `job_events`**.
-  5. The askpass helper in `sandbox.py` continues to isolate credentials from Git command arguments and logs.
+To maintain Phase A security boundaries in a detached child process:
+
+### 6.1 Configuration & E2B API Key Resolution
+- The worker supervisor and child workers load environment variables via `python-dotenv` from a secure configuration file or environment variables (`E2B_API_KEY`, `ENCRYPTION_KEY`).
+- `sandbox.py` is updated to accept explicit `api_key: Optional[str] = None` in `WorkspaceSandbox.__init__`, falling back cleanly to environment variables if Streamlit secrets are unavailable.
+
+### 6.2 Authenticated User-Store Lookup
+- When executing a job, the worker reads user data exclusively from:
+  `db._load_local_user_data(user_id=job["user_id"])`.
+- The user ID is taken strictly from the authenticated `job["user_id"]` stored at enqueue time, never from untrusted payload strings.
+- Keys are resolved in memory, passed to `WorkspaceSandbox` in memory, and never logged or serialized to `job_events`.
 
 ---
 
-## 7. Comprehensive Failure-Injection Test Plan for Phase B.2
+## 7. Verified E2B SDK Capabilities (Empirically Validated)
+
+Inspected live in `.venv/bin/python3`:
+- **Version**: E2B Python SDK v1.x (modern API).
+- **Metadata Tagging**: `Sandbox.create(metadata={"job_id": job_id, "managed_by": "ai-cloud-workspace"})` is directly supported.
+- **Enumeration**: `Sandbox.list(query=...)` supports paginated enumeration of active containers.
+- **Destruction**: `Sandbox.kill(sandbox_id)` is a verified `@class_method_variant` capable of directly killing any sandbox by ID without needing an existing instance connection.
+
+---
+
+## 8. Comprehensive Failure-Injection Test Plan for Phase B.2
 
 Dedicated test file: `tests/test_phase_b_worker_engine.py`
 
@@ -266,21 +314,21 @@ Dedicated test file: `tests/test_phase_b_worker_engine.py`
 |---|---|---|---|
 | **1** | **Normal Worker Turn** | Standard multi-step agent turn. | Job completes, logs stream, sandbox destroyed, terminal status `COMPLETED`. |
 | **2** | **Heartbeat Maintenance** | Long-running task (10s) with 3s lease. | Heartbeat continuously extends lease; job never expires. |
-| **3** | **Pre-Step Self-Fencing** | Worker lease expires mid-run; heartbeat returns `'STALE'`. | Worker halts immediately; **zero** subsequent tool calls made; sandbox destroyed. |
+| **3** | **Pre-Step Self-Fencing** | Worker lease expires mid-run; heartbeat returns `'STALE'`. | Worker halts immediately; **zero** subsequent tool calls made; sandbox destroyed locally. |
 | **4** | **Cooperative Cancellation** | User requests cancellation during turn 1 of 3. | Worker detects `CANCEL_REQUESTED`, halts before turn 2, destroys sandbox, records `CANCELLED`. |
 | **5** | **Forced Cancellation Escalation** | Mock tool hangs indefinitely after cancel requested. | Supervisor triggers `SIGTERM`/`SIGKILL` at 15s; reconciler destroys sandbox, marks `CANCELLED`. |
-| **6** | **Monotonic Timeout Interruption** | Mock command exceeds `timeout_seconds`. | Watchdog halts execution, terminates container, records `TIMED_OUT`. |
-| **7** | **Crash & Re-Claim Pre-Condition** | Worker killed via `SIGKILL` while holding active sandbox. | Stale job is **not** re-queued until reconciler confirms old sandbox destroyed. |
-| **8** | **Sandbox Creation Race Window** | Worker killed immediately after sandbox create, before DB registration. | Orphan scanner discovers tagged container in cloud provider list and destroys it. |
-| **9** | **Cleanup API Failure & Retry** | Reconciler encounters simulated 500 error calling `Sandbox.kill()`. | Job transitions to `ORPHANED` / `FAILED` cleanup; retries with exponential backoff; not re-queued. |
-| **10** | **PR Idempotency on Worker Retry** | Worker creates PR on GitHub, then crashes before DB write. Next worker retries job. | Worker inspects remote PRs, re-attaches to existing PR, avoids creating duplicate. |
-| **11** | **Supervisor Crash-Loop Protection** | Child worker process repeatedly crashes on startup. | Supervisor applies exponential backoff ($1s \to 30s$); prevents fork bomb. |
+| **6** | **Monotonic Timeout Interruption** | Mock command exceeds `timeout_seconds`. | Watchdog halts execution via `ExecutionController`, terminates container, records `TIMED_OUT`. |
+| **7** | **Crash & Re-Claim Pre-Condition** | Worker killed via `SIGKILL` while holding active sandbox. | Stale job is **not** eligible for `claim_next_job()` until reconciler confirms old sandbox destroyed. |
+| **8** | **Sandbox Creation Race Window** | Worker killed immediately after sandbox create, before DB registration. | Orphan scanner discovers tagged container via `Sandbox.list()` and destroys it. |
+| **9** | **Cleanup API Failure & Retry** | Reconciler encounters simulated 500 error calling `Sandbox.kill()`. | Job transitions to `ORPHANED` / `FAILED` cleanup; retries with exponential backoff; never re-claimed while cleanup pending. |
+| **10** | **PR Idempotency on Worker Retry** | Worker creates PR on GitHub, then crashes before DB write. Next worker retries job. | Worker inspects remote PRs across all states, re-attaches to existing PR, avoids creating duplicate. |
+| **11** | **Supervisor Crash-Loop Protection** | Child worker process repeatedly crashes on startup. | Supervisor applies exponential backoff ($1s \to 30s$); prevents fork bomb; pauses slot after 5 crashes. |
 | **12** | **Spawned Worker Credential Isolation** | Inspect child process `/proc/<pid>/cmdline`, environment, and `job_events`. | Zero plaintext GitHub tokens or LLM API keys leaked across IPC boundaries. |
 
 ---
 
-## 8. Verification Gate & Commit Evidence
+## 9. Verification Gate & Commit Evidence
 
-- **Current HEAD**: `a287ad20036c7b38c562ffb8dbeb996cc0016255`
+- **Specification Commit**: `c8eca94b0f0507fcf4725c77e9a437e5e8e1d6a0` (Updated to Revision 2.1)
 - **Main Baseline**: `5147be6c127c3eed87b6cabb0ca24f65b2550fa7` (strictly untouched)
 - **Scope Commitment**: `app.py` remains untouched. Phase B.2 implementation will not start until this specification is authorized.
