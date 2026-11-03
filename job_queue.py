@@ -1440,6 +1440,79 @@ class DurableJobQueue:
             except sqlite3.Error as e:
                 raise JobQueueError(f"Database error during claim_sandbox_cleanup: {str(e)}") from e
 
+    def finalize_active_sandbox_cleanup(
+        self,
+        job_id: str,
+        sandbox_id: str,
+        worker_id: str,
+        lease_generation: int,
+    ) -> bool:
+        """Atomically transitions an ACTIVE sandbox to CLEANED upon normal completion.
+
+        Requires strict fencing: job_id, sandbox_id, worker_id, and lease_generation
+        must match the active lease. If already CLEANED, returns True idempotently.
+        """
+        now = time.time()
+        with self._lock:
+            try:
+                with self.conn:
+                    self.conn.execute("BEGIN IMMEDIATE;")
+                    row = self.conn.execute(
+                        """
+                        SELECT sandbox_id, worker_id, lease_generation, sandbox_cleanup_status
+                        FROM jobs
+                        WHERE id = ?;
+                        """,
+                        (job_id,),
+                    ).fetchone()
+                    if not row:
+                        raise JobQueueError(f"Job '{job_id}' not found.")
+
+                    if row["sandbox_cleanup_status"] == "CLEANED":
+                        return True
+
+                    if row["sandbox_id"] != sandbox_id:
+                        raise JobQueueError(
+                            f"Sandbox ID mismatch on job '{job_id}': expected '{sandbox_id}', found '{row['sandbox_id']}'"
+                        )
+
+                    if row["worker_id"] != worker_id or (row["lease_generation"] or 0) != lease_generation:
+                        raise StaleLeaseError(
+                            f"Lease mismatch on job '{job_id}': worker '{worker_id}' gen {lease_generation} does not own active lease."
+                        )
+
+                    if row["sandbox_cleanup_status"] != "ACTIVE":
+                        raise JobQueueError(
+                            f"Cannot finalize normal sandbox cleanup: sandbox status is '{row['sandbox_cleanup_status']}', expected 'ACTIVE'."
+                        )
+
+                    self.conn.execute(
+                        """
+                        UPDATE jobs
+                        SET sandbox_cleanup_status = 'CLEANED',
+                            sandbox_cleanup_error = NULL
+                        WHERE id = ?
+                          AND sandbox_id = ?
+                          AND worker_id = ?
+                          AND lease_generation = ?
+                          AND sandbox_cleanup_status = 'ACTIVE';
+                        """,
+                        (job_id, sandbox_id, worker_id, lease_generation),
+                    )
+                    self.conn.execute(
+                        """
+                        INSERT INTO job_events (
+                            job_id, event_type, source, message, created_at
+                        ) VALUES (?, 'SANDBOX_CLEANED', 'worker', ?, ?);
+                        """,
+                        (job_id, f"Sandbox '{sandbox_id}' successfully destroyed on completion.", now),
+                    )
+                    return True
+            except (JobQueueError, StaleLeaseError):
+                raise
+            except sqlite3.Error as e:
+                raise JobQueueError(f"Database error during finalize_active_sandbox_cleanup: {str(e)}") from e
+
     def finalize_sandbox_cleanup(
         self,
         job_id: str,

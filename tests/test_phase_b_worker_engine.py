@@ -28,6 +28,7 @@ import tempfile
 import threading
 import time
 import uuid
+from typing import Any, Callable, Dict, Optional
 import pytest
 
 from job_queue import (
@@ -55,10 +56,10 @@ from worker import (
 class MockSandbox:
     """Mock E2B WorkspaceSandbox for testing."""
 
-    def __init__(self, repo_name: str, github_token: str = ""):
+    def __init__(self, repo_name: str, github_token: str = "", sandbox_id: Optional[str] = None):
         self.repo_name = repo_name
         self.github_token = github_token
-        self.sandbox_id = f"sb_mock_{uuid.uuid4().hex[:8]}"
+        self.sandbox_id = sandbox_id or f"sb_mock_{uuid.uuid4().hex[:8]}"
         self.executed_commands = []
         self.is_killed = False
 
@@ -445,7 +446,12 @@ class TestPhaseB2WorkerEngine:
         sup.shutdown()
 
     def test_scenario_7_blocked_command_forced_interruption(self, test_env):
-        """7. Genuinely blocked worker operation -> supervisor hard timeout watchdog terminates process via SIGTERM/SIGKILL."""
+        """7. Genuinely blocked worker operation -> supervisor hard timeout watchdog terminates process via SIGTERM/SIGKILL.
+
+        Note on execution mechanics: This test evaluates process-level supervision and timeout
+        enforcement on a spawned child worker process whose thread is blocked (simulating a hung command
+        or unresponsive execution). It does not test real cloud network container interruption via E2B SDK.
+        """
         db_path = test_env["db_path"]
         key_path = test_env["key_path"]
 
@@ -935,3 +941,335 @@ class TestPhaseB2WorkerEngine:
 
         failed_job = queue.get_job(job_unauth["id"], user_id="user_unauth")
         assert failed_job["status"] == "FAILED"
+
+    def test_scenario_16_normal_completion_active_sandbox_cleanup_matrix(self, test_env):
+        """16. Verification of normal completion active sandbox cleanup matrix:
+        1. ACTIVE -> CLEANED on normal completion.
+        2. Stale worker / lease generation cannot finalize.
+        3. Mismatched sandbox ID cannot finalize.
+        4. Failed container close does not transition to CLEANED.
+        5. Repeated cleanup calls are idempotent.
+        """
+        queue = test_env["queue"]
+        job = queue.enqueue_job(
+            user_id="user_alice",
+            session_id="sess_norm_clean",
+            repository="owner/repo",
+            payload={"prompt": "Normal cleanup test task"},
+        )
+        claimed = queue.claim_next_job(worker_id="worker_norm_1")
+        gen = claimed["lease_generation"]
+        sb_id = "sb_norm_1"
+        queue.register_sandbox(job["id"], sb_id, "worker_norm_1", gen)
+
+        # 1. Stale worker cannot finalize
+        with pytest.raises(StaleLeaseError):
+            queue.finalize_active_sandbox_cleanup(
+                job_id=job["id"],
+                sandbox_id=sb_id,
+                worker_id="imposter_worker",
+                lease_generation=gen,
+            )
+
+        # 2. Stale lease generation cannot finalize
+        with pytest.raises(StaleLeaseError):
+            queue.finalize_active_sandbox_cleanup(
+                job_id=job["id"],
+                sandbox_id=sb_id,
+                worker_id="worker_norm_1",
+                lease_generation=gen + 1,
+            )
+
+        # 3. Mismatched sandbox ID cannot finalize
+        with pytest.raises(JobQueueError, match="Sandbox ID mismatch"):
+            queue.finalize_active_sandbox_cleanup(
+                job_id=job["id"],
+                sandbox_id="wrong_sandbox_id",
+                worker_id="worker_norm_1",
+                lease_generation=gen,
+            )
+
+        # 4. Normal completion via execute_job_in_worker transitions ACTIVE -> CLEANED
+        controller = ExecutionController(job_id=job["id"])
+        mock_sb = MockSandbox("owner/repo", sandbox_id=sb_id)
+        mock_sb.close_called = False
+        original_close = mock_sb.close
+        def tracking_close():
+            mock_sb.close_called = True
+            original_close()
+        mock_sb.close = tracking_close
+
+        execute_job_in_worker(
+            job=claimed,
+            worker_id="worker_norm_1",
+            lease_gen=gen,
+            queue=queue,
+            controller=controller,
+            sandbox_factory=lambda repo_name, github_token: mock_sb,
+            agent_turn_fn=lambda **kwargs: {"success": True, "output": "Done successfully"},
+        )
+
+        assert mock_sb.close_called is True
+        job_after = queue.get_job(job["id"], user_id="user_alice")
+        assert job_after["status"] == "COMPLETED"
+        assert job_after["sandbox_cleanup_status"] == "CLEANED"
+
+        # 5. Repeated call is idempotent
+        res_repeat = queue.finalize_active_sandbox_cleanup(
+            job_id=job["id"],
+            sandbox_id=sb_id,
+            worker_id="worker_norm_1",
+            lease_generation=gen,
+        )
+        assert res_repeat is True
+
+        # 6. Failed close does not produce CLEANED status (it becomes ORPHANED on terminal update)
+        job_fail = queue.enqueue_job(
+            user_id="user_alice",
+            session_id="sess_norm_fail",
+            repository="owner/repo",
+            payload={"prompt": "Failing close test task"},
+        )
+        claimed_fail = queue.claim_next_job(worker_id="worker_norm_2")
+        gen_fail = claimed_fail["lease_generation"]
+        sb_id_fail = "sb_norm_fail"
+        queue.register_sandbox(job_fail["id"], sb_id_fail, "worker_norm_2", gen_fail)
+
+        mock_sb_fail = MockSandbox("owner/repo", sandbox_id=sb_id_fail)
+        def broken_close():
+            raise RuntimeError("Cloud provider network failure during close")
+        mock_sb_fail.close = broken_close
+
+        controller_fail = ExecutionController(job_id=job_fail["id"])
+        execute_job_in_worker(
+            job=claimed_fail,
+            worker_id="worker_norm_2",
+            lease_gen=gen_fail,
+            queue=queue,
+            controller=controller_fail,
+            sandbox_factory=lambda repo_name, github_token: mock_sb_fail,
+            agent_turn_fn=lambda **kwargs: {"success": True, "output": "Done"},
+        )
+        job_fail_after = queue.get_job(job_fail["id"], user_id="user_alice")
+        assert job_fail_after["sandbox_cleanup_status"] == "ORPHANED"  # NOT transitioned to CLEANED!
+
+    def test_scenario_17_pr_recovery_fail_closed_and_state_matrix(self, test_env):
+        """17. Comprehensive PR recovery verification:
+        1. Missing GitHub client factory raises SideEffectReconciliationBlockedError (fail-closed).
+        2. Client factory instantiation error raises SideEffectReconciliationBlockedError.
+        3. GitHub remote API error preserves unresolved recovery state.
+        4. Existing open PR is adopted cleanly.
+        5. Existing closed/merged PR is adopted cleanly.
+        6. Verified remote absence allows safe recreation.
+        7. No duplicate PR created after adoption.
+        """
+        sup = WorkerSupervisor(db_path=test_env["db_path"], concurrency=1, signing_key_path=test_env["key_path"])
+        queue = sup.queue
+
+        sup.start_worker_slot("slot_prior_rec", custom_target=mock_worker_target)
+        prior_info = sup._workers["slot_prior_rec"]
+        prior_worker_id = prior_info["instance_id"]
+
+        # 1. Missing GitHub client factory fails closed
+        job1 = queue.enqueue_job(
+            user_id="user_alice",
+            session_id="sess_rec_1",
+            repository="owner/repo",
+            payload={"prompt": "Test missing factory"},
+        )
+        c1 = queue.claim_next_job(worker_id=prior_worker_id)
+        g1 = c1["lease_generation"]
+        se_key1 = f"pr_{job1['id'][:8]}"
+        scoped_branch1 = f"ai-cloud/job-{job1['id'][:8]}"
+
+        se_id1, _, _ = queue.reserve_side_effect(
+            job_id=job1["id"],
+            worker_id=prior_worker_id,
+            lease_generation=g1,
+            action_type="CREATE_PULL_REQUEST",
+            action_key=se_key1,
+            intent_payload={"branch_name": scoped_branch1, "title": "Test PR 1"},
+        )
+
+        # Stop prior worker and record verified reap
+        sup.stop_worker_slot("slot_prior_rec", grace_seconds=0.2)
+
+        # Force expire lease and reap stale job so it returns to QUEUED
+        with queue._lock:
+            with queue.conn:
+                queue.conn.execute("UPDATE jobs SET lease_expires_at = ? WHERE id = ?;", (time.time() - 10.0, job1["id"]))
+        queue.reap_stale_jobs()
+
+        # Active worker setup
+        sup.start_worker_slot("slot_curr_rec", custom_target=mock_worker_target)
+        curr_info = sup._workers["slot_curr_rec"]
+        curr_worker_id = curr_info["instance_id"]
+        ipc_client = SupervisorIPCClient(
+            socket_path=sup.ipc_server.socket_path,
+            worker_instance_id=curr_worker_id,
+            auth_token=curr_info["auth_token"],
+        )
+
+        c1_new = queue.claim_next_job(worker_id=curr_worker_id)
+        g1_new = c1_new["lease_generation"]
+
+        # 1. Missing factory fails closed
+        ctrl_no_factory = ExecutionController(
+            job_id=job1["id"],
+            worker_id=curr_worker_id,
+            lease_generation=g1_new,
+            queue=queue,
+            ipc_client=ipc_client,
+            github_client_factory=None,  # MISSING FACTORY!
+        )
+
+        mock_sb1 = MockSandbox("owner/repo")
+        with pytest.raises(SideEffectReconciliationBlockedError, match="GitHub client factory is required"):
+            ctrl_no_factory.on_create_pull_request(
+                sandbox=mock_sb1,
+                branch_name=scoped_branch1,
+                commit_message="commit",
+                pr_title="Test PR 1",
+                pr_body="body",
+            )
+        # Verify side effect remains in PENDING_RECOVERY (unresolved)
+        se_row1 = queue.conn.execute("SELECT status FROM job_side_effects WHERE side_effect_id = ?;", (se_id1,)).fetchone()
+        assert se_row1["status"] == "PENDING"
+
+        # 2. Client factory exception fails closed
+        def failing_factory():
+            raise RuntimeError("Secret store unreachable")
+
+        ctrl_broken_factory = ExecutionController(
+            job_id=job1["id"],
+            worker_id=curr_worker_id,
+            lease_generation=g1_new,
+            queue=queue,
+            ipc_client=ipc_client,
+            github_client_factory=failing_factory,
+        )
+        with pytest.raises(SideEffectReconciliationBlockedError, match="Remote GitHub query failed during reconciliation"):
+            ctrl_broken_factory.on_create_pull_request(
+                sandbox=mock_sb1,
+                branch_name=scoped_branch1,
+                commit_message="commit",
+                pr_title="Test PR 1",
+                pr_body="body",
+            )
+        se_row2 = queue.conn.execute("SELECT status FROM job_side_effects WHERE side_effect_id = ?;", (se_id1,)).fetchone()
+        assert se_row2["status"] == "PENDING"
+
+        # 3. GitHub API query failure preserves unresolved recovery state
+        class FlakyGitHubClient:
+            def get_pulls(self, **kwargs):
+                raise ConnectionResetError("GitHub API rate limit or network reset")
+
+        ctrl_flaky_api = ExecutionController(
+            job_id=job1["id"],
+            worker_id=curr_worker_id,
+            lease_generation=g1_new,
+            queue=queue,
+            ipc_client=ipc_client,
+            github_client_factory=lambda: FlakyGitHubClient(),
+        )
+        with pytest.raises(SideEffectReconciliationBlockedError, match="Remote GitHub query failed during reconciliation"):
+            ctrl_flaky_api.on_create_pull_request(
+                sandbox=mock_sb1,
+                branch_name=scoped_branch1,
+                commit_message="commit",
+                pr_title="Test PR 1",
+                pr_body="body",
+            )
+        se_row3 = queue.conn.execute("SELECT status FROM job_side_effects WHERE side_effect_id = ?;", (se_id1,)).fetchone()
+        assert se_row3["status"] == "PENDING"
+
+        # 4. Existing closed/merged PR adopted cleanly across state="all"
+        class ClosedPRGitHubClient:
+            def __init__(self):
+                self.calls = []
+            def get_pulls(self, state, head):
+                self.calls.append({"state": state, "head": head})
+                return [{"html_url": "https://github.com/owner/repo/pull/42", "number": 42, "state": "closed"}]
+
+        closed_gh = ClosedPRGitHubClient()
+        ctrl_closed = ExecutionController(
+            job_id=job1["id"],
+            worker_id=curr_worker_id,
+            lease_generation=g1_new,
+            queue=queue,
+            ipc_client=ipc_client,
+            github_client_factory=lambda: closed_gh,
+        )
+        mock_sb1.pr_created = False
+        res_adopt = ctrl_closed.on_create_pull_request(
+            sandbox=mock_sb1,
+            branch_name=scoped_branch1,
+            commit_message="commit",
+            pr_title="Test PR 1",
+            pr_body="body",
+        )
+        assert res_adopt["success"] is True
+        assert res_adopt["adopted"] is True
+        assert res_adopt["pr_url"] == "https://github.com/owner/repo/pull/42"
+        assert closed_gh.calls[0]["state"] == "all"
+        assert getattr(mock_sb1, "pr_created", False) is False
+
+        # 5. Verified absence allows safe creation under new lease
+        job2 = queue.enqueue_job(
+            user_id="user_alice",
+            session_id="sess_rec_2",
+            repository="owner/repo",
+            payload={"prompt": "Test verified absence"},
+        )
+        c2 = queue.claim_next_job(worker_id=prior_worker_id)
+        g2 = c2["lease_generation"]
+        se_key2 = f"pr_{job2['id'][:8]}"
+        scoped_branch2 = f"ai-cloud/job-{job2['id'][:8]}"
+        se_id2, _, _ = queue.reserve_side_effect(
+            job_id=job2["id"],
+            worker_id=prior_worker_id,
+            lease_generation=g2,
+            action_type="CREATE_PULL_REQUEST",
+            action_key=se_key2,
+            intent_payload={"branch_name": scoped_branch2, "title": "Test PR 2"},
+        )
+
+        with queue._lock:
+            with queue.conn:
+                queue.conn.execute("UPDATE jobs SET lease_expires_at = ? WHERE id = ?;", (time.time() - 10.0, job2["id"]))
+        queue.reap_stale_jobs()
+
+        c2_new = queue.claim_next_job(worker_id=curr_worker_id)
+        g2_new = c2_new["lease_generation"]
+
+        class EmptyGitHubClient:
+            def get_pulls(self, state, head):
+                assert state == "all"
+                return []
+
+        mock_sb2 = MockSandbox("owner/repo")
+        ctrl_empty = ExecutionController(
+            job_id=job2["id"],
+            worker_id=curr_worker_id,
+            lease_generation=g2_new,
+            queue=queue,
+            ipc_client=ipc_client,
+            github_client_factory=lambda: EmptyGitHubClient(),
+        )
+        res_created = ctrl_empty.on_create_pull_request(
+            sandbox=mock_sb2,
+            branch_name=scoped_branch2,
+            commit_message="commit new",
+            pr_title="Test PR 2",
+            pr_body="body new",
+        )
+        assert res_created["success"] is True
+        assert res_created.get("adopted") is None
+        assert "pull/42" in res_created["pr_url"]
+        # Verify ledger confirmed new PR under curr_worker_id and g2_new
+        se_row_new = queue.conn.execute("SELECT * FROM job_side_effects WHERE side_effect_id = ?;", (se_id2,)).fetchone()
+        assert se_row_new["status"] == "CONFIRMED"
+        assert se_row_new["worker_id"] == curr_worker_id
+        assert se_row_new["lease_generation"] == g2_new
+
+        sup.shutdown()

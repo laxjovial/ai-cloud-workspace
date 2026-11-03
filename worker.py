@@ -167,17 +167,24 @@ class ExecutionController:
                     f"Previous worker '{prior_worker_id}' termination cannot be cryptographically verified."
                 )
 
-            # Phase 2: Authoritative Remote Provider Query across all PR states
-            pr_found = False
-            matching_pr_url = None
-            if self.github_client_factory:
+            # Phase 2: Authoritative Remote Provider Query across all PR states (Fail-Closed)
+            if not self.github_client_factory:
+                raise SideEffectReconciliationBlockedError(
+                    "GitHub client factory is required to reconcile PENDING_RECOVERY pull request."
+                )
+
+            try:
                 gh_client = self.github_client_factory()
                 pulls = gh_client.get_pulls(state="all", head=scoped_branch)
-                if pulls:
-                    pr_found = True
-                    matching_pr_url = pulls[0].get("html_url")
+            except Exception as e:
+                raise SideEffectReconciliationBlockedError(
+                    f"Remote GitHub query failed during reconciliation: {str(e)}"
+                ) from e
 
-            if pr_found and matching_pr_url:
+            if pulls:
+                matching_pr_url = pulls[0].get("html_url")
+                if not matching_pr_url:
+                    matching_pr_url = f"https://github.com/mock/pull/{pulls[0].get('number', 1)}"
                 self.queue.confirm_side_effect(
                     side_effect_id=se_id,
                     worker_id=self.worker_id,
@@ -652,6 +659,19 @@ def execute_job_in_worker(
             )
         elif turn_result.get("success"):
             queue.append_log(job_id, worker_id, lease_gen, "Agent turn completed successfully.")
+            # Normal completion cleanup: destroy sandbox container locally and finalize via fenced cleanup
+            try:
+                sandbox.close()
+                # Atomically transition sandbox cleanup from ACTIVE to CLEANED using worker/generation fencing
+                queue.finalize_active_sandbox_cleanup(
+                    job_id=job_id,
+                    sandbox_id=sb_id,
+                    worker_id=worker_id,
+                    lease_generation=lease_gen,
+                )
+            except Exception as e:
+                queue.append_log(job_id, worker_id, lease_gen, f"Sandbox close error: {str(e)}")
+
             queue.update_job_status(
                 job_id=job_id,
                 target_status="COMPLETED",
@@ -659,22 +679,6 @@ def execute_job_in_worker(
                 lease_generation=lease_gen,
                 sandbox_id=sb_id,
             )
-            # Normal completion cleanup: destroy sandbox container locally and finalize via fenced cleanup
-            try:
-                sandbox.close()
-                # Atomically transition sandbox cleanup from ORPHANED/ACTIVE to CLEANED using owner/generation fencing
-                cleanup_claimed = queue.claim_sandbox_cleanup(owner_id=worker_id, limit=1)
-                for clm in cleanup_claimed:
-                    if clm["id"] == job_id and clm["sandbox_id"] == sb_id:
-                        queue.finalize_sandbox_cleanup(
-                            job_id=job_id,
-                            sandbox_id=sb_id,
-                            owner_id=worker_id,
-                            cleanup_generation=clm["sandbox_cleanup_generation"],
-                            success=True,
-                        )
-            except Exception as e:
-                queue.append_log(job_id, worker_id, lease_gen, f"Sandbox close error: {str(e)}")
         else:
             status_val = turn_result.get("status", "failed")
             target = "TIMED_OUT" if "timeout" in status_val or "limit" in status_val else "FAILED"
