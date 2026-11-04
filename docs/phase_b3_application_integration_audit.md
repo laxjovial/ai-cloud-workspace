@@ -1,76 +1,56 @@
-# Phase B.3 Application Integration Architecture Audit & Blueprint
+# Phase B.3 Application Integration Architecture Audit & Blueprint (Revised)
 
-**Status:** Inspection & Design Phase (Pre-Implementation)  
+**Status:** Architecture Review Revision (Pre-Implementation)  
 **Author:** AI Cloud Workspace Agent  
 **Base Commit Inspected:** [`e02f52b459a72b33691d3ca954aae9654fd59203`](file:///home/gamp/portfolio/ai-cloud-workspace) (`main` post-PR #3 merge)  
 **Branch:** `audit/phase-b3-application-integration`  
-**Scope:** Streamlit Application (`app.py`), Agent Execution (`agent.py`), User Store (`db.py`), Durable Job Store (`job_queue.py`), and Autonomous Worker Engine (`worker.py`).
+**Scope:** Streamlit Application ([`app.py`](file:///home/gamp/portfolio/ai-cloud-workspace/app.py)), Agent Execution ([`agent.py`](file:///home/gamp/portfolio/ai-cloud-workspace/agent.py)), User Store ([`db.py`](file:///home/gamp/portfolio/ai-cloud-workspace/db.py)), Durable Job Store ([`job_queue.py`](file:///home/gamp/portfolio/ai-cloud-workspace/job_queue.py)), and Autonomous Worker Engine ([`worker.py`](file:///home/gamp/portfolio/ai-cloud-workspace/worker.py)).
 
 ---
 
-## 1. Executive Summary
+## 1. Executive Summary & Review Revisions
 
-With the successful merge of Phase B.1 (Durable Job Store) and Phase B.2 (Autonomous Worker Engine), the repository possesses an enterprise-grade, lease-fenced, crash-resilient execution substrate. However, the interactive user-facing application ([`app.py`](file:///home/gamp/portfolio/ai-cloud-workspace/app.py)) still executes tasks synchronously within the Streamlit server thread. 
+With the successful merge of Phase B.1 (Durable Job Store) and Phase B.2 (Autonomous Worker Engine), the repository possesses an enterprise-grade, lease-fenced, crash-resilient execution substrate. This revision addresses three critical architectural constraints identified during the initial Phase B.3 audit review:
 
-If a user navigates away, closes their browser tab, or experiences a network disruption while an agent task is executing:
-1. Streamlit terminates the active script run thread.
-2. The agent loop in [`agent.py`](file:///home/gamp/portfolio/ai-cloud-workspace/agent.py) is abruptly killed mid-turn.
-3. Temporary Docker sandbox containers leak on the host.
-4. Git state inside the sandbox is left uncommitted and untracked.
-5. In-flight API tokens and intermediate progress are unrecoverably lost.
-
-This audit establishes the comprehensive integration blueprint for **Phase B.3 ("Application Integration")**. Phase B.3 decouples the interactive Streamlit UI from long-running execution by introducing an explicit **Client-Service Boundary** (`job_service.py`), transforming [`app.py`](file:///home/gamp/portfolio/ai-cloud-workspace/app.py) into an asynchronous event observer and control plane, while delegating all sandbox and agent execution to supervised, durable background workers.
+1. **Worker Process Model & Decoupled Lifecycle:** The worker supervisor is **never** started, managed, or owned by the Streamlit application process. The worker supervisor runs strictly as an independent OS service daemon (`python -m worker`). Streamlit acts solely as an unprivileged client interface for job submission, event observation, and cancellation requests.
+2. **Credential Reference Architecture:** Plaintext credentials, session decryption context, and master encryption keys are **never** placed into durable job records, event tables, or payload blobs. Payloads store immutable, tenant-scoped *credential references*. The independent worker process decrypts credentials directly from the encrypted user store ([`db.py`](file:///home/gamp/portfolio/ai-cloud-workspace/db.py)) inside worker child memory at execution time, enabling jobs to continue seamlessly after the user's browser session disconnects.
+3. **SQLite WAL Deployment Boundary:** SQLite in Write-Ahead Logging (WAL) mode is verified and explicitly bounded to **coordinated processes running on the same host and local POSIX filesystem**. Multi-container or multi-host deployments sharing SQLite over network filesystems (NFS/CIFS) are explicitly out-of-scope for Phase B.3.
 
 ---
 
-## 2. Existing vs. Proposed Execution Architecture
+## 2. Verified Current Behavior vs. Proposed Phase B.3 Architecture
 
-### 2.1 Existing Synchronous Call Graph (Current `main`)
+### 2.1 Verified Current Behavior (`main` at `e02f52b`)
 
-Currently, [`app.py`](file:///home/gamp/portfolio/ai-cloud-workspace/app.py) handles user interaction, sandbox orchestration, LLM inference, and message persistence in a single blocking synchronous call:
+Source code inspection of [`app.py`](file:///home/gamp/portfolio/ai-cloud-workspace/app.py), [`agent.py`](file:///home/gamp/portfolio/ai-cloud-workspace/agent.py), and [`db.py`](file:///home/gamp/portfolio/ai-cloud-workspace/db.py) confirms the following runtime dynamics:
 
-```mermaid
-sequenceDiagram
-    autonumber
-    actor User
-    participant App as app.py (Streamlit Thread)
-    participant DB as db.py (Encrypted User Store)
-    participant Sandbox as sandbox.py (Docker / Workspace)
-    participant Agent as agent.py (run_agent_turn)
-    participant LLM as LiteLLM API
-
-    User->>App: Submits Prompt in Chat Input
-    App->>DB: add_message(role="user", content=...)
-    App->>App: Render user message in UI
-    Note over App,Sandbox: Synchronous Sandbox Boot (app.py:1654)
-    App->>Sandbox: WorkspaceSandbox.start()
-    Sandbox-->>App: sandbox instance
-    Note over App,Agent: Blocking Agent Loop (app.py:1680-1740)
-    loop Up to max_turns
-        App->>Agent: run_agent_turn(agent_input, status_callback)
-        Agent->>LLM: completion(messages, tools)
-        LLM-->>Agent: tool_calls
-        Agent->>Sandbox: execute_command() / file_write()
-        Sandbox-->>Agent: tool_result
-        Agent->>App: status_callback("Ran command...")
-        App->>App: status_box.update() (Direct UI Mutation)
-    end
-    Agent-->>App: final_turn_result
-    App->>Sandbox: sandbox.cleanup()
-    App->>DB: add_message(role="assistant", content=...)
-    App->>App: st.rerun()
-```
-
-#### Vulnerabilities in Current Model:
-- **Thread Hijacking:** If the browser disconnects or the user refreshes, Streamlit tears down the execution thread. Docker sandboxes are orphaned.
-- **Unbounded Reruns:** Any widget interaction in the sidebar triggers a Streamlit rerun, potentially spawning duplicate execution threads or corrupting state.
-- **Direct DB Coupling:** [`app.py`](file:///home/gamp/portfolio/ai-cloud-workspace/app.py) directly manages decrypted API keys in `st.session_state` and passes raw secrets across function arguments.
+1. **Agent Initiation & Execution Flow ([`app.py:1654-1740`](file:///home/gamp/portfolio/ai-cloud-workspace/app.py#L1654-L1740)):**
+   - User prompt is captured in Streamlit's script runner thread.
+   - `app.py` directly instantiates `sandbox = WorkspaceSandbox(repo_name, github_token)` and calls `sandbox.start()` synchronously.
+   - It invokes `agent.run_agent_turn()` on the active Streamlit script runner thread with a blocking loop up to `max_turns`.
+   - UI status updates are executed synchronously via `status_box.update(label=text)`.
+2. **Streamlit Script Reruns & UI Interactions:**
+   - Any widget interaction (sidebar filters, tab clicks) triggers a script rerun.
+   - In Streamlit, a rerun starts a new execution of `app.py`. If a previous script run was active on that session, Streamlit halts or abandons the previous script run's output widgets.
+   - Crucially, in Python, a thread running CPU work or blocking socket I/O may continue executing in the background until it finishes or errors, but its UI callbacks fail or detach, leaving the thread's results unpersisted to the UI.
+3. **Sandbox Teardown & Inability to Survive Disconnects:**
+   - [`app.py:1737-1740`](file:///home/gamp/portfolio/ai-cloud-workspace/app.py#L1737-L1740) wraps execution in `try ... finally: sandbox.close()`.
+   - If the user closes the tab or navigates away before completion, the sandbox is abruptly torn down (or worse, if the thread is terminated by a server shutdown, the container leaks on the host without cleanup).
+   - The sandbox **cannot** survive independently of the UI session under the current design.
+4. **Result Persistence & Reconnection Failure:**
+   - Final results and terminal output are only written to the database via `db.add_message()` at [`app.py:1729-1736`](file:///home/gamp/portfolio/ai-cloud-workspace/app.py#L1729-L1736) *after* the entire synchronous turn finishes.
+   - If a user disconnects or refreshes mid-turn, nothing is written to `db.add_message()`. Upon reconnecting, the user sees an empty chat without intermediate history or recovered output.
+5. **Cancellation Disconnect:**
+   - [`app.py`](file:///home/gamp/portfolio/ai-cloud-workspace/app.py) provides no cancellation mechanism for running turns. Even if a user clicks another action, the running agent turn cannot be stopped cooperatively.
 
 ---
 
-### 2.2 Proposed Asynchronous Call Graph (Phase B.3)
+### 2.2 Proposed Phase B.3 Execution Architecture
 
-In Phase B.3, [`app.py`](file:///home/gamp/portfolio/ai-cloud-workspace/app.py) never directly invokes [`WorkspaceSandbox`](file:///home/gamp/portfolio/ai-cloud-workspace/sandbox.py) or [`agent.run_agent_turn`](file:///home/gamp/portfolio/ai-cloud-workspace/agent.py). Instead, it communicates strictly via an application service layer ([`job_service.py`](file:///home/gamp/portfolio/ai-cloud-workspace/job_service.py)):
+In Phase B.3, execution is fully decoupled into three isolated tiers:
+- **Presentation Layer ([`app.py`](file:///home/gamp/portfolio/ai-cloud-workspace/app.py)):** Stateless, reactive Streamlit UI using `@st.fragment(run_every="2s")` to poll and render progress.
+- **Service Boundary ([`job_service.py`](file:///home/gamp/portfolio/ai-cloud-workspace/job_service.py)):** High-level client API enforcing tenant boundaries, idempotency, event queries, and cancellation requests.
+- **Autonomous Execution Engine ([`worker.py`](file:///home/gamp/portfolio/ai-cloud-workspace/worker.py) & [`job_queue.py`](file:///home/gamp/portfolio/ai-cloud-workspace/job_queue.py)):** Dedicated background daemon process (`WorkerSupervisor`) supervising child workers (`run_worker_process`) with lease heartbeats, sandbox registration, side-effect ledger, and atomic crash recovery.
 
 ```mermaid
 sequenceDiagram
@@ -78,244 +58,266 @@ sequenceDiagram
     actor User
     participant UI as app.py (Streamlit Fragment)
     participant Service as job_service.py (JobServiceClient)
-    participant Queue as job_queue.py (DurableJobQueue)
-    participant Sup as worker.py (WorkerSupervisor)
-    participant Worker as worker.py (Child Process Worker)
-    participant IPC as worker.py (SupervisorIPCServer)
+    participant Queue as job_queue.py (SQLite WAL)
+    participant Sup as worker.py (WorkerSupervisor Daemon)
+    participant Worker as worker.py (Child Process)
+    participant Store as db.py (.user_store AES-128)
 
-    User->>UI: Submits Prompt
-    UI->>Service: submit_agent_job(session_id, user_prompt, model_config)
-    Service->>Queue: enqueue_job(user_id, job_type="AGENT_RUN", payload=..., idempotency_key=...)
+    Note over Sup: Independently Managed Daemon (python -m worker)
+    
+    User->>UI: Submits Prompt (Click or Chat Input)
+    UI->>Service: submit_agent_turn(user_id, session_id, prompt, cred_refs, idempotency_key)
+    Service->>Queue: enqueue_job(user_id, payload, credential_refs, idempotency_key)
     Queue-->>Service: job_id
     Service-->>UI: job_id
     UI->>UI: Set st.session_state.active_job_id = job_id
 
-    Note over Sup,Worker: Autonomous Durable Execution (Detached)
+    Note over Sup,Worker: Autonomous Lease-Fenced Execution
     Sup->>Queue: claim_job(worker_id, ttl=30)
-    Queue-->>Sup: job (job_id, payload)
-    Sup->>Worker: spawn_worker_process(job_id)
-    
-    loop Streamlit Polling Fragment (@st.fragment(run_every="2s"))
-        UI->>Service: get_job_view(job_id, after_event_id)
-        Service->>Queue: get_job_events(job_id, after_event_id)
-        Queue-->>Service: [JobEvent(STATUS_UPDATE), JobEvent(TOOL_CALL)]
-        Service-->>UI: JobView(status, new_events, partial_output)
-        UI->>UI: Render streaming steps in status box
+    Queue-->>Sup: job (id, payload, credential_refs)
+    Sup->>Worker: spawn child process (multiprocessing spawn)
+
+    Worker->>Store: Load & Decrypt BYOK Key / GitHub PAT via db.py
+    Store-->>Worker: Plaintext keys in worker child memory only
+    Worker->>Worker: WorkspaceSandbox.start()
+    Worker->>Queue: register_sandbox(sb_id, ACTIVE)
+
+    loop Polling via @st.fragment(run_every="2s")
+        UI->>Service: stream_job_events(job_id, user_id, after_event_id)
+        Service->>Queue: get_job_events(job_id, user_id, after_event_id)
+        Queue-->>Service: [JobEvent(TOOL_CALL), JobEvent(STATUS)]
+        Service-->>UI: new_events
+        UI->>UI: Update status indicator & live thought expander
     end
 
-    loop Worker Execution & IPC
-        Worker->>IPC: send_heartbeat(lease_generation)
-        Worker->>IPC: record_side_effect(action_type, idempotency_key)
-        IPC->>Queue: record_job_event(job_id, event_type, event_payload)
-    end
+    Note over User,UI: Browser Disconnect / Tab Close Does NOT Interrupt Worker!
 
-    Worker-->>Sup: Process Exit (Code 0)
-    Sup->>Queue: finalize_active_sandbox_cleanup()
-    Sup->>Queue: complete_job(job_id, result_summary)
-    
-    UI->>Service: get_job_view(job_id)
-    Service-->>UI: JobView(status="COMPLETED", final_message=...)
-    UI->>UI: Render assistant response & clear active_job_id
+    Worker->>Queue: finalize_active_sandbox_cleanup()
+    Worker->>Queue: update_job_status(COMPLETED, result_summary)
+    Worker-->>Sup: Child Process Exits (0)
+
+    Note over User,UI: User Reconnects / Opens App Later
+    User->>UI: Reopens Workspace Tab
+    UI->>Service: get_active_job_for_session(session_id, user_id)
+    Service->>Queue: Fetch latest job & events
+    Queue-->>Service: JobRecord(COMPLETED)
+    Service-->>UI: JobView(COMPLETED)
+    UI->>Store: db.add_message(assistant, final_response)
+    UI->>UI: Render final message & clear active_job_id
 ```
 
 ---
 
-## 3. Client-Service Boundary Architecture (`job_service.py`)
+## 3. Detailed Architecture Specifications
 
-To prevent leaky abstractions and avoid exposing raw SQLite connections or low-level lease mechanics to Streamlit, Phase B.3 introduces a dedicated, high-level client module: `job_service.py`.
+### 3.1 Worker Process Ownership & Lifecycle
 
-### 3.1 Class Contract: `JobServiceClient`
+**Decision:** The worker supervisor (`WorkerSupervisor`) is an independently managed OS process. It is **never** launched by or embedded within the Streamlit web server.
 
-```python
-class JobServiceClient:
-    """
-    High-level application client for job submission, cancellation,
-    and event streaming. Enforces multi-tenant isolation and data sanitization.
-    """
-    def __init__(self, db_path: Optional[str] = None):
-        self._queue = DurableJobQueue(db_path=db_path)
-
-    def submit_agent_turn(
-        self,
-        user_id: str,
-        session_id: str,
-        prompt: str,
-        repo_url: Optional[str],
-        base_branch: str,
-        model_name: str,
-        credential_refs: Dict[str, str],
-        idempotency_key: str,
-        max_turns: int = 15,
-        timeout_seconds: int = 600,
-    ) -> JobRecord:
-        """
-        Enqueues an agent task with deduplication and tenant fencing.
-        """
-        ...
-
-    def get_job_status(self, job_id: str, user_id: str) -> Optional[JobView]:
-        """
-        Fetches job status, validating that user_id owns the job.
-        """
-        ...
-
-    def stream_job_events(
-        self,
-        job_id: str,
-        user_id: str,
-        after_event_id: int = 0
-    ) -> List[JobEvent]:
-        """
-        Fetches incremental execution events for UI rendering.
-        """
-        ...
-
-    def cancel_job(self, job_id: str, user_id: str, reason: str = "User cancelled") -> bool:
-        """
-        Requests cancellation with tenant verification.
-        """
-        ...
-```
-
-### 3.2 Value Object: `JobView`
-A lightweight, UI-safe dataclass that encapsulates job state without leaking database connection objects or raw transaction handles:
-
-```python
-@dataclass(frozen=True)
-class JobView:
-    job_id: str
-    user_id: str
-    status: str  # QUEUED, RUNNING, COMPLETED, FAILED, CANCELLED
-    prompt: str
-    created_at: float
-    started_at: Optional[float]
-    completed_at: Optional[float]
-    events: List[JobEvent]
-    result_summary: Optional[Dict[str, Any]]
-    error_message: Optional[str]
-```
+1. **Development Environment:**
+   - Started explicitly in terminal or background process: `python -m worker --daemon` or `python worker.py`.
+   - Streamlit connects to the shared SQLite WAL database using the path in `JOBS_DB_PATH` or `DEFAULT_DB_PATH`.
+   - If the worker daemon is not running when a job is enqueued, the job remains safely in `QUEUED` status; `app.py` displays a clear status banner: *"Job queued. Waiting for worker daemon..."*.
+2. **Production Environment:**
+   - Managed as an independent systemd unit, container, or supervisor service (e.g., `supervisord` / systemd unit `ai-cloud-worker.service`).
+   - Independent restart policies and log rotation.
+3. **Prevention of Duplicate Supervisors:**
+   - The supervisor enforces an exclusive flock lock on the database/pidfile directory (`~/.ai_cloud_workspace/worker_supervisor.lock`).
+   - If an operator or script attempts to start a second supervisor instance, it fails immediately with an error log: `"Another WorkerSupervisor is already active. Exiting."`.
+4. **Shutdown & Failure Recovery:**
+   - Clean shutdown (SIGTERM/SIGINT): Supervisor notifies worker child processes, waits up to 10s for cooperative termination, cleans up child slots, closes IPC server, and releases locks.
+   - Sudden supervisor crash (SIGKILL/power loss): The next supervisor instance that starts runs the reconciler:
+     - Scans expired leases (`lease_expires_at < now`).
+     - Reclaims active sandboxes via `orphan_cleanup_status`.
+     - Re-enqueues or fails timed-out jobs safely according to retry policy.
 
 ---
 
-## 4. Key Architectural Subsystems & Requirements
+### 3.2 Credential Reference Architecture & Post-Session Autonomy
 
-### 4.1 Secret Management and Credential Flow
-**Existing Issue:** Currently, [`db.py`](file:///home/gamp/portfolio/ai-cloud-workspace/db.py) decrypts API keys into memory in `st.session_state`. If the worker is executed out-of-process, passing raw decrypted API keys through serialized job payloads exposes secrets in SQLite logs or database rows.
+**Decision:** Plaintext credentials and master encryption keys are strictly decoupled from the durable job queue. Durable job payloads store only scoped *credential references*.
 
-**Phase B.3 Design:**
-1. **Payload Isolation:** The job payload stored in `durable_jobs.payload` MUST NOT contain plaintext API keys.
-2. **Encrypted Token References:** The payload contains encrypted references or scoped credential handles (`credential_refs`).
-3. **Worker Key Decryption:** The worker child process loads the master encryption key from its isolated environment or uses IPC-mediated ephemeral credential retrieval at sandbox startup. Plaintext credentials never touch disk or the durable job queue database.
-
-### 4.2 Streamlit Rendering & UI State Reactivity
-**Existing Issue:** In older Streamlit patterns, polling requires `st.rerun()`, which redraws the entire page, causing jarring visual flickering, resetting scroll position, and re-rendering chat message lists.
-
-**Phase B.3 Design:**
-1. **Isolated Polling Fragment:** Utilize Streamlit’s `@st.fragment(run_every="2s")` to poll `JobServiceClient.stream_job_events()`. Only the status indicator and active thought stream re-render.
-2. **Reconnection Hydration:** If a user refreshes the page or opens the app in a new tab:
-   - `app.py` queries `job_service.get_active_job_for_session(session_id, user_id)`.
-   - If an active `RUNNING` or `QUEUED` job exists, the UI instantly re-attaches to the event stream.
-   - If a job finished while the user was away, the UI reads the final `COMPLETED` event, renders the message in the chat history via `db.add_message()`, and closes the progress container.
-
-### 4.3 Idempotency and Deduplication
-**Existing Issue:** Double-clicking "Send" or Streamlit widget rerun triggers can accidentally spawn multiple agent runs for the same user prompt.
-
-**Phase B.3 Design:**
-- Each prompt submission derives an `idempotency_key = sha256(f"{session_id}:{user_id}:{user_message_index}:{prompt.strip()}")`.
-- `DurableJobQueue.enqueue_job()` already supports idempotency keys; subsequent duplicate submissions will return the existing `job_id` rather than enqueuing a duplicate task.
-
-### 4.4 Worker Daemon Lifecycle Management
-**Existing Issue:** The autonomous worker engine ([`worker.py`](file:///home/gamp/portfolio/ai-cloud-workspace/worker.py)) needs to run continuously in the background to pick up queued jobs.
-
-**Phase B.3 Design:**
-- **Local Dev / Single Container:** In local development, the worker supervisor daemon can be launched alongside the Streamlit server via a lightweight process supervisor (e.g. `supervisord`, `Procfile`, or a detached background thread/process initiated via `worker.py --daemon`).
-- **Production / Scaled Deployment:** The worker daemon runs in a separate container/service sharing the database or queue backend, completely decoupled from the web app container.
+1. **Storage & Separation of Concerns:**
+   - **Encrypted Store ([`db.py`](file:///home/gamp/portfolio/ai-cloud-workspace/db.py)):** Sensitive BYOK API keys and GitHub PATs are encrypted with AES-128 Fernet and persisted in `.user_store/<sha256(user_id)>.json` or Supabase encrypted tables.
+   - **Job Payload (`durable_jobs.payload`):** Contains user instructions, repository name, target branch, model name, and `credential_refs`:
+     ```json
+     {
+       "credential_refs": {
+         "github": {"type": "user_store", "account_id": "gh_1730700000_octocat"},
+         "gemini": {"type": "user_store", "provider": "gemini"}
+       }
+     }
+     ```
+   - No plaintext API keys, GitHub tokens, or session tokens exist in `durable_jobs` or `job_events`.
+2. **Worker-Side Credential Retrieval:**
+   - The worker child process is an OS process executing under the same host security context with access to `ENCRYPTION_KEY` (via environment variable or secret configuration).
+   - Upon claiming a job, the worker executes `execute_job_in_worker()`:
+     1. Reads `user_id` from the claimed job.
+     2. Invokes `db._load_local_user_data(user_id=user_id)` inside the worker child process.
+     3. Resolves and decrypts the referenced keys directly into private worker child process memory.
+     4. Passes decrypted strings in-memory to [`WorkspaceSandbox`](file:///home/gamp/portfolio/ai-cloud-workspace/sandbox.py) and [`agent.run_agent_turn()`](file:///home/gamp/portfolio/ai-cloud-workspace/agent.py).
+3. **Post-Session Validity:**
+   - Because the worker resolves credentials from the persistent encrypted user store on disk using `ENCRYPTION_KEY`, the job does **not** depend on an active Streamlit HTTP session, cookie, or PKCE OAuth token.
+   - If the user closes the browser or powers down their client machine, the worker process continues running autonomously until the turn completes.
+4. **Tenant Ownership & Authorization Checks:**
+   - The worker verifies that the `user_id` on the job record matches the owner of the credentials retrieved.
+   - If a credential reference cannot be found or decrypted, the worker immediately fails closed (`JobQueueError("Security violation: required credential reference could not be resolved from secure tenant store.")`) and transitions the job to `FAILED`.
 
 ---
 
-## 5. Security, Lifecycle, and Concurrency Review
+### 3.3 SQLite WAL Supported Deployment Boundary
 
-| Security / Concurrency Vector | Risk / Threat | Mitigation in Phase B.3 Design |
-| :--- | :--- | :--- |
-| **Cross-Tenant Job Tampering** | Malicious user crafts requests with arbitrary `job_id`s to view output or cancel another user's job. | `JobServiceClient` enforces `WHERE user_id = ?` on every status query, event fetch, and cancellation request. Low-level `DurableJobQueue` already strictly enforces this in SQL. |
-| **Secret Exfiltration in Events** | Tool outputs or LLM events contain raw API tokens or authorization headers. | Event recording sanitizes outputs before calling `record_job_event()`. Tokens matching known patterns (GitHub PAT, OpenAI, Anthropic) are masked. |
-| **Race Conditions on Cancel** | User clicks "Cancel" simultaneously while worker is completing and creating a PR. | `WorkerSupervisor` and `SupervisorIPCServer` require atomic lease validation. IPC side-effect recording fails closed if `job.status != 'RUNNING'` or cancellation flag is set. |
-| **Database Contention (SQLite)** | High-frequency polling from Streamlit fragments conflicts with Worker heartbeats and job event writes. | SQLite is configured in WAL mode (`PRAGMA journal_mode=WAL;`). Reads never block writes, and writes use short-lived `BEGIN IMMEDIATE` transactions with exponential backoff. |
+**Decision:** SQLite Write-Ahead Logging (WAL) is supported strictly for **same-host, multi-process deployments sharing a local POSIX filesystem**.
+
+1. **Supported Deployment Model:**
+   - Streamlit web application process and Worker supervisor daemon run on the **same OS host** (or within the same host filesystem mount).
+   - The SQLite database file (`jobs.db`) is configured with:
+     ```sql
+     PRAGMA journal_mode = WAL;
+     PRAGMA synchronous = NORMAL;
+     PRAGMA busy_timeout = 30000;
+     ```
+   - Multiple reader processes (Streamlit script runners) and writer processes (`WorkerSupervisor` and child workers) coordinate concurrently via POSIX advisory locks (`fcntl`) and SQLite's internal shared-memory (`jobs.db-shm`) / WAL (`jobs.db-wal`) files.
+2. **Unsupported Architectures & Explicit Limitations:**
+   - **Network Filesystems (NFS, CIFS, SMB, GlusterFS):** WAL mode requires shared memory primitives (`mmap` on the `-shm` file) and reliable POSIX byte-range locking. Distributed network filesystems have broken or buggy `fcntl`/`mmap` cache coherence, leading to database corruption.
+   - **Cross-Host Containers:** Separate Docker containers running on different virtual machines or cloud nodes **must not** attempt to mount a shared SQLite WAL database over network storage.
+3. **Future Scaling Path (Beyond Phase B.3):**
+   - If multi-host distributed scaling is required in the future, the storage layer must be migrated to a client-server relational database (e.g., PostgreSQL with `SKIP LOCKED` row claiming). No database migration is performed in Phase B.3.
 
 ---
 
-## 6. Incremental Implementation Plan
+### 3.4 Validated Streamlit Behavior & UI Reactivity
 
-To ensure zero regressions and safe review gates, Phase B.3 will be implemented in four distinct, test-verified increments:
+1. **Environment Verification:**
+   - Python virtual environment: `.venv/bin/python3` (Python 3.12.3).
+   - Pytest version: `pytest 9.2.0`.
+   - Pinned Streamlit dependency in `requirements.txt`: `streamlit>=1.65.0`.
+   - **Installed Streamlit version:** `streamlit 1.65.0`.
+   - **Feature Availability:** `hasattr(st, 'fragment') == True`.
+   - Signature: `st.fragment(func=None, *, run_every=None, parallel=False, key=None)`.
+2. **Flicker-Free Polling Implementation:**
+   - In Streamlit 1.65.0, `@st.fragment(run_every="2s")` allows a specific UI function to rerun periodically on a background interval *without* re-executing the entire page script.
+   - The main script loads chat history once. The active job progress bar, status spinner, and streaming thought log are isolated inside the fragment.
+   - When the fragment observes `job.status in ("COMPLETED", "FAILED", "CANCELLED")`, it persists the final result via `db.add_message()`, clears `st.session_state.active_job_id`, and triggers `st.rerun()` to return the UI to idle state.
+3. **Reconnection & Hydration Logic:**
+   - On page load, `app.py` queries `job_service.get_active_job_for_session(session_id, user.id)`.
+   - If an active job exists (`QUEUED` or `RUNNING`), `st.session_state.active_job_id` is restored, and the `@st.fragment` resumes polling from the last received event ID (`after_event_id`).
+   - If a job finished while the user was away, the UI fetches the final status, appends the assistant response to the conversation history, and renders the completed chat state.
+
+---
+
+## 4. Application-to-Worker Call Graph
+
+### 4.1 Component Interaction Overview
 
 ```mermaid
 flowchart TD
-    subgraph Step 1: Service Layer
-        A1[Create job_service.py] --> A2[Unit test JobServiceClient]
-        A2 --> A3[Verify Multi-tenant Fencing & Idempotency]
+    subgraph UI_Layer [Streamlit UI Process: app.py]
+        A[User Input / Quick Action] --> B[job_service.submit_agent_turn]
+        C[st.fragment Polling Loop] --> D[job_service.stream_job_events]
+        E[Cancel Button] --> F[job_service.cancel_job]
     end
 
-    subgraph Step 2: Worker Agent Bridge
-        B1[Adapt worker.py job payload] --> B2[Implement agent turn runner inside worker]
-        B2 --> B3[Wire event streaming from agent callbacks to IPC events]
+    subgraph Service_Layer [Client Boundary: job_service.py]
+        B --> G[DurableJobQueue.enqueue_job]
+        D --> H[DurableJobQueue.get_job_events]
+        F --> I[DurableJobQueue.request_cancellation]
     end
 
-    subgraph Step 3: Streamlit UI Integration
-        C1[Add @st.fragment polling widget in app.py] --> C2[Wire JobServiceClient to chat input]
-        C2 --> C3[Implement session reattachment on page reload]
+    subgraph DB_Layer [Persistent Storage]
+        G --> J[(jobs.db SQLite WAL)]
+        H --> J
+        I --> J
+        K[(Encrypted .user_store)]
     end
 
-    subgraph Step 4: Verification & Hardening
-        D1[Integration test full cycle: UI submit -> Worker -> Event stream -> Complete] --> D2[Simulate browser disconnect during execution]
-        D2 --> D3[Confirm sandbox cleanup and result recovery]
+    subgraph Worker_Layer [Autonomous Daemon: worker.py]
+        L[WorkerSupervisor] -->|Claims Job| J
+        L -->|Spawns| M[Worker Child Process]
+        M -->|Decrypts Creds| K
+        M -->|Starts| N[WorkspaceSandbox]
+        M -->|Executes Loop| O[agent.run_agent_turn]
+        O -->|Dispatches Events| P[SupervisorIPCClient]
+        P -->|Fenced Write| J
+        M -->|Fenced Teardown| J
     end
-
-    Step 1 --> Step 2
-    Step 2 --> Step 3
-    Step 3 --> Step 4
 ```
-
-### Increment 1: `job_service.py` Client Boundary
-- Implement `JobServiceClient` with complete type annotations and docstrings.
-- Add comprehensive test suite `tests/test_phase_b3_job_service.py` verifying:
-  - Job enqueuing with idempotency.
-  - Multi-tenant query isolation (rejecting cross-tenant access).
-  - Event stream polling and filtering by sequence ID.
-  - Cancellation propagation.
-
-### Increment 2: Worker Agent Execution Bridge
-- Update `worker.execute_job_in_worker()` to recognize `job_type="AGENT_RUN"`.
-- Adapt `agent.run_agent_turn()` so its status callbacks and tool outputs dispatch structured `JobEvent` notifications via `SupervisorIPCClient`.
-- Ensure sandbox lifecycle (creation, command execution, teardown) adheres strictly to the existing Phase B.2 lease fencing and orphan cleanup.
-
-### Increment 3: Streamlit UI Refactoring (`app.py`)
-- Replace synchronous sandbox boot and turn loop in [`app.py`](file:///home/gamp/portfolio/ai-cloud-workspace/app.py) with `job_service.submit_agent_turn()`.
-- Implement `@st.fragment` polling component to render live progress, tool executions, and status updates without full-page reruns.
-- Implement session hydration: on page load, check for active jobs and seamlessly resume rendering.
-- Add an explicit "Cancel Task" button bound to `job_service.cancel_job()`.
-
-### Increment 4: End-to-End Resilience & Disconnect Tests
-- Implement integration tests simulating:
-  1. Complete job execution through `job_service`.
-  2. Browser disconnect mid-turn (verifying worker completes independently and records final result).
-  3. Re-attachment after worker completion (verifying UI retrieves completed state).
-  4. User cancellation mid-turn (verifying prompt worker termination and sandbox teardown).
 
 ---
 
-## 7. Architectural Decisions Requiring Approval
+## 5. Security & Isolation Matrix
 
-Before authoring code or modifying [`app.py`](file:///home/gamp/portfolio/ai-cloud-workspace/app.py), approval is requested on the following three architectural decisions:
+| Threat Vector | Risk Level | Architectural Mitigation |
+| :--- | :--- | :--- |
+| **Plaintext Credential Exposure** | Critical | Plaintext keys are **never** passed in job payloads or logs. Payloads hold references (`credential_refs`); worker child process decrypts them in-memory only via `db._load_local_user_data()` and `ENCRYPTION_KEY`. |
+| **Cross-Tenant Data Tampering** | Critical | All service methods (`submit_agent_turn`, `stream_job_events`, `cancel_job`, `get_job_status`) require and enforce `user_id`. SQL queries in `job_queue.py` strictly enforce `WHERE user_id = ?`. |
+| **Orphaned Sandbox Container Leaks** | High | Worker registers container ID upon creation (`register_sandbox`). On normal completion, worker executes `finalize_active_sandbox_cleanup()`. On abnormal crash, supervisor background reconciler destroys orphaned container. |
+| **Race Conditions on Cancellation** | Medium | Cancellation is cooperatively checked by the worker watchdog thread every 5s. Side-effect creation (e.g. GitHub PR) requires atomic IPC lease verification before execution. |
+| **Database Lock Contention** | Medium | SQLite WAL mode with `busy_timeout=30000ms`. Writes use short-lived `BEGIN IMMEDIATE` transactions under `queue._lock`. UI read queries do not block worker writes. |
 
-1. **Worker Process Model in Development:**
-   - *Option A (Recommended):* Streamlit application starts or manages a local background supervisor thread/subprocess if none is running, sharing the SQLite WAL file.
-   - *Option B:* The worker supervisor must be started explicitly in a separate terminal via `python -m worker --daemon`.
-   - *Recommendation:* Support Option A by default in `app.py` for seamless local developer experience, while allowing Option B via an environment flag (`WORKER_STANDALONE=1`).
+---
 
-2. **Secret Decryption Boundary:**
-   - *Option A (Recommended):* `app.py` passes the user's encrypted key blobs and session decryption context pointer to the worker payload; worker decrypts in-memory inside the child process.
-   - *Option B:* Worker calls an IPC endpoint on the supervisor to decrypt credentials on demand.
-   - *Recommendation:* Option A minimizes IPC surface and keeps the supervisor unaware of user-specific API keys.
+## 6. Incremental Implementation Plan & Acceptance Criteria
 
-3. **Streamlit UI Version & Fragment Polling:**
-   - Verify that Streamlit version >= 1.37.0 is pinned in [`requirements.txt`](file:///home/gamp/portfolio/ai-cloud-workspace/requirements.txt) to guarantee native `@st.fragment` support for flicker-free polling.
+To ensure strict regression testing and verifiable boundaries, Phase B.3 will be implemented across four distinct increments:
+
+```mermaid
+flowchart LR
+    B3_1[Increment B.3.1<br>job_service.py] --> B3_2[Increment B.3.2<br>Worker-Agent Bridge]
+    B3_2 --> B3_3[Increment B.3.3<br>Streamlit Fragment UI]
+    B3_3 --> B3_4[Increment B.3.4<br>Resilience & Disconnect Tests]
+```
+
+### Increment B.3.1: Service Layer (`job_service.py`)
+- **Scope:** Create `job_service.py` introducing `JobServiceClient` and `JobView`.
+- **Implementation:**
+  - Wrap `DurableJobQueue` with sanitized methods.
+  - Compute deterministic `idempotency_key` based on `sha256(session_id:user_id:user_turn:prompt)`.
+  - Validate tenant isolation on all reads and cancellations.
+- **Acceptance Criteria:**
+  - `tests/test_phase_b3_job_service.py` passes 100%.
+  - Verified rejection of cross-tenant job queries.
+  - Verified deduplication of rapid duplicate submissions.
+
+### Increment B.3.2: Worker-to-Agent Execution Bridge
+- **Scope:** Update `worker.py` to route `job_type="AGENT_RUN"` to `agent.run_agent_turn()`.
+- **Implementation:**
+  - Adapt status callbacks from `agent.py` to dispatch structured `JobEvent` records via IPC or direct queue event logging.
+  - Bind `ExecutionController` abort flag to agent step loop.
+  - Verify credential resolution from `credential_refs` with fail-closed semantics.
+- **Acceptance Criteria:**
+  - Worker executes end-to-end agent turn in isolated process.
+  - Sandbox registered and transitioned to `CLEANED` on completion.
+  - Side effects (PR creation) correctly fenced and recorded.
+
+### Increment B.3.3: Streamlit UI Integration (`app.py`)
+- **Scope:** Refactor chat input and execution rendering in [`app.py`](file:///home/gamp/portfolio/ai-cloud-workspace/app.py).
+- **Implementation:**
+  - Replace blocking `agent.run_agent_turn()` call with `job_service.submit_agent_turn()`.
+  - Implement `@st.fragment(run_every="2s")` to poll and render active job status, tool execution, and thinking logs.
+  - Add explicit "Cancel Run" button in the active status box.
+  - Implement session rehydration on page reload.
+- **Acceptance Criteria:**
+  - Prompt submission returns control to UI immediately.
+  - Live progress updates render without whole-page flicker.
+  - Chat history updates correctly upon completion.
+
+### Increment B.3.4: Reconnection, Cancellation, & Disconnect Resilience
+- **Scope:** Comprehensive end-to-end integration tests (`tests/test_phase_b3_integration.py`).
+- **Implementation:**
+  - Test simulated browser disconnect: submit job, disconnect client, verify worker completes and records results in job queue.
+  - Test reconnection: reconnect client after completion, verify UI retrieves and renders assistant message.
+  - Test cooperative cancellation: trigger cancellation while worker is running, verify worker terminates and sandbox is cleaned up.
+  - Test worker daemon failure: verify queued jobs survive and resume when daemon restarts.
+- **Acceptance Criteria:**
+  - All Phase A, B.1, B.2, and B.3 tests pass (100% green).
+  - Clean working tree with zero container leaks.
+
+---
+
+## 7. Status & Next Step
+
+* **Audit Branch:** `audit/phase-b3-application-integration`
+* **Audit Document:** [`docs/phase_b3_application_integration_audit.md`](file:///home/gamp/portfolio/ai-cloud-workspace/docs/phase_b3_application_integration_audit.md)
+* **Code State:** Frozen. Zero changes to `main`, Phase A, B.1, or B.2. No implementation of B.3 has begun.
+* **Awaiting:** User review and authorization to proceed with Increment B.3.1.
