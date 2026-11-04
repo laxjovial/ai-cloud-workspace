@@ -989,6 +989,52 @@ class TestPhaseB2WorkerEngine:
                 lease_generation=gen,
             )
 
+        # 3b. Expired lease cannot finalize cleanup
+        with queue._lock:
+            with queue.conn:
+                queue.conn.execute(
+                    "UPDATE jobs SET lease_expires_at = ? WHERE id = ?;",
+                    (time.time() - 10.0, job["id"]),
+                )
+        with pytest.raises(StaleLeaseError, match="lease is null or expired"):
+            queue.finalize_active_sandbox_cleanup(
+                job_id=job["id"],
+                sandbox_id=sb_id,
+                worker_id="worker_norm_1",
+                lease_generation=gen,
+            )
+
+        # Restore valid lease for subsequent checks
+        with queue._lock:
+            with queue.conn:
+                queue.conn.execute(
+                    "UPDATE jobs SET lease_expires_at = ? WHERE id = ?;",
+                    (time.time() + 60.0, job["id"]),
+                )
+
+        # 3c. Non-RUNNING job cannot finalize cleanup
+        with queue._lock:
+            with queue.conn:
+                queue.conn.execute(
+                    "UPDATE jobs SET status = 'QUEUED' WHERE id = ?;",
+                    (job["id"],),
+                )
+        with pytest.raises(StaleLeaseError, match="non-running status"):
+            queue.finalize_active_sandbox_cleanup(
+                job_id=job["id"],
+                sandbox_id=sb_id,
+                worker_id="worker_norm_1",
+                lease_generation=gen,
+            )
+
+        # Restore status to RUNNING
+        with queue._lock:
+            with queue.conn:
+                queue.conn.execute(
+                    "UPDATE jobs SET status = 'RUNNING' WHERE id = ?;",
+                    (job["id"],),
+                )
+
         # 4. Normal completion via execute_job_in_worker transitions ACTIVE -> CLEANED
         controller = ExecutionController(job_id=job["id"])
         mock_sb = MockSandbox("owner/repo", sandbox_id=sb_id)
@@ -1014,7 +1060,7 @@ class TestPhaseB2WorkerEngine:
         assert job_after["status"] == "COMPLETED"
         assert job_after["sandbox_cleanup_status"] == "CLEANED"
 
-        # 5. Repeated call is idempotent
+        # 5. Repeated call is idempotent for valid caller
         res_repeat = queue.finalize_active_sandbox_cleanup(
             job_id=job["id"],
             sandbox_id=sb_id,
@@ -1022,6 +1068,22 @@ class TestPhaseB2WorkerEngine:
             lease_generation=gen,
         )
         assert res_repeat is True
+
+        # 5b. Already-CLEANED row rejects mismatched worker or mismatched sandbox
+        with pytest.raises(StaleLeaseError):
+            queue.finalize_active_sandbox_cleanup(
+                job_id=job["id"],
+                sandbox_id=sb_id,
+                worker_id="imposter_worker",
+                lease_generation=gen,
+            )
+        with pytest.raises(JobQueueError, match="Sandbox ID mismatch"):
+            queue.finalize_active_sandbox_cleanup(
+                job_id=job["id"],
+                sandbox_id="wrong_sandbox_id",
+                worker_id="worker_norm_1",
+                lease_generation=gen,
+            )
 
         # 6. Failed close does not produce CLEANED status (it becomes ORPHANED on terminal update)
         job_fail = queue.enqueue_job(
@@ -1183,7 +1245,46 @@ class TestPhaseB2WorkerEngine:
         se_row3 = queue.conn.execute("SELECT status FROM job_side_effects WHERE side_effect_id = ?;", (se_id1,)).fetchone()
         assert se_row3["status"] == "PENDING"
 
-        # 4. Existing closed/merged PR adopted cleanly across state="all"
+        # 4a. Existing open PR adopted cleanly across state="all"
+        class OpenPRGitHubClient:
+            def __init__(self):
+                self.calls = []
+            def get_pulls(self, state, head):
+                self.calls.append({"state": state, "head": head})
+                return [{"html_url": "https://github.com/owner/repo/pull/101", "number": 101, "state": "open"}]
+
+        open_gh = OpenPRGitHubClient()
+        ctrl_open = ExecutionController(
+            job_id=job1["id"],
+            worker_id=curr_worker_id,
+            lease_generation=g1_new,
+            queue=queue,
+            ipc_client=ipc_client,
+            github_client_factory=lambda: open_gh,
+        )
+        mock_sb1.pr_created = False
+        res_adopt_open = ctrl_open.on_create_pull_request(
+            sandbox=mock_sb1,
+            branch_name=scoped_branch1,
+            commit_message="commit",
+            pr_title="Test PR 1",
+            pr_body="body",
+        )
+        assert res_adopt_open["success"] is True
+        assert res_adopt_open["adopted"] is True
+        assert res_adopt_open["pr_url"] == "https://github.com/owner/repo/pull/101"
+        assert open_gh.calls[0]["state"] == "all"
+        assert getattr(mock_sb1, "pr_created", False) is False
+
+        # Reset side effect status back to PENDING for testing closed PR adoption
+        with queue._lock:
+            with queue.conn:
+                queue.conn.execute(
+                    "UPDATE job_side_effects SET status = 'PENDING', worker_id = ?, lease_generation = ? WHERE side_effect_id = ?;",
+                    (prior_worker_id, g1, se_id1),
+                )
+
+        # 4b. Existing closed PR adopted cleanly across state="all"
         class ClosedPRGitHubClient:
             def __init__(self):
                 self.calls = []
@@ -1212,6 +1313,45 @@ class TestPhaseB2WorkerEngine:
         assert res_adopt["adopted"] is True
         assert res_adopt["pr_url"] == "https://github.com/owner/repo/pull/42"
         assert closed_gh.calls[0]["state"] == "all"
+        assert getattr(mock_sb1, "pr_created", False) is False
+
+        # Reset side effect status back to PENDING for testing merged PR adoption
+        with queue._lock:
+            with queue.conn:
+                queue.conn.execute(
+                    "UPDATE job_side_effects SET status = 'PENDING', worker_id = ?, lease_generation = ? WHERE side_effect_id = ?;",
+                    (prior_worker_id, g1, se_id1),
+                )
+
+        # 4c. Existing merged PR adopted cleanly across state="all"
+        class MergedPRGitHubClient:
+            def __init__(self):
+                self.calls = []
+            def get_pulls(self, state, head):
+                self.calls.append({"state": state, "head": head})
+                return [{"html_url": "https://github.com/owner/repo/pull/202", "number": 202, "state": "closed", "merged": True, "merged_at": "2026-11-04T00:00:00Z"}]
+
+        merged_gh = MergedPRGitHubClient()
+        ctrl_merged = ExecutionController(
+            job_id=job1["id"],
+            worker_id=curr_worker_id,
+            lease_generation=g1_new,
+            queue=queue,
+            ipc_client=ipc_client,
+            github_client_factory=lambda: merged_gh,
+        )
+        mock_sb1.pr_created = False
+        res_adopt_merged = ctrl_merged.on_create_pull_request(
+            sandbox=mock_sb1,
+            branch_name=scoped_branch1,
+            commit_message="commit",
+            pr_title="Test PR 1",
+            pr_body="body",
+        )
+        assert res_adopt_merged["success"] is True
+        assert res_adopt_merged["adopted"] is True
+        assert res_adopt_merged["pr_url"] == "https://github.com/owner/repo/pull/202"
+        assert merged_gh.calls[0]["state"] == "all"
         assert getattr(mock_sb1, "pr_created", False) is False
 
         # 5. Verified absence allows safe creation under new lease

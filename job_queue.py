@@ -1449,28 +1449,33 @@ class DurableJobQueue:
     ) -> bool:
         """Atomically transitions an ACTIVE sandbox to CLEANED upon normal completion.
 
-        Requires strict fencing: job_id, sandbox_id, worker_id, and lease_generation
-        must match the active lease. If already CLEANED, returns True idempotently.
+        Requires strict fencing:
+        - Exact job ID.
+        - Exact sandbox ID.
+        - Exact worker ID.
+        - Exact lease generation.
+        - Job status must be RUNNING.
+        - Lease expiry must be non-null and in the future (lease_expires_at >= now).
+        - Cleanup status must be ACTIVE (or already CLEANED for legitimate caller idempotent retry).
         """
         now = time.time()
+        validate_numeric(lease_generation, "lease_generation", 1, 1000000000, require_int=True)
         with self._lock:
             try:
                 with self.conn:
                     self.conn.execute("BEGIN IMMEDIATE;")
                     row = self.conn.execute(
                         """
-                        SELECT sandbox_id, worker_id, lease_generation, sandbox_cleanup_status
+                        SELECT status, sandbox_id, worker_id, lease_generation, lease_expires_at, sandbox_cleanup_status
                         FROM jobs
                         WHERE id = ?;
                         """,
                         (job_id,),
                     ).fetchone()
                     if not row:
-                        raise JobQueueError(f"Job '{job_id}' not found.")
+                        raise JobNotFoundError(f"Job '{job_id}' does not exist.")
 
-                    if row["sandbox_cleanup_status"] == "CLEANED":
-                        return True
-
+                    # Fencing identity checks must happen BEFORE checking cleanup status
                     if row["sandbox_id"] != sandbox_id:
                         raise JobQueueError(
                             f"Sandbox ID mismatch on job '{job_id}': expected '{sandbox_id}', found '{row['sandbox_id']}'"
@@ -1479,6 +1484,20 @@ class DurableJobQueue:
                     if row["worker_id"] != worker_id or (row["lease_generation"] or 0) != lease_generation:
                         raise StaleLeaseError(
                             f"Lease mismatch on job '{job_id}': worker '{worker_id}' gen {lease_generation} does not own active lease."
+                        )
+
+                    # Preserve idempotency for legitimate repeated calls by the same verified worker/generation
+                    if row["sandbox_cleanup_status"] == "CLEANED":
+                        return True
+
+                    if row["status"] != "RUNNING":
+                        raise StaleLeaseError(
+                            f"Cannot finalize normal sandbox cleanup: job '{job_id}' is in non-running status '{row['status']}'."
+                        )
+
+                    if row["lease_expires_at"] is None or row["lease_expires_at"] < now:
+                        raise StaleLeaseError(
+                            f"Worker '{worker_id}' (gen {lease_generation}) cannot finalize sandbox cleanup: lease is null or expired at {row['lease_expires_at']}."
                         )
 
                     if row["sandbox_cleanup_status"] != "ACTIVE":
@@ -1495,20 +1514,22 @@ class DurableJobQueue:
                           AND sandbox_id = ?
                           AND worker_id = ?
                           AND lease_generation = ?
+                          AND status = 'RUNNING'
+                          AND lease_expires_at >= ?
                           AND sandbox_cleanup_status = 'ACTIVE';
                         """,
-                        (job_id, sandbox_id, worker_id, lease_generation),
+                        (job_id, sandbox_id, worker_id, lease_generation, now),
                     )
                     self.conn.execute(
                         """
                         INSERT INTO job_events (
-                            job_id, event_type, source, message, created_at
-                        ) VALUES (?, 'SANDBOX_CLEANED', 'worker', ?, ?);
+                            job_id, event_type, source, worker_id, lease_generation, message, created_at
+                        ) VALUES (?, 'SANDBOX_CLEANED', 'worker', ?, ?, ?, ?);
                         """,
-                        (job_id, f"Sandbox '{sandbox_id}' successfully destroyed on completion.", now),
+                        (job_id, worker_id, lease_generation, f"Sandbox '{sandbox_id}' successfully destroyed on completion.", now),
                     )
                     return True
-            except (JobQueueError, StaleLeaseError):
+            except (JobQueueError, JobNotFoundError, StaleLeaseError):
                 raise
             except sqlite3.Error as e:
                 raise JobQueueError(f"Database error during finalize_active_sandbox_cleanup: {str(e)}") from e
