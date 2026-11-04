@@ -899,7 +899,9 @@ class TestPhaseB2WorkerEngine:
         sup = WorkerSupervisor(db_path=test_env["db_path"], concurrency=1)
         # Set stop event so supervise_step does not immediately spawn a replacement worker
         sup.start_worker_slot("slot_crash", custom_target=crashing_worker_target)
-        time.sleep(0.5)
+        proc = sup._workers["slot_crash"]["process"]
+        # Wait for child process to terminate
+        proc.join(timeout=3.0)
 
         sup._stop_event.set()
         # Supervise step detects crash and updates crash count
@@ -1033,6 +1035,49 @@ class TestPhaseB2WorkerEngine:
                 queue.conn.execute(
                     "UPDATE jobs SET status = 'RUNNING' WHERE id = ?;",
                     (job["id"],),
+                )
+
+        # 3d. Regression: lease expires while waiting to acquire queue lock / BEGIN IMMEDIATE
+        # Set a short lease duration (0.4s) that is currently valid
+        short_lease_expiry = time.time() + 0.4
+        with queue._lock:
+            with queue.conn:
+                queue.conn.execute(
+                    "UPDATE jobs SET lease_expires_at = ? WHERE id = ?;",
+                    (short_lease_expiry, job["id"]),
+                )
+
+        # Background thread acquires queue lock before finalize_active_sandbox_cleanup and holds it until lease expires
+        cleanup_result = {}
+        cleanup_exc = {}
+
+        def lock_holder():
+            with queue._lock:
+                # Hold lock until short lease is guaranteed to have expired
+                time.sleep(0.6)
+
+        holder_t = threading.Thread(target=lock_holder)
+        holder_t.start()
+        # Give thread time to acquire queue._lock
+        time.sleep(0.1)
+
+        # Now attempt cleanup while lock is held; finalize_active_sandbox_cleanup must block until lock_holder releases,
+        # by which time the lease will have expired. It must sample `now` AFTER lock acquisition and reject!
+        with pytest.raises(StaleLeaseError, match="lease is null or expired"):
+            queue.finalize_active_sandbox_cleanup(
+                job_id=job["id"],
+                sandbox_id=sb_id,
+                worker_id="worker_norm_1",
+                lease_generation=gen,
+            )
+        holder_t.join()
+
+        # Restore valid lease for subsequent checks
+        with queue._lock:
+            with queue.conn:
+                queue.conn.execute(
+                    "UPDATE jobs SET lease_expires_at = ? WHERE id = ?;",
+                    (time.time() + 60.0, job["id"]),
                 )
 
         # 4. Normal completion via execute_job_in_worker transitions ACTIVE -> CLEANED

@@ -1458,12 +1458,12 @@ class DurableJobQueue:
         - Lease expiry must be non-null and in the future (lease_expires_at >= now).
         - Cleanup status must be ACTIVE (or already CLEANED for legitimate caller idempotent retry).
         """
-        now = time.time()
         validate_numeric(lease_generation, "lease_generation", 1, 1000000000, require_int=True)
         with self._lock:
             try:
                 with self.conn:
                     self.conn.execute("BEGIN IMMEDIATE;")
+                    now = time.time()
                     row = self.conn.execute(
                         """
                         SELECT status, sandbox_id, worker_id, lease_generation, lease_expires_at, sandbox_cleanup_status
