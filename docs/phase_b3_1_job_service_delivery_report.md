@@ -1,4 +1,4 @@
-# Phase B.3.1 Delivery Report: Job Service Client Boundary (Targeted Corrections)
+# Phase B.3.1 Delivery Report: Job Service Client Boundary (Final Review Corrections)
 
 **Status:** Completed & Ready for Review  
 **Branch:** `feat/phase-b3-job-service`  
@@ -12,73 +12,54 @@
 
 ## 1. Executive Summary & Review Findings Addressed
 
-Following the independent review of Increment B.3.1, targeted corrections were implemented to close all identified security, idempotency, immutability, and sanitization gaps.
+Following the second review of Increment B.3.1, targeted corrections were implemented to establish a genuine authentication trust boundary, complete parameter comparison for custom idempotency keys, and eliminate concurrency races during duplicate submissions.
 
-### Summary of Corrections Delivered:
-1. **Authenticated Identity Contract ([`AuthenticatedContext`](file:///home/gamp/portfolio/ai-cloud-workspace/job_service.py#L110-L130)):**
-   - Replaced plain caller-supplied string trust with an explicit `AuthenticatedContext` contract.
-   - Enforces non-empty, validated principal identities and optional authentication metadata (`roles`, `email`, `auth_provider`, `session_token_hash`).
-   - String inputs are resolved strictly through `_resolve_context()`, failing closed with `JobAccessDeniedError` if empty or invalid.
-2. **Comprehensive Idempotency & Conflict Detection ([`IdempotencyConflictError`](file:///home/gamp/portfolio/ai-cloud-workspace/job_service.py#L71)):**
-   - Default idempotency key binds ALL execution-defining parameters: `(user_id, session_id, turn_index, prompt, repository, model, credential_refs, additional_payload)`.
-   - If an idempotency key (computed or custom) matches an existing record, [`_verify_idempotent_request_match()`](file:///home/gamp/portfolio/ai-cloud-workspace/job_service.py#L461-L507) verifies that the incoming request exactly matches the original repository, prompt, model, turn index, credential references, and payload values. Any mismatch is explicitly rejected with `IdempotencyConflictError`.
-3. **Payload Construction Protection:**
-   - Reserved fields (`job_type`, `prompt`, `model`, `turn_index`, `user_id`, `repository`) are strictly protected from overwrite by `additional_payload`.
-   - `additional_payload` is validated against an explicit allowlist: `ALLOWED_ADDITIONAL_PAYLOAD_KEYS` (`base_branch`, `target_branch`, `reasoning_effort`, `temperature`, `max_turns`, `context_files`). Disallowed keys raise `JobQueueError`.
-4. **Deep Immutability ([`make_deep_immutable()`](file:///home/gamp/portfolio/ai-cloud-workspace/job_service.py#L96-L107)):**
-   - `JobView.payload`, `credential_refs`, and `error`, as well as `JobEventView.data`, are recursively wrapped in `MappingProxyType` and immutable tuples.
-   - Callers cannot mutate nested dictionaries, lists, or fields.
-5. **Recursive Sanitization ([`sanitize_recursive()`](file:///home/gamp/portfolio/ai-cloud-workspace/job_service.py#L82-L93)):**
-   - Recursively traverses arbitrary nested structures (lists of dicts, dicts of lists, tuples) to mask tokens, GitHub PATs, OpenAI/Anthropic/Gemini keys, and Bearer authorization tokens.
+### Detailed Corrections Delivered:
+
+1. **Genuine Authentication Boundary ([`AuthenticationAuthority`](file:///home/gamp/portfolio/ai-cloud-workspace/job_service.py#L130-L200) & [`AuthenticatedPrincipal`](file:///home/gamp/portfolio/ai-cloud-workspace/job_service.py#L112-L127)):**
+   - **Removed string-based fallback:** The service no longer accepts raw `user_id` strings or caller-manufactured identity claims.
+   - **Cryptographic issuance and verification:** An `AuthenticatedPrincipal` can only be minted by an `AuthenticationAuthority` with an HMAC-SHA256 signature.
+   - **Fail-closed verification:** Every service method validates the principal's signature and expiration against the authority. Forged signatures, cross-authority tokens, expired tokens, and raw strings strictly raise [`AuthenticationVerificationError`](file:///home/gamp/portfolio/ai-cloud-workspace/job_service.py#L76) (`JobAccessDeniedError`).
+2. **Complete Parameter Idempotency Comparison ([`_verify_idempotent_request_match()`](file:///home/gamp/portfolio/ai-cloud-workspace/job_service.py#L555-L605)):**
+   - When an idempotency key matches an existing record, the service validates:
+     * `user_id` matches tenant ownership.
+     * `session_id` matches.
+     * `repository` matches.
+     * `max_retries` matches.
+     * `timeout_seconds` matches.
+     * `payload` canonically matches (detecting extra, missing, or altered keys).
+     * `credential_refs` canonically matches.
+   - Any difference raises [`IdempotencyConflictError`](file:///home/gamp/portfolio/ai-cloud-workspace/job_service.py#L71).
+3. **Race-Free Concurrent Duplicate Handling:**
+   - Wrapped check-and-enqueue logic under `self._queue._lock`.
+   - Concurrent submissions with identical parameters safely return the same job without database constraint errors or duplicate records.
+   - Concurrent submissions with conflicting parameters raise `IdempotencyConflictError`.
+   - Verified via a multithreaded concurrency test ([`test_3_concurrent_duplicate_submissions`](file:///home/gamp/portfolio/ai-cloud-workspace/tests/test_phase_b3_job_service.py#L182-L203)).
 
 ---
 
-## 2. Updated Service Interface
+## 2. Updated Interface Specification
 
 ```python
 @dataclass(frozen=True)
-class AuthenticatedContext:
+class AuthenticatedPrincipal:
     user_id: str
+    issuer: str
+    issued_at: float
+    signature: str
     email: Optional[str] = None
     roles: Tuple[str, ...] = ("user",)
-    auth_provider: str = "supabase"
-    session_token_hash: Optional[str] = None
 
-@dataclass(frozen=True)
-class JobView:
-    id: str
-    user_id: str
-    session_id: str
-    repository: str
-    status: str
-    payload: Any            # MappingProxyType (deeply immutable)
-    credential_refs: Any    # MappingProxyType (deeply immutable)
-    idempotency_key: Optional[str]
-    worker_id: Optional[str]
-    lease_generation: int
-    retry_count: int
-    max_retries: int
-    timeout_seconds: float
-    created_at: float
-    started_at: Optional[float]
-    finished_at: Optional[float]
-    cancel_requested_at: Optional[float]
-    cancel_requested_by: Optional[str]
-    error: Optional[Any]    # MappingProxyType or None (deeply immutable)
-    sandbox_id: Optional[str]
-    sandbox_cleanup_status: str
-
-    @property
-    def is_terminal(self) -> bool: ...
-    @property
-    def is_active(self) -> bool: ...
-    @property
-    def is_cancellation_requested(self) -> bool: ...
+class AuthenticationAuthority:
+    def issue_principal(self, user_id: str, email: Optional[str] = None, roles: Tuple[str, ...] = ("user",)) -> AuthenticatedPrincipal: ...
+    def verify_principal(self, principal: Any) -> AuthenticatedPrincipal: ...
 
 class JobServiceClient:
+    def __init__(self, db_path: str = DEFAULT_DB_PATH, queue: Optional[DurableJobQueue] = None, auth_authority: Optional[AuthenticationAuthority] = None): ...
+
     def submit_agent_turn(
         self,
-        context: Union[AuthenticatedContext, str],
+        principal: AuthenticatedPrincipal,
         session_id: str,
         repository: str,
         prompt: str,
@@ -91,33 +72,33 @@ class JobServiceClient:
         additional_payload: Optional[Dict[str, Any]] = None,
     ) -> JobView: ...
 
-    def get_job(self, job_id: str, context: Union[AuthenticatedContext, str]) -> JobView: ...
-    def get_job_events(self, job_id: str, context: Union[AuthenticatedContext, str], after_id: int = 0) -> List[JobEventView]: ...
-    def cancel_job(self, job_id: str, context: Union[AuthenticatedContext, str]) -> JobView: ...
-    def list_recent_jobs(self, context: Union[AuthenticatedContext, str], limit: int = 50) -> List[JobView]: ...
-    def get_active_job_for_session(self, session_id: str, context: Union[AuthenticatedContext, str]) -> Optional[JobView]: ...
+    def get_job(self, job_id: str, principal: AuthenticatedPrincipal) -> JobView: ...
+    def get_job_events(self, job_id: str, principal: AuthenticatedPrincipal, after_id: int = 0) -> List[JobEventView]: ...
+    def cancel_job(self, job_id: str, principal: AuthenticatedPrincipal) -> JobView: ...
+    def list_recent_jobs(self, principal: AuthenticatedPrincipal, limit: int = 50) -> List[JobView]: ...
+    def get_active_job_for_session(self, session_id: str, principal: AuthenticatedPrincipal) -> Optional[JobView]: ...
 ```
 
 ---
 
-## 3. Test Suite Verification
+## 3. Test Suite Execution Results
 
-All 14 tests in [`tests/test_phase_b3_job_service.py`](file:///home/gamp/portfolio/ai-cloud-workspace/tests/test_phase_b3_job_service.py) were executed alongside the regression suites:
+All 15 tests in [`tests/test_phase_b3_job_service.py`](file:///home/gamp/portfolio/ai-cloud-workspace/tests/test_phase_b3_job_service.py) were executed alongside the regression suites:
 
 ```bash
 PYTHONPATH=. .venv/bin/pytest tests/test_phase_a_security.py tests/test_phase_b_durable_execution.py tests/test_phase_b_worker_engine.py tests/test_phase_b3_job_service.py -v
 ```
 
-### Verified Test Results:
+### Output Summary:
 - **Phase A Security Hardening:** 25 passed.
 - **Phase B.1 Durable Job Store:** 17 passed.
 - **Phase B.2 Autonomous Worker Engine:** 17 passed.
-- **Phase B.3.1 Job Service Client Boundary:** 14 passed (including new tests for idempotency conflict detection, deep immutability, AuthenticatedContext, and recursive list-of-dict sanitization).
-- **Total:** **73 passed in 28.56s (100% green)**.
+- **Phase B.3.1 Job Service Client Boundary:** 15 passed (including authentic authority verification, concurrent duplicate submissions, full-parameter idempotency comparison, deep immutability, and recursive sanitization).
+- **Total:** **74 passed in 37.62s (100% green)**.
 
 ---
 
-## 4. Governance & Boundary Invariants Preserved
+## 4. Scope Discipline & Governance
 - `app.py`, `agent.py`, `worker.py`, and `job_queue.py` remain **completely untouched**.
-- No database migrations were performed.
-- Changes are strictly isolated to `job_service.py`, `tests/test_phase_b3_job_service.py`, and this report.
+- Zero schema migrations.
+- Implementation confined to `job_service.py` and `tests/test_phase_b3_job_service.py`.

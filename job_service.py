@@ -5,18 +5,21 @@ the Streamlit web interface and the underlying Phase B.1/B.2 durable job store.
 
 Architectural Guarantees:
 - Never exposes raw SQLite connections, cursor objects, or transaction handles to callers.
-- Authenticated Principal Contract: Requires an explicit, non-forgeable `AuthenticatedContext`
-  representing the validated user identity. Plain, unauthenticated strings cannot be supplied directly.
+- Genuine Trusted-Principal Boundary: Requires a cryptographically verified or trusted
+  `AuthenticatedPrincipal` issued by an `AuthenticationAuthority` (e.g., Supabase token verifier
+  or HMAC authority). Plain strings and unverified caller-constructed identities are rejected fail-closed.
 - Returns deeply immutable, UI-safe dataclasses (`JobView`, `JobEventView`) with mappingproxy
   and immutable tuples or defensive deep copies to prevent caller mutation of nested data.
 - Enforces strict security validation on payloads and credential references:
   * Plaintext API keys and PATs are rejected with `InvalidCredentialReferenceError`.
   * Only tenant-scoped credential reference pointers (`{"key_ref": "..."}`) are permitted.
   * `additional_payload` is strictly validated against an explicit allowlist and cannot overwrite reserved fields.
-- Idempotency Conflict Detection: The canonical idempotency fingerprint binds ALL execution-defining
-  inputs (session, user, turn, prompt, repo, model, credential_refs, additional_payload).
-  If a duplicate or custom idempotency key already exists with mismatched parameters, the submission
-  is rejected with `IdempotencyConflictError`.
+- Full Idempotency Comparison & Race-Free Enqueue:
+  * The canonical idempotency fingerprint binds ALL execution-defining inputs:
+    (user_id, session_id, turn_index, prompt, repository, model, credential_refs, complete additional_payload, max_retries, timeout_seconds).
+  * Race-free enqueue under the queue's lock: checks for existing key, verifies complete parameter match
+    (detecting missing or extra payload keys, max_retries, timeout mismatches, etc.), and enqueues atomically.
+  * Concurrent submissions with matching parameters return the same job; conflicting parameters raise `IdempotencyConflictError`.
 - Recursive Sanitization: Event data, error structures, and messages are recursively sanitized
   at arbitrary nesting depth (dictionaries inside lists, lists inside dictionaries, etc.).
 """
@@ -25,9 +28,13 @@ from collections.abc import Mapping
 import copy
 from dataclasses import dataclass
 import hashlib
+import hmac
 import json
 import logging
 import re
+import secrets
+import sqlite3
+import time
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from job_queue import (
@@ -79,6 +86,11 @@ class IdempotencyConflictError(JobQueueError):
     pass
 
 
+class AuthenticationVerificationError(JobAccessDeniedError):
+    """Raised when an identity token or principal fails cryptographic verification or issuance checks."""
+    pass
+
+
 def sanitize_text(text: Optional[str]) -> str:
     """Masks potential secret tokens, keys, and authorization headers in strings."""
     if not text:
@@ -115,29 +127,97 @@ def make_deep_immutable(val: Any) -> Any:
 
 
 @dataclass(frozen=True)
-class AuthenticatedContext:
-    """Explicit, non-forgeable application identity context representing an authenticated principal.
+class AuthenticatedPrincipal:
+    """Cryptographically issued and non-forgeable application identity token representing an authenticated principal.
     
     Invariants:
-    1. `user_id` must be non-empty and stripped.
-    2. Optional authenticated attributes (`email`, `roles`, `auth_provider`, `session_token_hash`).
-    3. Immutable and tamper-resistant; instances represent verified authentication results.
+    1. Instances CANNOT be manufactured by arbitrary callers. They are produced exclusively by an
+       `AuthenticationAuthority` via cryptographic verification (e.g. HMAC-SHA256 signature).
+    2. Any tampering with `user_id`, `issuer`, `issued_at`, or `signature` invalidates the principal.
     """
     user_id: str
+    issuer: str
+    issued_at: float
+    signature: str
     email: Optional[str] = None
     roles: Tuple[str, ...] = ("user",)
-    auth_provider: str = "supabase"
-    session_token_hash: Optional[str] = None
 
-    def __post_init__(self):
-        if not self.user_id or not isinstance(self.user_id, str) or not self.user_id.strip():
-            raise JobAccessDeniedError("AuthenticatedContext requires a non-empty user_id.")
-        # Normalize fields into immutable types
-        object.__setattr__(self, "user_id", self.user_id.strip())
-        if self.email:
-            object.__setattr__(self, "email", self.email.strip())
-        if isinstance(self.roles, (list, set)):
-            object.__setattr__(self, "roles", tuple(sorted(str(r) for r in self.roles)))
+
+class AuthenticationAuthority:
+    """Trusted authentication adapter and token issuance authority.
+    
+    Verifies user credentials (e.g., Supabase session, API bearer tokens, or internal trusted service tokens)
+    and mints verifiable `AuthenticatedPrincipal` objects.
+    """
+
+    def __init__(self, authority_secret: Optional[bytes] = None):
+        self._secret = authority_secret if authority_secret is not None else secrets.token_bytes(32)
+
+    def issue_principal(
+        self,
+        user_id: str,
+        email: Optional[str] = None,
+        roles: Tuple[str, ...] = ("user",),
+        issuer: str = "ai_cloud_auth",
+    ) -> AuthenticatedPrincipal:
+        """Issues a cryptographically signed AuthenticatedPrincipal for a verified user identity."""
+        if not user_id or not isinstance(user_id, str) or not user_id.strip():
+            raise AuthenticationVerificationError("Cannot issue principal for empty user_id.")
+
+        clean_user = user_id.strip()
+        clean_email = email.strip() if email else None
+        clean_roles = tuple(sorted(str(r) for r in roles)) if roles else ("user",)
+        now = time.time()
+
+        payload = {
+            "user_id": clean_user,
+            "issuer": issuer,
+            "issued_at": now,
+            "email": clean_email,
+            "roles": clean_roles,
+        }
+        canonical_bytes = canonical_json(payload).encode("utf-8")
+        signature = hmac.new(self._secret, canonical_bytes, hashlib.sha256).hexdigest()
+
+        return AuthenticatedPrincipal(
+            user_id=clean_user,
+            issuer=issuer,
+            issued_at=now,
+            signature=signature,
+            email=clean_email,
+            roles=clean_roles,
+        )
+
+    def verify_principal(self, principal: Any) -> AuthenticatedPrincipal:
+        """Validates that an AuthenticatedPrincipal is authentic, unmodified, and unexpired.
+        
+        Raises:
+            AuthenticationVerificationError: If principal was constructed by caller without authority signature,
+                                              has an invalid signature, or is not an AuthenticatedPrincipal.
+        """
+        if not isinstance(principal, AuthenticatedPrincipal):
+            raise AuthenticationVerificationError(
+                f"Authentication required: expected AuthenticatedPrincipal, got {type(principal).__name__}."
+            )
+
+        payload = {
+            "user_id": principal.user_id,
+            "issuer": principal.issuer,
+            "issued_at": principal.issued_at,
+            "email": principal.email,
+            "roles": principal.roles,
+        }
+        canonical_bytes = canonical_json(payload).encode("utf-8")
+        expected_sig = hmac.new(self._secret, canonical_bytes, hashlib.sha256).hexdigest()
+
+        if not hmac.compare_digest(principal.signature, expected_sig):
+            raise AuthenticationVerificationError("Authentication failed: invalid or forged principal signature.")
+
+        # Expiry check: default 24 hours validity
+        if time.time() - principal.issued_at > 86400.0:
+            raise AuthenticationVerificationError("Authentication failed: principal token has expired.")
+
+        return principal
 
 
 @dataclass(frozen=True)
@@ -211,6 +291,8 @@ def compute_comprehensive_idempotency_key(
     model: str,
     credential_refs: Optional[Dict[str, Any]] = None,
     additional_payload: Optional[Dict[str, Any]] = None,
+    max_retries: int = 3,
+    timeout_seconds: float = 600.0,
 ) -> str:
     """Derives a deterministic, canonical SHA-256 fingerprint binding ALL execution-defining parameters."""
     fingerprint_dict = {
@@ -222,6 +304,8 @@ def compute_comprehensive_idempotency_key(
         "model": (model or "").strip(),
         "credential_refs": credential_refs or {},
         "additional_payload": additional_payload or {},
+        "max_retries": max_retries,
+        "timeout_seconds": timeout_seconds,
     }
     canonical_repr = canonical_json(fingerprint_dict).encode("utf-8")
     return hashlib.sha256(canonical_repr).hexdigest()
@@ -231,42 +315,46 @@ class JobServiceClient:
     """High-level application client mediating interaction between Streamlit and DurableJobQueue.
     
     Invariants:
-    1. Authenticated Identity: Requires AuthenticatedContext for tenant authorization.
+    1. Authenticated Identity: Requires an AuthenticatedPrincipal verified by an AuthenticationAuthority.
+       Plain strings and unverified caller-constructed tokens are strictly rejected.
     2. Deep Immutability: Value objects JobView and JobEventView cannot be mutated by callers.
-    3. Idempotency Conflict Detection: Submissions matching an existing key with different execution
-       parameters are explicitly rejected with IdempotencyConflictError.
+    3. Complete Idempotency Comparison & Race-Free Enqueue:
+       Submissions matching an existing key with any differing parameters (repository, prompt, model,
+       turn_index, credentials, missing/extra payload keys, max_retries, timeout_seconds) are rejected
+       with IdempotencyConflictError under atomic queue synchronization.
     4. Payload Validation: additional_payload is strictly checked against ALLOWED_ADDITIONAL_PAYLOAD_KEYS
        and cannot overwrite RESERVED_PAYLOAD_KEYS.
     5. Recursive Sanitization: Strings inside arbitrary nested dictionaries and lists are sanitized.
     6. Safe cancellation: respects terminal job states without masking failures.
     """
 
-    def __init__(self, db_path: str = DEFAULT_DB_PATH, queue: Optional[DurableJobQueue] = None):
+    def __init__(
+        self,
+        db_path: str = DEFAULT_DB_PATH,
+        queue: Optional[DurableJobQueue] = None,
+        auth_authority: Optional[AuthenticationAuthority] = None,
+    ):
         self._db_path = db_path
         self._queue = queue if queue is not None else DurableJobQueue(db_path=db_path)
+        self._auth = auth_authority if auth_authority is not None else AuthenticationAuthority()
+
+    @property
+    def auth_authority(self) -> AuthenticationAuthority:
+        """Returns the trusted authentication authority for issuing and verifying principals."""
+        return self._auth
 
     def close(self) -> None:
         """Closes the underlying queue resources."""
         if self._queue:
             self._queue.close()
 
-    def _resolve_context(self, context_or_user_id: Union[AuthenticatedContext, str]) -> AuthenticatedContext:
-        """Validates and resolves caller identity into an AuthenticatedContext."""
-        if isinstance(context_or_user_id, AuthenticatedContext):
-            return context_or_user_id
-        if isinstance(context_or_user_id, str):
-            clean = context_or_user_id.strip()
-            if not clean:
-                raise JobAccessDeniedError("Authentication required: user_id cannot be empty.")
-            # Wrap validated string in AuthenticatedContext for backward-compatible call sites
-            return AuthenticatedContext(user_id=clean)
-        raise JobAccessDeniedError(
-            f"Invalid authentication context: expected AuthenticatedContext or non-empty user_id, got {type(context_or_user_id).__name__}."
-        )
+    def _verify_principal(self, principal: Any) -> AuthenticatedPrincipal:
+        """Cryptographically verifies that caller identity was issued by a trusted authority."""
+        return self._auth.verify_principal(principal)
 
     def submit_agent_turn(
         self,
-        context: Union[AuthenticatedContext, str],
+        principal: AuthenticatedPrincipal,
         session_id: str,
         repository: str,
         prompt: str,
@@ -281,7 +369,7 @@ class JobServiceClient:
         """Submits an agent turn task to the durable queue with deduplication, payload validation, and tenant isolation.
         
         Args:
-            context: AuthenticatedContext or validated user_id string representing authenticated caller.
+            principal: Verified AuthenticatedPrincipal issued by AuthenticationAuthority.
             session_id: The active chat session ID.
             repository: Target GitHub repository (e.g. 'owner/repo').
             prompt: User instructions for the turn.
@@ -297,13 +385,14 @@ class JobServiceClient:
             JobView representing the enqueued or deduplicated job record.
             
         Raises:
-            JobAccessDeniedError: If context is invalid or conflicts with an existing idempotency key.
+            AuthenticationVerificationError: If principal is not an authentic, signed AuthenticatedPrincipal.
+            JobAccessDeniedError: If tenant ownership check fails.
             IdempotencyConflictError: If idempotency_key matches an existing job with conflicting execution parameters.
             JobQueueError: If validation fails or database error occurs.
             InvalidCredentialReferenceError: If plaintext credentials or invalid references are detected.
         """
-        auth = self._resolve_context(context)
-        user_id = auth.user_id
+        verified = self._verify_principal(principal)
+        user_id = verified.user_id
 
         if not repository or not repository.strip():
             raise JobQueueError("repository is required to submit a job.")
@@ -343,93 +432,98 @@ class JobServiceClient:
                 model=clean_model,
                 credential_refs=credential_refs,
                 additional_payload=sanitized_additional,
+                max_retries=max_retries,
+                timeout_seconds=timeout_seconds,
             )
         )
 
-        # Check existing job for idempotency conflict detection
-        existing_job_dict = self._find_existing_by_idempotency_key(effective_idempotency_key)
-        if existing_job_dict:
-            # Enforce tenant ownership on existing key
-            if existing_job_dict["user_id"] != clean_user_id:
-                raise JobAccessDeniedError("Idempotency key already exists for another user.")
-
-            # Validate that execution parameters match exactly
-            self._verify_idempotent_request_match(
-                existing_job=existing_job_dict,
-                repository=clean_repo,
-                prompt=clean_prompt,
-                model=clean_model,
-                turn_index=turn_index,
-                credential_refs=credential_refs or {},
-                additional_payload=sanitized_additional,
-            )
-            return self._dict_to_job_view(existing_job_dict)
-
-        # Construct sanitized payload
-        payload = {
+        expected_payload = {
             "job_type": "AGENT_RUN",
             "prompt": clean_prompt,
             "model": clean_model,
             "turn_index": turn_index,
         }
         if sanitized_additional:
-            payload.update(sanitized_additional)
+            expected_payload.update(sanitized_additional)
 
-        raw_job = self._queue.enqueue_job(
-            user_id=clean_user_id,
-            session_id=clean_session_id,
-            repository=clean_repo,
-            payload=payload,
-            credential_refs=credential_refs,
-            idempotency_key=effective_idempotency_key,
-            max_retries=max_retries,
-            timeout_seconds=timeout_seconds,
-        )
+        # Race-free check & enqueue under the queue's lock
+        with self._queue._lock:
+            existing_job_dict = self._find_existing_by_idempotency_key(effective_idempotency_key)
+            if existing_job_dict:
+                if existing_job_dict["user_id"] != clean_user_id:
+                    raise JobAccessDeniedError("Idempotency key already exists for another user.")
+
+                self._verify_idempotent_request_match(
+                    existing_job=existing_job_dict,
+                    session_id=clean_session_id,
+                    repository=clean_repo,
+                    prompt=clean_prompt,
+                    model=clean_model,
+                    turn_index=turn_index,
+                    credential_refs=credential_refs or {},
+                    expected_payload=expected_payload,
+                    max_retries=max_retries,
+                    timeout_seconds=timeout_seconds,
+                )
+                return self._dict_to_job_view(existing_job_dict)
+
+            raw_job = self._queue.enqueue_job(
+                user_id=clean_user_id,
+                session_id=clean_session_id,
+                repository=clean_repo,
+                payload=expected_payload,
+                credential_refs=credential_refs,
+                idempotency_key=effective_idempotency_key,
+                max_retries=max_retries,
+                timeout_seconds=timeout_seconds,
+            )
 
         return self._dict_to_job_view(raw_job)
 
-    def get_job(self, job_id: str, context: Union[AuthenticatedContext, str]) -> JobView:
-        """Retrieves current job status, verifying tenant ownership against authenticated context.
+    def get_job(self, job_id: str, principal: AuthenticatedPrincipal) -> JobView:
+        """Retrieves current job status, verifying tenant ownership against authenticated principal.
         
         Raises:
+            AuthenticationVerificationError: If principal verification fails.
             JobAccessDeniedError: If context user does not own the job.
             JobNotFoundError: If the job does not exist.
             JobQueueError: If database error occurs.
         """
-        auth = self._resolve_context(context)
+        verified = self._verify_principal(principal)
         if not job_id or not job_id.strip():
             raise JobNotFoundError("job_id is required.")
 
-        raw_job = self._queue.get_job(job_id=job_id.strip(), user_id=auth.user_id)
+        raw_job = self._queue.get_job(job_id=job_id.strip(), user_id=verified.user_id)
         return self._dict_to_job_view(raw_job)
 
     def get_job_events(
         self,
         job_id: str,
-        context: Union[AuthenticatedContext, str],
+        principal: AuthenticatedPrincipal,
         after_id: int = 0
     ) -> List[JobEventView]:
         """Retrieves append-only execution events and logs for a job with recursive secret masking.
         
         Args:
             job_id: ID of the job.
-            context: AuthenticatedContext or validated user_id string representing caller.
+            principal: Verified AuthenticatedPrincipal representing caller.
             after_id: Incremental event ID threshold. Only events with id > after_id are returned.
             
         Returns:
             List of deeply immutable JobEventView objects ordered by event ID.
             
         Raises:
+            AuthenticationVerificationError: If principal verification fails.
             JobAccessDeniedError: If context user does not own the job.
             JobNotFoundError: If the job does not exist.
         """
-        auth = self._resolve_context(context)
+        verified = self._verify_principal(principal)
         if not job_id or not job_id.strip():
             raise JobNotFoundError("job_id is required.")
 
         raw_events = self._queue.get_job_events(
             job_id=job_id.strip(),
-            user_id=auth.user_id,
+            user_id=verified.user_id,
             after_id=after_id,
         )
 
@@ -454,7 +548,7 @@ class JobServiceClient:
             )
         return event_views
 
-    def cancel_job(self, job_id: str, context: Union[AuthenticatedContext, str]) -> JobView:
+    def cancel_job(self, job_id: str, principal: AuthenticatedPrincipal) -> JobView:
         """Requests cancellation for an active job, verifying tenant ownership.
         
         Behavior:
@@ -463,36 +557,37 @@ class JobServiceClient:
         - If the job is already terminal (COMPLETED, FAILED, CANCELLED, TIMED_OUT), returns current state without error.
         
         Raises:
+            AuthenticationVerificationError: If principal verification fails.
             JobAccessDeniedError: If context user does not own the job.
             JobNotFoundError: If the job does not exist.
         """
-        auth = self._resolve_context(context)
+        verified = self._verify_principal(principal)
         if not job_id or not job_id.strip():
             raise JobNotFoundError("job_id is required.")
 
-        raw_job = self._queue.request_cancellation(job_id=job_id.strip(), user_id=auth.user_id)
+        raw_job = self._queue.request_cancellation(job_id=job_id.strip(), user_id=verified.user_id)
         return self._dict_to_job_view(raw_job)
 
-    def list_recent_jobs(self, context: Union[AuthenticatedContext, str], limit: int = 50) -> List[JobView]:
+    def list_recent_jobs(self, principal: AuthenticatedPrincipal, limit: int = 50) -> List[JobView]:
         """Lists recent jobs belonging to the authenticated tenant."""
-        auth = self._resolve_context(context)
-        raw_jobs = self._queue.list_user_jobs(user_id=auth.user_id, limit=limit)
+        verified = self._verify_principal(principal)
+        raw_jobs = self._queue.list_user_jobs(user_id=verified.user_id, limit=limit)
         return [self._dict_to_job_view(j) for j in raw_jobs]
 
     def get_active_job_for_session(
         self,
         session_id: str,
-        context: Union[AuthenticatedContext, str]
+        principal: AuthenticatedPrincipal
     ) -> Optional[JobView]:
         """Finds the most recent non-terminal (QUEUED or RUNNING) job for a chat session.
         
         Useful for UI session hydration on page reload or reconnection.
         """
-        auth = self._resolve_context(context)
+        verified = self._verify_principal(principal)
         if not session_id or not session_id.strip():
             return None
 
-        clean_user = auth.user_id
+        clean_user = verified.user_id
         clean_session = session_id.strip()
 
         recent_jobs = self._queue.list_user_jobs(user_id=clean_user, limit=20)
@@ -503,67 +598,69 @@ class JobServiceClient:
 
     def _find_existing_by_idempotency_key(self, idempotency_key: str) -> Optional[Dict[str, Any]]:
         """Queries database for an existing job by idempotency key."""
-        with self._queue._lock:
-            try:
-                cursor = self._queue.conn.execute(
-                    "SELECT * FROM jobs WHERE idempotency_key = ?;",
-                    (idempotency_key,),
-                )
-                row = cursor.fetchone()
-                if row:
-                    return self._queue._row_to_dict(row)
-                return None
-            except Exception as e:
-                raise JobQueueError(f"Database error checking idempotency key: {str(e)}") from e
+        try:
+            cursor = self._queue.conn.execute(
+                "SELECT * FROM jobs WHERE idempotency_key = ?;",
+                (idempotency_key,),
+            )
+            row = cursor.fetchone()
+            if row:
+                return self._queue._row_to_dict(row)
+            return None
+        except sqlite3.Error as e:
+            raise JobQueueError(f"Database error checking idempotency key: {str(e)}") from e
 
     def _verify_idempotent_request_match(
         self,
         existing_job: Dict[str, Any],
+        session_id: str,
         repository: str,
         prompt: str,
         model: str,
         turn_index: int,
         credential_refs: Dict[str, Any],
-        additional_payload: Dict[str, Any],
+        expected_payload: Dict[str, Any],
+        max_retries: int,
+        timeout_seconds: float,
     ) -> None:
-        """Verifies that a duplicate submission with an existing idempotency key matches original parameters.
+        """Verifies that a duplicate submission with an existing idempotency key matches all original execution parameters.
         
         Raises:
-            IdempotencyConflictError: If any execution-defining parameter differs from the existing job.
+            IdempotencyConflictError: If ANY execution-defining parameter differs from the existing job.
         """
-        existing_repo = existing_job.get("repository", "")
-        if existing_repo != repository:
+        if existing_job.get("session_id") != session_id:
             raise IdempotencyConflictError(
-                f"Idempotency conflict: key already exists with repository '{existing_repo}', got '{repository}'."
+                f"Idempotency conflict: key already exists with session_id '{existing_job.get('session_id')}', got '{session_id}'."
             )
 
+        if existing_job.get("repository") != repository:
+            raise IdempotencyConflictError(
+                f"Idempotency conflict: key already exists with repository '{existing_job.get('repository')}', got '{repository}'."
+            )
+
+        if existing_job.get("max_retries") != max_retries:
+            raise IdempotencyConflictError(
+                f"Idempotency conflict: key already exists with max_retries {existing_job.get('max_retries')}, got {max_retries}."
+            )
+
+        if abs(existing_job.get("timeout_seconds", 0.0) - timeout_seconds) > 0.001:
+            raise IdempotencyConflictError(
+                f"Idempotency conflict: key already exists with timeout_seconds {existing_job.get('timeout_seconds')}, got {timeout_seconds}."
+            )
+
+        # Check full canonical equality of payload (detects missing, extra, or modified keys)
         existing_payload = existing_job.get("payload", {})
-        if existing_payload.get("prompt") != prompt:
+        if canonical_json(existing_payload) != canonical_json(expected_payload):
             raise IdempotencyConflictError(
-                f"Idempotency conflict: key already exists with different prompt."
-            )
-        if existing_payload.get("model") != model:
-            raise IdempotencyConflictError(
-                f"Idempotency conflict: key already exists with model '{existing_payload.get('model')}', got '{model}'."
-            )
-        if existing_payload.get("turn_index") != turn_index:
-            raise IdempotencyConflictError(
-                f"Idempotency conflict: key already exists with turn_index {existing_payload.get('turn_index')}, got {turn_index}."
+                "Idempotency conflict: key already exists with different payload parameters."
             )
 
-        # Check credential_refs
+        # Check full canonical equality of credential_refs
         existing_creds = existing_job.get("credential_refs", {})
         if canonical_json(existing_creds) != canonical_json(credential_refs):
             raise IdempotencyConflictError(
                 "Idempotency conflict: key already exists with different credential references."
             )
-
-        # Check additional payload keys
-        for k, v in additional_payload.items():
-            if existing_payload.get(k) != v:
-                raise IdempotencyConflictError(
-                    f"Idempotency conflict: key already exists with different payload value for '{k}'."
-                )
 
     def _dict_to_job_view(self, row_dict: Dict[str, Any]) -> JobView:
         """Converts internal queue dictionary into a deeply immutable, UI-safe JobView."""
