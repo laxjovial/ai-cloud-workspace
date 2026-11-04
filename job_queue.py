@@ -1145,22 +1145,97 @@ class DurableJobQueue:
             except sqlite3.Error as e:
                 raise JobQueueError(f"Database error during record_process_reap: {str(e)}") from e
 
+    def register_worker_instance(
+        self,
+        instance_id: str,
+        pid: int,
+        start_time: float,
+    ) -> None:
+        """Atomically registers or updates a worker instance in worker_instances under the queue lock."""
+        now = time.time()
+        with self._lock:
+            try:
+                with self.conn:
+                    self.conn.execute("BEGIN IMMEDIATE;")
+                    self.conn.execute(
+                        """
+                        INSERT INTO worker_instances (
+                            instance_id, pid, start_time, last_heartbeat, status
+                        ) VALUES (?, ?, ?, ?, 'ALIVE')
+                        ON CONFLICT(instance_id) DO UPDATE SET
+                            pid = excluded.pid,
+                            start_time = COALESCE(worker_instances.start_time, excluded.start_time),
+                            last_heartbeat = excluded.last_heartbeat,
+                            status = 'ALIVE';
+                        """,
+                        (instance_id, pid, start_time, now),
+                    )
+            except sqlite3.Error as e:
+                raise JobQueueError(f"Database error during register_worker_instance: {str(e)}") from e
+
+    def get_worker_instance(self, instance_id: str) -> Optional[Dict[str, Any]]:
+        """Safely fetches a worker instance record under the queue lock."""
+        with self._lock:
+            try:
+                row = self.conn.execute(
+                    "SELECT * FROM worker_instances WHERE instance_id = ?;",
+                    (instance_id,),
+                ).fetchone()
+                return dict(row) if row else None
+            except sqlite3.Error as e:
+                raise JobQueueError(f"Database error during get_worker_instance: {str(e)}") from e
+
+    def get_active_running_jobs(self) -> List[Dict[str, Any]]:
+        """Safely fetches all RUNNING jobs under the queue lock."""
+        with self._lock:
+            try:
+                cursor = self.conn.execute(
+                    """
+                    SELECT id, worker_id, lease_generation, lease_expires_at, timeout_seconds, started_at, cancel_requested_at
+                    FROM jobs
+                    WHERE status = 'RUNNING';
+                    """
+                )
+                return [dict(r) for r in cursor.fetchall()]
+            except sqlite3.Error as e:
+                raise JobQueueError(f"Database error during get_active_running_jobs: {str(e)}") from e
+
     def supervisor_verify_worker_death(
         self,
         job_id: str,
         instance_id: str,
         side_effect_id: str,
         supervisor_signing_key: bytes,
+        caller_worker_id: Optional[str] = None,
     ) -> bool:
         """Contextual worker-death verification bound to specific job, worker instance, and side-effect.
         
-        Invariants:
-        1. Verifies side_effect_id exists and is bound to (job_id, instance_id).
-        2. Verifies worker_instances row for instance_id has status == 'DEAD'.
-        3. Recomputes and validates canonical HMAC signature against supervisor_signing_key.
+        Strict Invariants (executed under self._lock in a consistent database transaction):
+        1. If caller_worker_id is provided, validates that caller_worker_id currently owns job_id,
+           the job is strictly in status 'RUNNING', and its lease is non-null and unexpired (lease_expires_at >= now).
+        2. Verifies side_effect_id exists, belongs to specified job_id, and was registered by instance_id.
+        3. Verifies worker_instances row for instance_id has status == 'DEAD'.
+        4. Recomputes and validates canonical HMAC signature against supervisor_signing_key.
         """
+        now = time.time()
         with self._lock:
             try:
+                # 1. Caller lease authorization check (if caller_worker_id specified)
+                if caller_worker_id is not None:
+                    job_row = self.conn.execute(
+                        "SELECT worker_id, status, lease_expires_at FROM jobs WHERE id = ?;",
+                        (job_id,),
+                    ).fetchone()
+                    if not job_row:
+                        return False
+                    if job_row["worker_id"] != caller_worker_id:
+                        return False
+                    if job_row["status"] != "RUNNING":
+                        return False
+                    if job_row["lease_expires_at"] is None or job_row["lease_expires_at"] < now:
+                        return False
+
+                # 2. Side-effect binding check
                 se_row = self.conn.execute(
                     "SELECT job_id, worker_id, status FROM job_side_effects WHERE side_effect_id = ?;",
                     (side_effect_id,),
@@ -1171,6 +1246,7 @@ class DurableJobQueue:
                 if se_row["job_id"] != job_id or se_row["worker_id"] != instance_id:
                     return False
 
+                # 3. Instance death record check
                 inst_row = self.conn.execute(
                     "SELECT * FROM worker_instances WHERE instance_id = ?;",
                     (instance_id,),
@@ -1181,6 +1257,7 @@ class DurableJobQueue:
                 if inst_row["status"] != "DEAD":
                     return False
 
+                # 4. Cryptographic HMAC proof validation
                 canonical_payload = {
                     "version": "v1",
                     "proof_type": inst_row["proof_type"],

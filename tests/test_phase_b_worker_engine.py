@@ -675,6 +675,73 @@ class TestPhaseB2WorkerEngine:
         )
         assert is_dead
 
+        # FOCUSED INTEGRATION TEST: Reject IPC verification when caller's lease has expired
+        with queue._lock:
+            with queue.conn:
+                queue.conn.execute(
+                    "UPDATE jobs SET lease_expires_at = ? WHERE id = ?;",
+                    (time.time() - 10.0, job["id"]),
+                )
+        is_dead_expired = ipc_client_B.verify_worker_death(
+            job_id=job["id"],
+            instance_id=inst_A,
+            side_effect_id=se_id,
+        )
+        assert not is_dead_expired
+
+        # FOCUSED INTEGRATION TEST: Reject IPC verification when job is no longer RUNNING (e.g. CANCELLED or FAILED)
+        with queue._lock:
+            with queue.conn:
+                queue.conn.execute(
+                    "UPDATE jobs SET status = 'CANCELLED', lease_expires_at = ? WHERE id = ?;",
+                    (time.time() + 60.0, job["id"]),
+                )
+        is_dead_non_running = ipc_client_B.verify_worker_death(
+            job_id=job["id"],
+            instance_id=inst_A,
+            side_effect_id=se_id,
+        )
+        assert not is_dead_non_running
+
+        # Restore job to RUNNING with valid lease for confirmation
+        with queue._lock:
+            with queue.conn:
+                queue.conn.execute(
+                    "UPDATE jobs SET status = 'RUNNING', lease_expires_at = ? WHERE id = ?;",
+                    (time.time() + 60.0, job["id"]),
+                )
+
+        # FOCUSED INTEGRATION TEST: Verify concurrent queue writes and IPC reads cannot interfere
+        concurrent_errors = []
+        def concurrent_writer():
+            try:
+                for _ in range(50):
+                    queue.append_log(
+                        job_id=job["id"],
+                        worker_id=inst_B,
+                        lease_generation=claimed_B["lease_generation"],
+                        message="Concurrent log entry",
+                    )
+                    time.sleep(0.005)
+            except Exception as ex:
+                concurrent_errors.append(ex)
+
+        writer_t = threading.Thread(target=concurrent_writer)
+        writer_t.start()
+
+        # Perform multiple IPC death verifications concurrently while writes are happening
+        for _ in range(20):
+            res = ipc_client_B.verify_worker_death(
+                job_id=job["id"],
+                instance_id=inst_A,
+                side_effect_id=se_id,
+            )
+            assert res is True
+            time.sleep(0.01)
+
+        writer_t.join()
+        assert len(concurrent_errors) == 0
+
         # Worker B confirms side-effect under its lease generation
         queue.confirm_side_effect(
             side_effect_id=se_id,

@@ -1,4 +1,4 @@
-# Phase B.2 Autonomous Worker Engine Delivery Report — Lock-Wait Lease Expiry Fencing Correction
+# Phase B.1 + B.2 Combined Integration Report — Supervisor IPC & Queue Concurrency Hardening
 
 **Target Branch**: `feat/phase-b-durable-execution`  
 **Base `main` Commit**: `5147be6c127c3eed87b6cabb0ca24f65b2550fa7`  
@@ -6,19 +6,41 @@
 
 ---
 
-## 1. Executive Summary of Remediations
+## 1. Executive Summary of Integration Hardening
 
-This focused correction eliminates the timing window in `finalize_active_sandbox_cleanup()` where lease expiration during lock acquisition could allow an expired lease to pass verification:
+This remediation pass closes the concurrency and authorization boundary between the supervisor daemon, IPC server, and relational job queue:
 
-1. **Lock-Protected Timestamp Sampling**:
-   - Location: `job_queue.py` (`DurableJobQueue.finalize_active_sandbox_cleanup`)
-   - `now = time.time()` is now captured strictly **after** `self._lock` is acquired and `BEGIN IMMEDIATE;` has started inside the database transaction.
-   - The same post-lock timestamp is used for both the row expiry validation (`lease_expires_at < now`) and the update statement's conditional lease expiry guard (`lease_expires_at >= ?`).
-   - Ensures any lease expiring while the caller was waiting for the local thread lock or SQLite write transaction lock fails closed with `StaleLeaseError`.
+1. **Centralized IPC Authorization in `DurableJobQueue`**:
+   - Location: `job_queue.py` (`DurableJobQueue.supervisor_verify_worker_death`)
+   - Extended `supervisor_verify_worker_death` to take optional `caller_worker_id: Optional[str] = None`.
+   - Atomically executes all validations under `self._lock` inside a single consistent SQLite transaction:
+     - **Current Leaseholder Check**: Validates `job_row["worker_id"] == caller_worker_id`.
+     - **Status Check**: Validates `job_row["status"] == 'RUNNING'`.
+     - **Unexpired Lease Check**: Validates `job_row["lease_expires_at"] IS NOT NULL AND job_row["lease_expires_at"] >= now`.
+     - **Side-Effect Binding Check**: Validates `se_row["job_id"] == job_id AND se_row["worker_id"] == instance_id`.
+     - **Prior Worker Death Record**: Validates `inst_row["status"] == 'DEAD'`.
+     - **Cryptographic HMAC Signature**: Verifies canonical JSON HMAC against supervisor's signing key.
 
-2. **Regression Test for Lock-Wait Lease Expiry**:
-   - Location: `tests/test_phase_b_worker_engine.py` (Scenario 16: `test_scenario_16_normal_completion_active_sandbox_cleanup_matrix`)
-   - Adds test case `3d`: sets a valid short lease (0.4s), spawns a thread that holds `queue._lock` for 0.6s, and verifies that `finalize_active_sandbox_cleanup()` blocks until lock release, evaluates the lease at that point, and fails closed with `StaleLeaseError("lease is null or expired")`.
+2. **Elimination of Unprotected Direct `queue.conn` Access**:
+   - Locations: `worker.py` and `job_queue.py`
+   - Added thread-safe encapsulated helper methods on `DurableJobQueue`:
+     - `get_active_running_jobs()`: Retrieves RUNNING jobs safely serialized under `self._lock`.
+     - `get_worker_instance(instance_id)`: Fetches worker instance rows safely serialized under `self._lock`.
+     - `register_worker_instance(instance_id, pid, start_time)`: Atomically upserts `worker_instances` under `self._lock`.
+   - In `worker.py`:
+     - `SupervisorIPCServer._handle_client`: Removed direct `queue.conn.execute()` lookup; delegates directly to centralized `supervisor_verify_worker_death(..., caller_worker_id=worker_instance_id)`.
+     - `WorkerSupervisor.supervise_step`: Replaced all direct `queue.conn.execute()` calls with `self.queue.get_active_running_jobs()` and `self.queue.get_worker_instance()`.
+     - `WorkerSupervisor.start_worker_slot`: Replaced raw query with `self.queue.register_worker_instance()`.
+     - `worker_child_main`: Replaced raw query with `queue.register_worker_instance()`.
+   - Zero occurrences of direct `queue.conn` remain in `worker.py`.
+
+3. **Focused Regression Tests Added**:
+   - Location: `tests/test_phase_b_worker_engine.py` (Scenario 10: `test_scenario_10_contextual_side_effect_gate`)
+   - Explicitly tests:
+     - Rejects IPC verification when caller's lease has expired (`lease_expires_at < now`).
+     - Rejects IPC verification when job is no longer `RUNNING` (e.g. `CANCELLED`).
+     - Verifies concurrent queue writes (50 rapid `append_log` transactions) and IPC reads (20 concurrent verifications) execute safely without database lock collisions or interference.
+     - Preserves valid worker-death recovery flow and fenced confirmation.
 
 ---
 
@@ -49,7 +71,7 @@ tests/test_phase_b_worker_engine.py::TestPhaseB2WorkerEngine::test_scenario_15_s
 tests/test_phase_b_worker_engine.py::TestPhaseB2WorkerEngine::test_scenario_16_normal_completion_active_sandbox_cleanup_matrix PASSED [ 94%]
 tests/test_phase_b_worker_engine.py::TestPhaseB2WorkerEngine::test_scenario_17_pr_recovery_fail_closed_and_state_matrix PASSED [100%]
 
-============================= 17 passed in 17.26s ==============================
+============================== 17 passed in 9.53s ==============================
 ```
 
 ### Suite 2: Phase A Security & Phase B.1 Hardened Job Store
@@ -62,7 +84,7 @@ PYTHONPATH=. .venv/bin/pytest tests/test_phase_b_durable_execution.py tests/test
 tests/test_phase_b_durable_execution.py (17 tests) PASSED
 tests/test_phase_a_security.py (25 tests) PASSED
 
-============================= 42 passed in 50.69s ==============================
+============================= 42 passed in 26.95s ==============================
 ```
 **Combined Count**: 59 tests passing across all suites.
 

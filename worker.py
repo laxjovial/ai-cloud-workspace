@@ -439,22 +439,13 @@ class SupervisorIPCServer:
                     prior_instance_id = req.get("instance_id")
                     side_effect_id = req.get("side_effect_id")
 
-                    # Verify calling worker currently holds the active lease on job_id
-                    current_job = self.supervisor.queue.conn.execute(
-                        "SELECT worker_id, status FROM jobs WHERE id = ?;", (job_id,)
-                    ).fetchone()
-                    if not current_job or current_job["worker_id"] != worker_instance_id:
-                        self._send_framed_msg(conn, {
-                            "success": False,
-                            "error": f"Caller worker '{worker_instance_id}' is not the current leaseholder for job '{job_id}'."
-                        })
-                        return
-
+                    # Authoritative centralized verification under queue._lock
                     is_dead = self.supervisor.queue.supervisor_verify_worker_death(
                         job_id=job_id,
                         instance_id=prior_instance_id,
                         side_effect_id=side_effect_id,
                         supervisor_signing_key=self.supervisor.signing_key,
+                        caller_worker_id=worker_instance_id,
                     )
                     self._send_framed_msg(conn, {"success": True, "is_dead": is_dead})
                 else:
@@ -716,22 +707,11 @@ def worker_child_main(
     queue = DurableJobQueue(db_path=db_path)
 
     # Register instance in worker_instances as ALIVE (preserve supervisor's authoritative start_time if already set)
-    with queue._lock:
-        with queue.conn:
-            queue.conn.execute("BEGIN IMMEDIATE;")
-            queue.conn.execute(
-                """
-                INSERT INTO worker_instances (
-                    instance_id, pid, start_time, last_heartbeat, status
-                ) VALUES (?, ?, ?, ?, 'ALIVE')
-                ON CONFLICT(instance_id) DO UPDATE SET
-                    pid = excluded.pid,
-                    start_time = COALESCE(worker_instances.start_time, excluded.start_time),
-                    last_heartbeat = excluded.last_heartbeat,
-                    status = 'ALIVE';
-                """,
-                (worker_instance_id, pid, start_time, time.time()),
-            )
+    queue.register_worker_instance(
+        instance_id=worker_instance_id,
+        pid=pid,
+        start_time=start_time,
+    )
 
     ipc_client = None
     if ipc_socket_path and ipc_token:
@@ -900,22 +880,11 @@ class WorkerSupervisor:
             }
 
         # Atomically register instance in worker_instances so start_time is consistent and authoritative
-        with self.queue._lock:
-            with self.queue.conn:
-                self.queue.conn.execute("BEGIN IMMEDIATE;")
-                self.queue.conn.execute(
-                    """
-                    INSERT INTO worker_instances (
-                        instance_id, pid, start_time, last_heartbeat, status
-                    ) VALUES (?, ?, ?, ?, 'ALIVE')
-                    ON CONFLICT(instance_id) DO UPDATE SET
-                        pid = excluded.pid,
-                        start_time = excluded.start_time,
-                        last_heartbeat = excluded.last_heartbeat,
-                        status = 'ALIVE';
-                    """,
-                    (instance_id, proc.pid, spawn_time, spawn_time),
-                )
+        self.queue.register_worker_instance(
+            instance_id=instance_id,
+            pid=proc.pid,
+            start_time=spawn_time,
+        )
 
     def stop_worker_slot(self, slot_id: str, grace_seconds: float = 5.0) -> None:
         """Stops a worker process gracefully; falls back to forced SIGKILL."""
@@ -958,14 +927,7 @@ class WorkerSupervisor:
         now = time.time()
 
         # 1. Supervise active running jobs (Deadlock, hard timeout, and cancellation watchdog for unresponsive child processes)
-        with self.queue._lock:
-            running_jobs = self.queue.conn.execute(
-                """
-                SELECT id, worker_id, lease_generation, lease_expires_at, timeout_seconds, started_at, cancel_requested_at
-                FROM jobs
-                WHERE status = 'RUNNING';
-                """
-            ).fetchall()
+        running_jobs = self.queue.get_active_running_jobs()
 
         for r_job in running_jobs:
             w_id = r_job["worker_id"]
@@ -1011,13 +973,10 @@ class WorkerSupervisor:
                 )
                 self.stop_worker_slot(slot_id, grace_seconds=0.2)
 
-                # Fetch recorded reap proof to authoritatively finalize job
-                inst_row = self.queue.conn.execute(
-                    "SELECT reap_token, reap_signature FROM worker_instances WHERE instance_id = ?;",
-                    (w_id,),
-                ).fetchone()
+                # Fetch recorded reap proof to authoritatively finalize job safely under queue lock
+                inst_row = self.queue.get_worker_instance(w_id)
 
-                if inst_row and inst_row["reap_token"] and inst_row["reap_signature"]:
+                if inst_row and inst_row.get("reap_token") and inst_row.get("reap_signature"):
                     try:
                         self.queue.supervisor_finalize_job(
                             job_id=r_job["id"],
@@ -1071,9 +1030,7 @@ class WorkerSupervisor:
                 exit_signal = 9 if exit_code in (-9, 137) else None
 
                 # Only record reap if not already recorded DEAD by stop_worker_slot
-                inst_check = self.queue.conn.execute(
-                    "SELECT status FROM worker_instances WHERE instance_id = ?;", (inst_id,)
-                ).fetchone()
+                inst_check = self.queue.get_worker_instance(inst_id)
                 if not (inst_check and inst_check["status"] == "DEAD"):
                     self.queue.record_process_reap(
                         instance_id=inst_id,
