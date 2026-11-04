@@ -1047,19 +1047,19 @@ class TestPhaseB2WorkerEngine:
                     (short_lease_expiry, job["id"]),
                 )
 
-        # Background thread acquires queue lock before finalize_active_sandbox_cleanup and holds it until lease expires
-        cleanup_result = {}
-        cleanup_exc = {}
+        # Deterministic synchronization: lock_holder sets an Event immediately after acquiring queue._lock
+        lock_acquired_event = threading.Event()
 
         def lock_holder():
             with queue._lock:
+                lock_acquired_event.set()
                 # Hold lock until short lease is guaranteed to have expired
-                time.sleep(0.6)
+                time.sleep(0.5)
 
         holder_t = threading.Thread(target=lock_holder)
         holder_t.start()
-        # Give thread time to acquire queue._lock
-        time.sleep(0.1)
+        # Wait deterministically for lock acquisition
+        assert lock_acquired_event.wait(timeout=2.0) is True
 
         # Now attempt cleanup while lock is held; finalize_active_sandbox_cleanup must block until lock_holder releases,
         # by which time the lease will have expired. It must sample `now` AFTER lock acquisition and reject!
