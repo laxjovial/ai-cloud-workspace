@@ -703,6 +703,79 @@ class TestPhaseB2WorkerEngine:
         )
         assert not is_dead_non_running
 
+        # FOCUSED INTEGRATION TEST: Reject IPC verification when lease expires while waiting for queue lock / BEGIN IMMEDIATE
+        short_lease_expiry = time.time() + 0.3
+        with queue._lock:
+            with queue.conn:
+                queue.conn.execute(
+                    "UPDATE jobs SET lease_expires_at = ? WHERE id = ?;",
+                    (short_lease_expiry, job["id"]),
+                )
+
+        lock_holder_event = threading.Event()
+        def lock_holder_func():
+            with queue._lock:
+                lock_holder_event.set()
+                # Hold lock until short lease is guaranteed to have expired
+                time.sleep(0.5)
+
+        lock_t = threading.Thread(target=lock_holder_func)
+        lock_t.start()
+        assert lock_holder_event.wait(timeout=2.0) is True
+
+        # IPC verification request arrives while queue._lock is held, blocks, and once acquired evaluates post-lock 'now'
+        is_dead_lock_expired = ipc_client_B.verify_worker_death(
+            job_id=job["id"],
+            instance_id=inst_A,
+            side_effect_id=se_id,
+        )
+        assert not is_dead_lock_expired
+        lock_t.join()
+
+        # FOCUSED INTEGRATION TEST: Transactional consistency under competing independent SQLite database connections
+        # An independent connection attempts concurrent mutations during verification
+        separate_queue = DurableJobQueue(db_path=db_path)
+        competing_errors = []
+
+        def competing_connection_mutator():
+            try:
+                for _ in range(40):
+                    with separate_queue._lock:
+                        with separate_queue.conn:
+                            separate_queue.conn.execute("BEGIN IMMEDIATE;")
+                            separate_queue.conn.execute(
+                                "UPDATE jobs SET heartbeat_at = ? WHERE id = ?;",
+                                (time.time(), job["id"]),
+                            )
+                    time.sleep(0.005)
+            except Exception as e:
+                competing_errors.append(e)
+            finally:
+                separate_queue.close()
+
+        # Restore valid lease before starting competing connection test
+        with queue._lock:
+            with queue.conn:
+                queue.conn.execute(
+                    "UPDATE jobs SET status = 'RUNNING', lease_expires_at = ? WHERE id = ?;",
+                    (time.time() + 60.0, job["id"]),
+                )
+
+        comp_t = threading.Thread(target=competing_connection_mutator)
+        comp_t.start()
+
+        for _ in range(20):
+            res_comp = ipc_client_B.verify_worker_death(
+                job_id=job["id"],
+                instance_id=inst_A,
+                side_effect_id=se_id,
+            )
+            assert res_comp is True
+            time.sleep(0.01)
+
+        comp_t.join()
+        assert len(competing_errors) == 0
+
         # Restore job to RUNNING with valid lease for confirmation
         with queue._lock:
             with queue.conn:

@@ -1210,68 +1210,72 @@ class DurableJobQueue:
     ) -> bool:
         """Contextual worker-death verification bound to specific job, worker instance, and side-effect.
         
-        Strict Invariants (executed under self._lock in a consistent database transaction):
+        Strict Invariants (executed under self._lock within an atomic BEGIN IMMEDIATE transaction):
         1. If caller_worker_id is provided, validates that caller_worker_id currently owns job_id,
            the job is strictly in status 'RUNNING', and its lease is non-null and unexpired (lease_expires_at >= now).
-        2. Verifies side_effect_id exists, belongs to specified job_id, and was registered by instance_id.
-        3. Verifies worker_instances row for instance_id has status == 'DEAD'.
-        4. Recomputes and validates canonical HMAC signature against supervisor_signing_key.
+        2. Timestamp 'now' is sampled strictly AFTER acquiring self._lock and beginning the transaction.
+        3. Verifies side_effect_id exists, belongs to specified job_id, and was registered by instance_id.
+        4. Verifies worker_instances row for instance_id has status == 'DEAD'.
+        5. Recomputes and validates canonical HMAC signature against supervisor_signing_key.
         """
-        now = time.time()
         with self._lock:
             try:
-                # 1. Caller lease authorization check (if caller_worker_id specified)
-                if caller_worker_id is not None:
-                    job_row = self.conn.execute(
-                        "SELECT worker_id, status, lease_expires_at FROM jobs WHERE id = ?;",
-                        (job_id,),
+                with self.conn:
+                    self.conn.execute("BEGIN IMMEDIATE;")
+                    now = time.time()
+
+                    # 1. Caller lease authorization check (if caller_worker_id specified)
+                    if caller_worker_id is not None:
+                        job_row = self.conn.execute(
+                            "SELECT worker_id, status, lease_expires_at FROM jobs WHERE id = ?;",
+                            (job_id,),
+                        ).fetchone()
+                        if not job_row:
+                            return False
+                        if job_row["worker_id"] != caller_worker_id:
+                            return False
+                        if job_row["status"] != "RUNNING":
+                            return False
+                        if job_row["lease_expires_at"] is None or job_row["lease_expires_at"] < now:
+                            return False
+
+                    # 2. Side-effect binding check
+                    se_row = self.conn.execute(
+                        "SELECT job_id, worker_id, status FROM job_side_effects WHERE side_effect_id = ?;",
+                        (side_effect_id,),
                     ).fetchone()
-                    if not job_row:
+
+                    if not se_row:
                         return False
-                    if job_row["worker_id"] != caller_worker_id:
-                        return False
-                    if job_row["status"] != "RUNNING":
-                        return False
-                    if job_row["lease_expires_at"] is None or job_row["lease_expires_at"] < now:
+                    if se_row["job_id"] != job_id or se_row["worker_id"] != instance_id:
                         return False
 
-                # 2. Side-effect binding check
-                se_row = self.conn.execute(
-                    "SELECT job_id, worker_id, status FROM job_side_effects WHERE side_effect_id = ?;",
-                    (side_effect_id,),
-                ).fetchone()
+                    # 3. Instance death record check
+                    inst_row = self.conn.execute(
+                        "SELECT * FROM worker_instances WHERE instance_id = ?;",
+                        (instance_id,),
+                    ).fetchone()
 
-                if not se_row:
-                    return False
-                if se_row["job_id"] != job_id or se_row["worker_id"] != instance_id:
-                    return False
+                    if not inst_row:
+                        return False
+                    if inst_row["status"] != "DEAD":
+                        return False
 
-                # 3. Instance death record check
-                inst_row = self.conn.execute(
-                    "SELECT * FROM worker_instances WHERE instance_id = ?;",
-                    (instance_id,),
-                ).fetchone()
-
-                if not inst_row:
-                    return False
-                if inst_row["status"] != "DEAD":
-                    return False
-
-                # 4. Cryptographic HMAC proof validation
-                canonical_payload = {
-                    "version": "v1",
-                    "proof_type": inst_row["proof_type"],
-                    "supervisor_id": inst_row["supervisor_id"],
-                    "instance_id": inst_row["instance_id"],
-                    "pid": inst_row["pid"],
-                    "start_time": inst_row["start_time"],
-                    "exit_code": inst_row["exit_code"],
-                    "exit_signal": inst_row["exit_signal"],
-                    "terminated_at": inst_row["terminated_at"],
-                    "reap_token": inst_row["reap_token"],
-                }
-                expected_sig = compute_canonical_signature(supervisor_signing_key, canonical_payload)
-                return hmac.compare_digest(inst_row["reap_signature"] or "", expected_sig)
+                    # 4. Cryptographic HMAC proof validation
+                    canonical_payload = {
+                        "version": "v1",
+                        "proof_type": inst_row["proof_type"],
+                        "supervisor_id": inst_row["supervisor_id"],
+                        "instance_id": inst_row["instance_id"],
+                        "pid": inst_row["pid"],
+                        "start_time": inst_row["start_time"],
+                        "exit_code": inst_row["exit_code"],
+                        "exit_signal": inst_row["exit_signal"],
+                        "terminated_at": inst_row["terminated_at"],
+                        "reap_token": inst_row["reap_token"],
+                    }
+                    expected_sig = compute_canonical_signature(supervisor_signing_key, canonical_payload)
+                    return hmac.compare_digest(inst_row["reap_signature"] or "", expected_sig)
             except sqlite3.Error:
                 return False
 
