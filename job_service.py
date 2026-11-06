@@ -5,23 +5,33 @@ the Streamlit web interface and the underlying Phase B.1/B.2 durable job store.
 
 Architectural Guarantees:
 - Never exposes raw SQLite connections, cursor objects, or transaction handles to callers.
-- Genuine Trusted-Principal Boundary: Requires a cryptographically verified or trusted
-  `AuthenticatedPrincipal` issued by an `AuthenticationAuthority` (e.g., Supabase token verifier
-  or HMAC authority). Plain strings and unverified caller-constructed identities are rejected fail-closed.
-- Returns deeply immutable, UI-safe dataclasses (`JobView`, `JobEventView`) with mappingproxy
-  and immutable tuples or defensive deep copies to prevent caller mutation of nested data.
-- Enforces strict security validation on payloads and credential references:
-  * Plaintext API keys and PATs are rejected with `InvalidCredentialReferenceError`.
-  * Only tenant-scoped credential reference pointers (`{"key_ref": "..."}`) are permitted.
-  * `additional_payload` is strictly validated against an explicit allowlist and cannot overwrite reserved fields.
-- Full Idempotency Comparison & Race-Free Enqueue:
+- Genuine Trusted-Principal Boundary: Requires a verified `AuthenticatedPrincipal` issued by a
+  trusted `AuthenticationVerifier` adapter. Plain strings and unverified caller-constructed identities
+  are rejected fail-closed.
+  * In B.3.1, `JobServiceClient` requires an `auth_verifier: AuthenticationVerifier` dependency injection;
+    it FAILS CLOSED if none is provided. No default random-secret authority is silently created.
+  * `auth_authority` is NOT exposed as a public property on `JobServiceClient`.
+  * `AuthenticationVerifier` verifies authentic external credentials (such as Supabase JWTs or shared-secret tokens)
+    before issuing or returning an `AuthenticatedPrincipal`.
+- Pre-Validation of Numeric Parameters:
+  * Numeric parameters (`max_retries`, `timeout_seconds`) are strictly validated using `validate_numeric()`
+    BEFORE any idempotency lookup or comparison. Booleans, NaN, Infinity, floats-for-ints, and out-of-range
+    values are rejected immediately.
+- Cross-Process Concurrency & Complete Idempotency Comparison:
   * The canonical idempotency fingerprint binds ALL execution-defining inputs:
     (user_id, session_id, turn_index, prompt, repository, model, credential_refs, complete additional_payload, max_retries, timeout_seconds).
-  * Race-free enqueue under the queue's lock: checks for existing key, verifies complete parameter match
-    (detecting missing or extra payload keys, max_retries, timeout mismatches, etc.), and enqueues atomically.
-  * Concurrent submissions with matching parameters return the same job; conflicting parameters raise `IdempotencyConflictError`.
-- Recursive Sanitization: Event data, error structures, and messages are recursively sanitized
-  at arbitrary nesting depth (dictionaries inside lists, lists inside dictionaries, etc.).
+  * Post-enqueue cross-process verification: After `enqueue_job()` returns (which handles multi-process concurrency
+    via SQLite WAL `BEGIN IMMEDIATE` transactions), the service strictly verifies the returned job against the complete
+    incoming execution request (including session_id, repository, prompt, model, turn_index, max_retries, timeout_seconds,
+    complete payload equality, and credential references).
+  * If another process won the race with a conflicting request, the service raises `IdempotencyConflictError`.
+  * If another process won the race with an identical request, the service safely returns the existing job.
+- Deep Immutability:
+  * Returns deeply immutable, UI-safe dataclasses (`JobView`, `JobEventView`) with mappingproxy
+    and immutable tuples to prevent caller mutation of nested data.
+- Recursive Sanitization:
+  * Event data, error structures, and messages are recursively sanitized at arbitrary nesting depth
+    (dictionaries inside lists, lists inside dictionaries, etc.).
 """
 
 from collections.abc import Mapping
@@ -35,7 +45,7 @@ import re
 import secrets
 import sqlite3
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Protocol, Set, Tuple, Union
 
 from job_queue import (
     DEFAULT_DB_PATH,
@@ -47,6 +57,7 @@ from job_queue import (
     InvalidStateTransitionError,
     StaleLeaseError,
     canonical_json,
+    validate_numeric,
 )
 
 logger = logging.getLogger("ai_cloud_workspace.job_service")
@@ -131,8 +142,8 @@ class AuthenticatedPrincipal:
     """Cryptographically issued and non-forgeable application identity token representing an authenticated principal.
     
     Invariants:
-    1. Instances CANNOT be manufactured by arbitrary callers. They are produced exclusively by an
-       `AuthenticationAuthority` via cryptographic verification (e.g. HMAC-SHA256 signature).
+    1. Instances CANNOT be manufactured by arbitrary callers. They are produced exclusively by a trusted
+       `AuthenticationVerifier` via cryptographic verification (e.g. HMAC-SHA256 signature).
     2. Any tampering with `user_id`, `issuer`, `issued_at`, or `signature` invalidates the principal.
     """
     user_id: str
@@ -143,28 +154,39 @@ class AuthenticatedPrincipal:
     roles: Tuple[str, ...] = ("user",)
 
 
-class AuthenticationAuthority:
-    """Trusted authentication adapter and token issuance authority.
+class AuthenticationVerifier(Protocol):
+    """Protocol representing a trusted authentication adapter (e.g., Supabase JWT verifier or backend auth service)."""
+    def verify_principal(self, principal: Any) -> AuthenticatedPrincipal:
+        """Verifies that the principal is authentic and returns the verified AuthenticatedPrincipal."""
+        ...
+
+
+class HMACAuthenticationAuthority:
+    """Cryptographic authentication authority and verifier using HMAC-SHA256 signatures.
     
-    Verifies user credentials (e.g., Supabase session, API bearer tokens, or internal trusted service tokens)
-    and mints verifiable `AuthenticatedPrincipal` objects.
+    Used by trusted application layers (e.g. auth callbacks, server session validators) to verify
+    credentials and issue non-forgeable `AuthenticatedPrincipal` objects.
+    
+    Security Invariant: The authority secret must be kept private within the authentication layer.
     """
 
-    def __init__(self, authority_secret: Optional[bytes] = None):
-        self._secret = authority_secret if authority_secret is not None else secrets.token_bytes(32)
+    def __init__(self, authority_secret: bytes):
+        if not authority_secret or not isinstance(authority_secret, (bytes, bytearray)) or len(authority_secret) < 16:
+            raise ValueError("HMACAuthenticationAuthority requires a secret key of at least 16 bytes.")
+        self._secret = bytes(authority_secret)
 
-    def issue_principal(
+    def issue_principal_from_verified_credential(
         self,
-        user_id: str,
+        verified_user_id: str,
         email: Optional[str] = None,
         roles: Tuple[str, ...] = ("user",),
         issuer: str = "ai_cloud_auth",
     ) -> AuthenticatedPrincipal:
-        """Issues a cryptographically signed AuthenticatedPrincipal for a verified user identity."""
-        if not user_id or not isinstance(user_id, str) or not user_id.strip():
+        """Issues an AuthenticatedPrincipal after a trusted verification step has validated the user's credential."""
+        if not verified_user_id or not isinstance(verified_user_id, str) or not verified_user_id.strip():
             raise AuthenticationVerificationError("Cannot issue principal for empty user_id.")
 
-        clean_user = user_id.strip()
+        clean_user = verified_user_id.strip()
         clean_email = email.strip() if email else None
         clean_roles = tuple(sorted(str(r) for r in roles)) if roles else ("user",)
         now = time.time()
@@ -189,12 +211,7 @@ class AuthenticationAuthority:
         )
 
     def verify_principal(self, principal: Any) -> AuthenticatedPrincipal:
-        """Validates that an AuthenticatedPrincipal is authentic, unmodified, and unexpired.
-        
-        Raises:
-            AuthenticationVerificationError: If principal was constructed by caller without authority signature,
-                                              has an invalid signature, or is not an AuthenticatedPrincipal.
-        """
+        """Validates that an AuthenticatedPrincipal is authentic, unmodified, and unexpired."""
         if not isinstance(principal, AuthenticatedPrincipal):
             raise AuthenticationVerificationError(
                 f"Authentication required: expected AuthenticatedPrincipal, got {type(principal).__name__}."
@@ -315,33 +332,35 @@ class JobServiceClient:
     """High-level application client mediating interaction between Streamlit and DurableJobQueue.
     
     Invariants:
-    1. Authenticated Identity: Requires an AuthenticatedPrincipal verified by an AuthenticationAuthority.
-       Plain strings and unverified caller-constructed tokens are strictly rejected.
+    1. Authenticated Identity: Requires an AuthenticatedPrincipal verified by an AuthenticationVerifier.
+       Fails closed if auth_verifier is missing or fails. Does not silently generate random authorities.
     2. Deep Immutability: Value objects JobView and JobEventView cannot be mutated by callers.
-    3. Complete Idempotency Comparison & Race-Free Enqueue:
+    3. Numeric Pre-Validation: Validates max_retries and timeout_seconds BEFORE idempotency lookup,
+       rejecting NaN, Infinity, and booleans.
+    4. Cross-Process Race-Free Idempotency:
        Submissions matching an existing key with any differing parameters (repository, prompt, model,
        turn_index, credentials, missing/extra payload keys, max_retries, timeout_seconds) are rejected
-       with IdempotencyConflictError under atomic queue synchronization.
-    4. Payload Validation: additional_payload is strictly checked against ALLOWED_ADDITIONAL_PAYLOAD_KEYS
+       with IdempotencyConflictError both before AND after enqueue_job() returns.
+    5. Payload Validation: additional_payload is strictly checked against ALLOWED_ADDITIONAL_PAYLOAD_KEYS
        and cannot overwrite RESERVED_PAYLOAD_KEYS.
-    5. Recursive Sanitization: Strings inside arbitrary nested dictionaries and lists are sanitized.
-    6. Safe cancellation: respects terminal job states without masking failures.
+    6. Recursive Sanitization: Strings inside arbitrary nested dictionaries and lists are sanitized.
+    7. Safe cancellation: respects terminal job states without masking failures.
     """
 
     def __init__(
         self,
+        auth_verifier: AuthenticationVerifier,
         db_path: str = DEFAULT_DB_PATH,
         queue: Optional[DurableJobQueue] = None,
-        auth_authority: Optional[AuthenticationAuthority] = None,
     ):
+        if auth_verifier is None or not hasattr(auth_verifier, "verify_principal"):
+            raise ValueError(
+                "JobServiceClient requires a valid 'auth_verifier' implementing AuthenticationVerifier. "
+                "Refusing to initialize without a trusted authentication verification boundary."
+            )
+        self._auth_verifier = auth_verifier
         self._db_path = db_path
         self._queue = queue if queue is not None else DurableJobQueue(db_path=db_path)
-        self._auth = auth_authority if auth_authority is not None else AuthenticationAuthority()
-
-    @property
-    def auth_authority(self) -> AuthenticationAuthority:
-        """Returns the trusted authentication authority for issuing and verifying principals."""
-        return self._auth
 
     def close(self) -> None:
         """Closes the underlying queue resources."""
@@ -349,8 +368,8 @@ class JobServiceClient:
             self._queue.close()
 
     def _verify_principal(self, principal: Any) -> AuthenticatedPrincipal:
-        """Cryptographically verifies that caller identity was issued by a trusted authority."""
-        return self._auth.verify_principal(principal)
+        """Cryptographically verifies caller identity via the trusted authentication verifier."""
+        return self._auth_verifier.verify_principal(principal)
 
     def submit_agent_turn(
         self,
@@ -369,7 +388,7 @@ class JobServiceClient:
         """Submits an agent turn task to the durable queue with deduplication, payload validation, and tenant isolation.
         
         Args:
-            principal: Verified AuthenticatedPrincipal issued by AuthenticationAuthority.
+            principal: Verified AuthenticatedPrincipal issued by a trusted authentication adapter.
             session_id: The active chat session ID.
             repository: Target GitHub repository (e.g. 'owner/repo').
             prompt: User instructions for the turn.
@@ -391,8 +410,13 @@ class JobServiceClient:
             JobQueueError: If validation fails or database error occurs.
             InvalidCredentialReferenceError: If plaintext credentials or invalid references are detected.
         """
+        # 1. Strictly verify authenticated identity before anything else
         verified = self._verify_principal(principal)
         user_id = verified.user_id
+
+        # 2. Strict Pre-Validation of Numeric Parameters (prevents NaN / boolean bypass)
+        validate_numeric(max_retries, "max_retries", 0, 50, require_int=True)
+        validate_numeric(timeout_seconds, "timeout_seconds", 1.0, 86400.0, require_int=False)
 
         if not repository or not repository.strip():
             raise JobQueueError("repository is required to submit a job.")
@@ -405,7 +429,7 @@ class JobServiceClient:
         clean_prompt = prompt.strip()
         clean_model = model.strip() if model else "gemini/gemini-2.5-flash"
 
-        # Validate additional_payload against reserved fields and allowlist
+        # 3. Validate additional_payload against reserved fields and allowlist
         sanitized_additional: Dict[str, Any] = {}
         if additional_payload is not None:
             if not isinstance(additional_payload, dict):
@@ -419,7 +443,7 @@ class JobServiceClient:
                     )
                 sanitized_additional[k] = v
 
-        # Compute comprehensive canonical idempotency key if not explicitly provided
+        # 4. Compute comprehensive canonical idempotency key if not explicitly provided
         effective_idempotency_key = (
             idempotency_key.strip()
             if idempotency_key and idempotency_key.strip()
@@ -446,7 +470,7 @@ class JobServiceClient:
         if sanitized_additional:
             expected_payload.update(sanitized_additional)
 
-        # Race-free check & enqueue under the queue's lock
+        # 5. Pre-check for existing job under local lock to fail fast on conflicts
         with self._queue._lock:
             existing_job_dict = self._find_existing_by_idempotency_key(effective_idempotency_key)
             if existing_job_dict:
@@ -467,6 +491,7 @@ class JobServiceClient:
                 )
                 return self._dict_to_job_view(existing_job_dict)
 
+            # 6. Execute atomic enqueue (in SQLite WAL BEGIN IMMEDIATE)
             raw_job = self._queue.enqueue_job(
                 user_id=clean_user_id,
                 session_id=clean_session_id,
@@ -477,6 +502,22 @@ class JobServiceClient:
                 max_retries=max_retries,
                 timeout_seconds=timeout_seconds,
             )
+
+        # 7. Post-Enqueue Cross-Process Verification:
+        # If another process inserted this idempotency key concurrently, enqueue_job() returned
+        # that existing row. We MUST verify that the returned job matches our execution parameters.
+        self._verify_idempotent_request_match(
+            existing_job=raw_job,
+            session_id=clean_session_id,
+            repository=clean_repo,
+            prompt=clean_prompt,
+            model=clean_model,
+            turn_index=turn_index,
+            credential_refs=credential_refs or {},
+            expected_payload=expected_payload,
+            max_retries=max_retries,
+            timeout_seconds=timeout_seconds,
+        )
 
         return self._dict_to_job_view(raw_job)
 

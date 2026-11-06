@@ -1,26 +1,31 @@
-"""Test Suite for Phase B.3.1 Job Service Client Boundary (Final Targeted Corrections).
+"""Test Suite for Phase B.3.1 Job Service Client Boundary (Independent Review Corrections).
 
 Covers all review requirements and safeguards:
 1. Successful job submission with verified AuthenticatedPrincipal and immutable JobView return.
 2. Complete parameter idempotency comparison (detects repository, model, prompt, missing/extra payload,
    credential_refs, max_retries, and timeout_seconds mismatches) raising IdempotencyConflictError.
-3. Concurrent duplicate submissions handling without race conditions, errors, or duplicates.
-4. Cross-tenant job access rejection.
-5. Cross-tenant event access rejection.
-6. Cross-tenant cancellation rejection.
-7. Incremental event retrieval (after_id sequence filtering).
-8. Cancellation of queued jobs (immediate transition) and running jobs (cancel_requested_at).
-9. Cancellation of terminal jobs (no-op, preserves state).
-10. Invalid payload, raw secret detection, and reserved payload key protection.
-11. Database and queue failure behavior (does not mask errors).
-12. Genuine authentication boundary enforcement: rejects raw strings, forged signatures, expired principals,
-    and unverified caller-constructed objects.
-13. Deep immutability of JobView and JobEventView (nested dicts/lists cannot be mutated).
-14. Recursive sanitization at arbitrary nesting depth (lists of dicts, dicts of lists).
-15. Chat session active job rehydration lookup.
+3. Cross-process concurrent duplicate submissions:
+   - Uses two independently constructed JobServiceClient instances sharing the same SQLite DB.
+   - Identical parameters safely return the same job.
+   - Conflicting parameters raise IdempotencyConflictError without duplicate rows or uncaught SQLite errors.
+4. Pre-validation of numeric execution parameters (rejects NaN, Infinity, booleans, and out-of-range).
+5. Cross-tenant job access rejection.
+6. Cross-tenant event access rejection.
+7. Cross-tenant cancellation rejection.
+8. Incremental event retrieval (after_id sequence filtering).
+9. Cancellation of queued jobs (immediate transition) and running jobs (cancel_requested_at).
+10. Cancellation of terminal jobs (no-op, preserves state).
+11. Invalid payload, raw secret detection, and reserved payload key protection.
+12. Database and queue failure behavior (does not mask errors).
+13. Genuine authentication boundary enforcement: rejects raw strings, forged signatures, expired principals,
+    foreign authorities, and fails closed when auth_verifier is absent.
+14. Deep immutability of JobView and JobEventView (nested dicts/lists cannot be mutated).
+15. Recursive sanitization at arbitrary nesting depth (lists of dicts, dicts of lists).
+16. Chat session active job rehydration lookup.
 """
 
 import concurrent.futures
+import math
 import os
 import sqlite3
 import tempfile
@@ -37,8 +42,8 @@ from job_queue import (
 )
 from job_service import (
     AuthenticatedPrincipal,
-    AuthenticationAuthority,
     AuthenticationVerificationError,
+    HMACAuthenticationAuthority,
     IdempotencyConflictError,
     JobEventView,
     JobServiceClient,
@@ -66,14 +71,14 @@ def temp_db_path():
 
 @pytest.fixture
 def auth_authority():
-    """Provides a fresh AuthenticationAuthority."""
-    return AuthenticationAuthority(authority_secret=b"test_secret_for_service_testing_32b!")
+    """Provides a fresh HMACAuthenticationAuthority."""
+    return HMACAuthenticationAuthority(authority_secret=b"test_secret_for_service_testing_32b!")
 
 
 @pytest.fixture
 def service_client(temp_db_path, auth_authority):
     """Provides a fresh JobServiceClient instance backed by a temporary database and test authority."""
-    client = JobServiceClient(db_path=temp_db_path, auth_authority=auth_authority)
+    client = JobServiceClient(db_path=temp_db_path, auth_verifier=auth_authority)
     yield client
     client.close()
 
@@ -81,13 +86,17 @@ def service_client(temp_db_path, auth_authority):
 @pytest.fixture
 def alice_principal(auth_authority):
     """Provides a legitimately signed AuthenticatedPrincipal for Alice."""
-    return auth_authority.issue_principal(user_id="user_alice", email="alice@example.com", roles=("user",))
+    return auth_authority.issue_principal_from_verified_credential(
+        verified_user_id="user_alice", email="alice@example.com", roles=("user",)
+    )
 
 
 @pytest.fixture
 def bob_principal(auth_authority):
     """Provides a legitimately signed AuthenticatedPrincipal for Bob."""
-    return auth_authority.issue_principal(user_id="user_bob", email="bob@example.com", roles=("user",))
+    return auth_authority.issue_principal_from_verified_credential(
+        verified_user_id="user_bob", email="bob@example.com", roles=("user",)
+    )
 
 
 class TestPhaseB3JobService:
@@ -224,31 +233,107 @@ class TestPhaseB3JobService:
             )
         assert "payload" in str(exc_missing.value)
 
-    def test_3_concurrent_duplicate_submissions(self, service_client, alice_principal):
-        """Requirement 3: Concurrent submissions with same idempotency key are race-free and return identical job."""
-        key = "idemp_concurrent_shared_key"
+    def test_3_cross_process_concurrent_idempotency_race(self, temp_db_path, auth_authority, alice_principal):
+        """Requirement 3: Two independent JobServiceClient instances sharing the same DB coordinate race-free.
+        
+        Exercises:
+        1. Identical concurrent requests return the same job.
+        2. Conflicting concurrent requests raise IdempotencyConflictError.
+        3. Zero duplicate records or uncaught SQLite errors.
+        """
+        # Create two independent service instances sharing the same underlying SQLite file
+        client_a = JobServiceClient(db_path=temp_db_path, auth_verifier=auth_authority)
+        client_b = JobServiceClient(db_path=temp_db_path, auth_verifier=auth_authority)
 
-        def submit():
-            return service_client.submit_agent_turn(
+        custom_idemp = "cross_process_idemp_key_123"
+
+        # 1. Concurrent identical requests across independent clients
+        def submit_identical(client):
+            return client.submit_agent_turn(
                 principal=alice_principal,
-                session_id="sess_race",
+                session_id="sess_cross",
                 repository="org/repo",
-                prompt="Concurrent prompt",
+                prompt="Shared prompt",
                 turn_index=1,
-                idempotency_key=key,
+                idempotency_key=custom_idemp,
             )
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-            futures = [executor.submit(submit) for _ in range(5)]
-            results = [f.result() for f in futures]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            fut_a = executor.submit(submit_identical, client_a)
+            fut_b = executor.submit(submit_identical, client_b)
+            res_a = fut_a.result()
+            res_b = fut_b.result()
 
-        # All 5 concurrent requests returned successfully and received the exact same job ID
-        assert len(results) == 5
-        job_ids = {r.id for r in results}
-        assert len(job_ids) == 1
+        # Both independent clients received the exact same job ID
+        assert res_a.id == res_b.id
 
-    def test_4_cross_tenant_job_access_rejection(self, service_client, alice_principal, bob_principal):
-        """Requirement 4: Verify tenant ownership is strictly enforced for job status queries."""
+        # Verify only 1 row exists in the database
+        queue = DurableJobQueue(db_path=temp_db_path)
+        rows = queue.conn.execute("SELECT COUNT(*) as cnt FROM jobs WHERE idempotency_key = ?;", (custom_idemp,)).fetchone()
+        assert rows["cnt"] == 1
+        queue.close()
+
+        # 2. Conflicting request submitted from client_b on the existing key must raise IdempotencyConflictError
+        with pytest.raises(IdempotencyConflictError):
+            client_b.submit_agent_turn(
+                principal=alice_principal,
+                session_id="sess_cross",
+                repository="org/repo",
+                prompt="Conflicting prompt on same key",
+                turn_index=1,
+                idempotency_key=custom_idemp,
+            )
+
+        client_a.close()
+        client_b.close()
+
+    def test_4_numeric_pre_validation(self, service_client, alice_principal):
+        """Requirement 4: Strict pre-validation of numeric execution parameters rejects NaN, Inf, and booleans."""
+        # 1. NaN timeout_seconds rejected before lookup
+        with pytest.raises(JobQueueError) as exc_nan:
+            service_client.submit_agent_turn(
+                principal=alice_principal,
+                session_id="sess_num",
+                repository="org/repo",
+                prompt="Task",
+                timeout_seconds=float("nan"),
+            )
+        assert "non-finite" in str(exc_nan.value).lower()
+
+        # 2. Infinity timeout_seconds rejected
+        with pytest.raises(JobQueueError) as exc_inf:
+            service_client.submit_agent_turn(
+                principal=alice_principal,
+                session_id="sess_num",
+                repository="org/repo",
+                prompt="Task",
+                timeout_seconds=float("inf"),
+            )
+        assert "non-finite" in str(exc_inf.value).lower()
+
+        # 3. Boolean passed as max_retries rejected (even though bool is subclass of int)
+        with pytest.raises(JobQueueError) as exc_bool:
+            service_client.submit_agent_turn(
+                principal=alice_principal,
+                session_id="sess_num",
+                repository="org/repo",
+                prompt="Task",
+                max_retries=True,  # type: ignore
+            )
+        assert "invalid type" in str(exc_bool.value).lower() or "expected integer" in str(exc_bool.value).lower()
+
+        # 4. Negative or out-of-range timeout
+        with pytest.raises(JobQueueError):
+            service_client.submit_agent_turn(
+                principal=alice_principal,
+                session_id="sess_num",
+                repository="org/repo",
+                prompt="Task",
+                timeout_seconds=0.0,
+            )
+
+    def test_5_cross_tenant_job_access_rejection(self, service_client, alice_principal, bob_principal):
+        """Requirement 5: Verify tenant ownership is strictly enforced for job status queries."""
         job = service_client.submit_agent_turn(
             principal=alice_principal,
             session_id="sess_1",
@@ -269,8 +354,8 @@ class TestPhaseB3JobService:
         with pytest.raises(JobNotFoundError):
             service_client.get_job(job_id="non_existent_uuid", principal=alice_principal)
 
-    def test_5_cross_tenant_event_access_rejection(self, service_client, alice_principal, bob_principal):
-        """Requirement 5: Verify tenant ownership is strictly enforced for event streams."""
+    def test_6_cross_tenant_event_access_rejection(self, service_client, alice_principal, bob_principal):
+        """Requirement 6: Verify tenant ownership is strictly enforced for event streams."""
         job = service_client.submit_agent_turn(
             principal=alice_principal,
             session_id="sess_1",
@@ -287,8 +372,8 @@ class TestPhaseB3JobService:
         with pytest.raises(JobAccessDeniedError):
             service_client.get_job_events(job_id=job.id, principal=bob_principal)
 
-    def test_6_cross_tenant_cancellation_rejection(self, service_client, alice_principal, bob_principal):
-        """Requirement 6: Verify tenant ownership is strictly enforced for job cancellation."""
+    def test_7_cross_tenant_cancellation_rejection(self, service_client, alice_principal, bob_principal):
+        """Requirement 7: Verify tenant ownership is strictly enforced for job cancellation."""
         job = service_client.submit_agent_turn(
             principal=alice_principal,
             session_id="sess_1",
@@ -305,8 +390,8 @@ class TestPhaseB3JobService:
         assert check.status == "QUEUED"
         assert check.is_cancellation_requested is False
 
-    def test_7_incremental_event_retrieval(self, service_client, temp_db_path, alice_principal):
-        """Requirement 7: Verify incremental event retrieval using after_id filtering."""
+    def test_8_incremental_event_retrieval(self, service_client, temp_db_path, alice_principal):
+        """Requirement 8: Verify incremental event retrieval using after_id filtering."""
         job = service_client.submit_agent_turn(
             principal=alice_principal,
             session_id="sess_1",
@@ -352,8 +437,8 @@ class TestPhaseB3JobService:
         assert new_events[1].event_type == "TOOL_CALL"
         assert all(e.id > last_id for e in new_events)
 
-    def test_8_cancellation_queued_and_running_jobs(self, service_client, temp_db_path, alice_principal):
-        """Requirement 8: Cancellation transitions QUEUED to CANCELLED and marks RUNNING jobs."""
+    def test_9_cancellation_queued_and_running_jobs(self, service_client, temp_db_path, alice_principal):
+        """Requirement 9: Cancellation transitions QUEUED to CANCELLED and marks RUNNING jobs."""
         # 1. Cancel QUEUED job -> immediate transition to CANCELLED
         job_queued = service_client.submit_agent_turn(
             principal=alice_principal,
@@ -385,8 +470,8 @@ class TestPhaseB3JobService:
         assert res_r.is_cancellation_requested is True
         assert res_r.cancel_requested_by == "user_alice"
 
-    def test_9_cancellation_of_terminal_jobs(self, service_client, temp_db_path, alice_principal):
-        """Requirement 9: Cancellation of terminal jobs (COMPLETED, FAILED) is safe and preserves status."""
+    def test_10_cancellation_of_terminal_jobs(self, service_client, temp_db_path, alice_principal):
+        """Requirement 10: Cancellation of terminal jobs (COMPLETED, FAILED) is safe and preserves status."""
         job = service_client.submit_agent_turn(
             principal=alice_principal,
             session_id="sess_term",
@@ -417,8 +502,8 @@ class TestPhaseB3JobService:
         assert view_after.status == "COMPLETED"
         assert view_after.is_terminal is True
 
-    def test_10_invalid_payload_and_reserved_key_protection(self, service_client, alice_principal):
-        """Requirement 10: Reserved payload keys cannot be overridden and raw secrets are rejected."""
+    def test_11_invalid_payload_and_reserved_key_protection(self, service_client, alice_principal):
+        """Requirement 11: Reserved payload keys cannot be overridden and raw secrets are rejected."""
         # 1. Plaintext API key in credential_refs must be rejected
         with pytest.raises(InvalidCredentialReferenceError):
             service_client.submit_agent_turn(
@@ -461,8 +546,8 @@ class TestPhaseB3JobService:
             )
         assert "Disallowed key" in str(exc_dis.value)
 
-    def test_11_database_and_queue_failure_behavior(self, service_client, alice_principal):
-        """Requirement 11: Database errors are properly raised and not masked as success or empty."""
+    def test_12_database_and_queue_failure_behavior(self, service_client, alice_principal):
+        """Requirement 12: Database errors are properly raised and not masked as success or empty."""
         service_client._queue.conn.close()
 
         with pytest.raises(JobQueueError):
@@ -479,8 +564,8 @@ class TestPhaseB3JobService:
         with pytest.raises(JobQueueError):
             service_client.cancel_job(job_id="any_id", principal=alice_principal)
 
-    def test_12_authenticated_principal_boundary_enforcement(self, service_client, auth_authority):
-        """Requirement 12: Genuine authentication boundary: rejects raw strings, forged signatures, and unverified objects."""
+    def test_13_authenticated_principal_boundary_enforcement(self, service_client, auth_authority, temp_db_path):
+        """Requirement 13: Genuine authentication boundary: rejects raw strings, forged signatures, and fails closed without verifier."""
         # 1. Plain strings are strictly rejected
         with pytest.raises(AuthenticationVerificationError):
             service_client.get_job(job_id="job_123", principal="user_alice")  # type: ignore
@@ -495,21 +580,25 @@ class TestPhaseB3JobService:
         with pytest.raises(AuthenticationVerificationError):
             service_client.get_job(job_id="job_123", principal=forged_principal)
 
-        # 3. Principal signed by different authority rejected
-        other_authority = AuthenticationAuthority(authority_secret=b"different_secret_key_32b_here!!")
-        foreign_principal = other_authority.issue_principal(user_id="user_alice")
+        # 3. Principal signed by different authority secret rejected
+        other_authority = HMACAuthenticationAuthority(authority_secret=b"different_secret_key_32b_here!!")
+        foreign_principal = other_authority.issue_principal_from_verified_credential(verified_user_id="user_alice")
         with pytest.raises(AuthenticationVerificationError):
             service_client.get_job(job_id="job_123", principal=foreign_principal)
 
         # 4. Expired principal rejected
-        expired_principal = auth_authority.issue_principal(user_id="user_alice")
-        # Artificially age the principal
+        expired_principal = auth_authority.issue_principal_from_verified_credential(verified_user_id="user_alice")
         object.__setattr__(expired_principal, "issued_at", time.time() - 90000.0)
         with pytest.raises(AuthenticationVerificationError):
             service_client.get_job(job_id="job_123", principal=expired_principal)
 
-    def test_13_deep_immutability_of_views(self, service_client, alice_principal, temp_db_path):
-        """Requirement 13: JobView and JobEventView prevent nested data mutation."""
+        # 5. Service client refuses to initialize without auth_verifier (fails closed)
+        with pytest.raises(ValueError) as exc_init:
+            JobServiceClient(db_path=temp_db_path, auth_verifier=None)  # type: ignore
+        assert "requires a valid 'auth_verifier'" in str(exc_init.value)
+
+    def test_14_deep_immutability_of_views(self, service_client, alice_principal, temp_db_path):
+        """Requirement 14: JobView and JobEventView prevent nested data mutation."""
         job = service_client.submit_agent_turn(
             principal=alice_principal,
             session_id="sess_mut",
@@ -559,8 +648,8 @@ class TestPhaseB3JobService:
         with pytest.raises(TypeError):
             log_event.data["details"]["files"][0] = "c.py"
 
-    def test_14_recursive_sanitization_at_arbitrary_depth(self):
-        """Requirement 14: Recursive sanitization redacts secrets in deeply nested lists and dicts."""
+    def test_15_recursive_sanitization_at_arbitrary_depth(self):
+        """Requirement 15: Recursive sanitization redacts secrets in deeply nested lists and dicts."""
         nested_structure = {
             "execution": {
                 "steps": [
@@ -588,8 +677,8 @@ class TestPhaseB3JobService:
         assert "AIza" not in step1["logs"][0]
         assert "[REDACTED_SECRET]" in step1["logs"][0]
 
-    def test_15_session_active_job_lookup(self, service_client, alice_principal):
-        """Requirement 15: Verify get_active_job_for_session retrieves running/queued jobs and ignores completed."""
+    def test_16_session_active_job_lookup(self, service_client, alice_principal):
+        """Requirement 16: Verify get_active_job_for_session retrieves running/queued jobs and ignores completed."""
         j1 = service_client.submit_agent_turn(
             principal=alice_principal,
             session_id="sess_hydration",

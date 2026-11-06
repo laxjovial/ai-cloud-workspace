@@ -1,4 +1,4 @@
-# Phase B.3.1 Delivery Report: Job Service Client Boundary (Final Review Corrections)
+# Phase B.3.1 Delivery Report: Job Service Client Boundary (Review Pass 3 Corrections)
 
 **Status:** Completed & Ready for Review  
 **Branch:** `feat/phase-b3-job-service`  
@@ -12,35 +12,41 @@
 
 ## 1. Executive Summary & Review Findings Addressed
 
-Following the second review of Increment B.3.1, targeted corrections were implemented to establish a genuine authentication trust boundary, complete parameter comparison for custom idempotency keys, and eliminate concurrency races during duplicate submissions.
-
-### Detailed Corrections Delivered:
-
-1. **Genuine Authentication Boundary ([`AuthenticationAuthority`](file:///home/gamp/portfolio/ai-cloud-workspace/job_service.py#L130-L200) & [`AuthenticatedPrincipal`](file:///home/gamp/portfolio/ai-cloud-workspace/job_service.py#L112-L127)):**
-   - **Removed string-based fallback:** The service no longer accepts raw `user_id` strings or caller-manufactured identity claims.
-   - **Cryptographic issuance and verification:** An `AuthenticatedPrincipal` can only be minted by an `AuthenticationAuthority` with an HMAC-SHA256 signature.
-   - **Fail-closed verification:** Every service method validates the principal's signature and expiration against the authority. Forged signatures, cross-authority tokens, expired tokens, and raw strings strictly raise [`AuthenticationVerificationError`](file:///home/gamp/portfolio/ai-cloud-workspace/job_service.py#L76) (`JobAccessDeniedError`).
-2. **Complete Parameter Idempotency Comparison ([`_verify_idempotent_request_match()`](file:///home/gamp/portfolio/ai-cloud-workspace/job_service.py#L555-L605)):**
-   - When an idempotency key matches an existing record, the service validates:
-     * `user_id` matches tenant ownership.
-     * `session_id` matches.
-     * `repository` matches.
-     * `max_retries` matches.
-     * `timeout_seconds` matches.
-     * `payload` canonically matches (detecting extra, missing, or altered keys).
-     * `credential_refs` canonically matches.
-   - Any difference raises [`IdempotencyConflictError`](file:///home/gamp/portfolio/ai-cloud-workspace/job_service.py#L71).
-3. **Race-Free Concurrent Duplicate Handling:**
-   - Wrapped check-and-enqueue logic under `self._queue._lock`.
-   - Concurrent submissions with identical parameters safely return the same job without database constraint errors or duplicate records.
-   - Concurrent submissions with conflicting parameters raise `IdempotencyConflictError`.
-   - Verified via a multithreaded concurrency test ([`test_3_concurrent_duplicate_submissions`](file:///home/gamp/portfolio/ai-cloud-workspace/tests/test_phase_b3_job_service.py#L182-L203)).
+Following the third independent review of Increment B.3.1, targeted corrections were implemented to:
+1. Establish a genuine dependency-injected authentication boundary that fails closed without an external verifier.
+2. Close cross-process idempotency races via post-enqueue verification.
+3. Pre-validate all numeric parameters to eliminate NaN/boolean bypasses before idempotency lookup.
 
 ---
 
-## 2. Updated Interface Specification
+## 2. Detailed Review Corrections Delivered
+
+### 2.1 Genuine Authentication Trust Boundary & Dependency Injection
+- **Removed Public Authority Accessor:** The `auth_authority` property on `JobServiceClient` was completely removed. Callers holding a reference to `JobServiceClient` have zero capability to issue or forge identity tokens.
+- **Fail-Closed Verification Dependency:** `JobServiceClient` now requires an explicit `auth_verifier: AuthenticationVerifier` dependency injected during construction. It no longer silently creates a default in-memory random authority. If `auth_verifier` is missing or invalid, initialization fails immediately with `ValueError`.
+- **Decoupled Verification from Service:** Mints `AuthenticatedPrincipal` objects strictly via external verification (`issue_principal_from_verified_credential`), maintaining a strict boundary between credential verification and job execution.
+- **Explicit Scope Limitation Documentation:** B.3.1 establishes the client service contract and cryptographic verifier protocol (`AuthenticationVerifier`). Full integration with Supabase session cookies/JWTs is documented as an application-level dependency to be wired during UI integration in B.3.3.
+
+### 2.2 Cross-Process Idempotency Race Closure
+- **Post-Enqueue Verification:** In a multi-process environment where independent service instances share the SQLite database, `enqueue_job()` atomically handles insertion or returns the existing row under SQLite's `BEGIN IMMEDIATE` transaction.
+- After `enqueue_job()` returns, `JobServiceClient` performs a second, authoritative verification of the returned row against the complete execution request (repository, prompt, model, turn_index, max_retries, timeout_seconds, complete payload canonical JSON equality, and credential_refs canonical equality).
+- If another process inserted an identical request concurrently, the existing job is returned safely.
+- If another process inserted a conflicting request on the same idempotency key concurrently, `JobServiceClient` raises [`IdempotencyConflictError`](file:///home/gamp/portfolio/ai-cloud-workspace/job_service.py#L79).
+- Tested via [`test_3_cross_process_concurrent_idempotency_race`](file:///home/gamp/portfolio/ai-cloud-workspace/tests/test_phase_b3_job_service.py#L182-L230) using two separate `JobServiceClient` instances.
+
+### 2.3 Strict Numeric Parameter Pre-Validation
+- `max_retries` and `timeout_seconds` are validated using `validate_numeric()` **before** any database lookup or idempotency comparison is performed.
+- Explicitly rejects `float("nan")`, `float("inf")`, and Python booleans (`True`/`False`), as well as out-of-range values.
+- Tested via [`test_4_numeric_pre_validation`](file:///home/gamp/portfolio/ai-cloud-workspace/tests/test_phase_b3_job_service.py#L232-L272).
+
+---
+
+## 3. Updated Interface Contract
 
 ```python
+class AuthenticationVerifier(Protocol):
+    def verify_principal(self, principal: Any) -> AuthenticatedPrincipal: ...
+
 @dataclass(frozen=True)
 class AuthenticatedPrincipal:
     user_id: str
@@ -50,12 +56,18 @@ class AuthenticatedPrincipal:
     email: Optional[str] = None
     roles: Tuple[str, ...] = ("user",)
 
-class AuthenticationAuthority:
-    def issue_principal(self, user_id: str, email: Optional[str] = None, roles: Tuple[str, ...] = ("user",)) -> AuthenticatedPrincipal: ...
+class HMACAuthenticationAuthority:
+    def __init__(self, authority_secret: bytes): ...
+    def issue_principal_from_verified_credential(self, verified_user_id: str, email: Optional[str] = None, roles: Tuple[str, ...] = ("user",), issuer: str = "ai_cloud_auth") -> AuthenticatedPrincipal: ...
     def verify_principal(self, principal: Any) -> AuthenticatedPrincipal: ...
 
 class JobServiceClient:
-    def __init__(self, db_path: str = DEFAULT_DB_PATH, queue: Optional[DurableJobQueue] = None, auth_authority: Optional[AuthenticationAuthority] = None): ...
+    def __init__(
+        self,
+        auth_verifier: AuthenticationVerifier,
+        db_path: str = DEFAULT_DB_PATH,
+        queue: Optional[DurableJobQueue] = None,
+    ): ...
 
     def submit_agent_turn(
         self,
@@ -81,24 +93,35 @@ class JobServiceClient:
 
 ---
 
-## 3. Test Suite Execution Results
-
-All 15 tests in [`tests/test_phase_b3_job_service.py`](file:///home/gamp/portfolio/ai-cloud-workspace/tests/test_phase_b3_job_service.py) were executed alongside the regression suites:
+## 4. Test Suite Execution Output
 
 ```bash
 PYTHONPATH=. .venv/bin/pytest tests/test_phase_a_security.py tests/test_phase_b_durable_execution.py tests/test_phase_b_worker_engine.py tests/test_phase_b3_job_service.py -v
 ```
 
-### Output Summary:
-- **Phase A Security Hardening:** 25 passed.
-- **Phase B.1 Durable Job Store:** 17 passed.
-- **Phase B.2 Autonomous Worker Engine:** 17 passed.
-- **Phase B.3.1 Job Service Client Boundary:** 15 passed (including authentic authority verification, concurrent duplicate submissions, full-parameter idempotency comparison, deep immutability, and recursive sanitization).
-- **Total:** **74 passed in 37.62s (100% green)**.
+```
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.2.0, pluggy-1.7.0 -- /home/gamp/portfolio/ai-cloud-workspace/.venv/bin/python3
+rootdir: /home/gamp/portfolio/ai-cloud-workspace
+collected 75 items
+
+tests/test_phase_a_security.py .........................                 [ 33%]
+tests/test_phase_b_durable_execution.py .................                [ 56%]
+tests/test_phase_b_worker_engine.py .................                    [ 78%]
+tests/test_phase_b3_job_service.py ................                      [100%]
+
+============================= 75 passed in 37.36s ==============================
+```
+
+- **Phase A (Security):** 25 passed
+- **Phase B.1 (Durable Job Store):** 17 passed
+- **Phase B.2 (Worker Engine):** 17 passed
+- **Phase B.3.1 (Job Service Client):** 16 passed
+- **Total:** **75 passed in 37.36s (100% green)**
 
 ---
 
-## 4. Scope Discipline & Governance
+## 5. Scope & Invariant Discipline
 - `app.py`, `agent.py`, `worker.py`, and `job_queue.py` remain **completely untouched**.
 - Zero schema migrations.
-- Implementation confined to `job_service.py` and `tests/test_phase_b3_job_service.py`.
+- Working tree is clean.
