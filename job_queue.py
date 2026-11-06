@@ -1972,14 +1972,25 @@ class DurableJobQueue:
                 raise JobNotFoundError(f"Job '{job_id}' does not exist.")
             return self._row_to_dict(row)
 
-    def list_user_jobs(self, user_id: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """Lists recent jobs for a specific tenant."""
+    def list_user_jobs(
+        self,
+        user_id: str,
+        session_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Lists recent jobs for a specific tenant, optionally filtered by session_id."""
         with self._lock:
             try:
-                cursor = self.conn.execute(
-                    "SELECT * FROM jobs WHERE user_id = ? ORDER BY created_at DESC LIMIT ?;",
-                    (user_id, limit),
-                )
+                if session_id:
+                    cursor = self.conn.execute(
+                        "SELECT * FROM jobs WHERE user_id = ? AND session_id = ? ORDER BY created_at DESC LIMIT ?;",
+                        (user_id, session_id.strip(), limit),
+                    )
+                else:
+                    cursor = self.conn.execute(
+                        "SELECT * FROM jobs WHERE user_id = ? ORDER BY created_at DESC LIMIT ?;",
+                        (user_id, limit),
+                    )
                 return [self._row_to_dict(r) for r in cursor.fetchall()]
             except sqlite3.Error as e:
                 raise JobQueueError(f"Database error during list_user_jobs: {str(e)}") from e

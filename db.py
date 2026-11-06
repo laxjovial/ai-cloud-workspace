@@ -336,6 +336,28 @@ def exchange_oauth_code(code: str, state: Optional[str] = None, session_id: Opti
         return {"success": False, "error": str(e)}
 
 
+def sign_up_with_email(email: str, password: str) -> Dict[str, Any]:
+    """Signs up a new user with email and password."""
+    supabase = get_supabase_client()
+    try:
+        response = supabase.auth.sign_up({"email": email.strip(), "password": password})
+        return {"success": True, "data": response}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def sign_in_with_email(email: str, password: str) -> Dict[str, Any]:
+    """Logs in an existing user with email and password."""
+    supabase = get_supabase_client()
+    try:
+        response = supabase.auth.sign_in_with_password(
+            {"email": email.strip(), "password": password}
+        )
+        return {"success": True, "data": response}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 def sign_out() -> bool:
     """Signs out the current user."""
     supabase = get_supabase_client()

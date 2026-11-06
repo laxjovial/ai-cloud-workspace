@@ -83,6 +83,7 @@ ALLOWED_ADDITIONAL_PAYLOAD_KEYS: Set[str] = {
     "temperature",
     "max_turns",
     "context_files",
+    "messages",
 }
 
 # Reserved payload keys that can NEVER be overridden by additional_payload
@@ -305,6 +306,11 @@ class JobView:
     error: Optional[Any]  # MappingProxyType or None
     sandbox_id: Optional[str]
     sandbox_cleanup_status: str
+
+    @property
+    def job_id(self) -> str:
+        """Alias for id matching job_id terminology across services and UI."""
+        return self.id
 
     @property
     def is_terminal(self) -> bool:
@@ -632,10 +638,19 @@ class JobServiceClient:
         raw_job = self._queue.request_cancellation(job_id=job_id.strip(), user_id=verified.user_id)
         return self._dict_to_job_view(raw_job)
 
-    def list_recent_jobs(self, principal: AuthenticatedPrincipal, limit: int = 50) -> List[JobView]:
-        """Lists recent jobs belonging to the authenticated tenant."""
+    def list_recent_jobs(
+        self,
+        principal: AuthenticatedPrincipal,
+        session_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[JobView]:
+        """Lists recent jobs belonging to the authenticated tenant, optionally filtered by session."""
         verified = self._verify_principal(principal)
-        raw_jobs = self._queue.list_user_jobs(user_id=verified.user_id, limit=limit)
+        raw_jobs = self._queue.list_user_jobs(
+            user_id=verified.user_id,
+            session_id=session_id,
+            limit=limit,
+        )
         return [self._dict_to_job_view(j) for j in raw_jobs]
 
     def get_active_job_for_session(

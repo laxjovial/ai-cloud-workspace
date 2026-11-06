@@ -3,10 +3,12 @@
 import importlib
 import os
 from datetime import datetime
+from typing import Any, Dict, List, Optional
 import streamlit as st
-import agent
 import db
-from sandbox import WorkspaceSandbox
+import ui_theme
+from auth_adapter import SupabaseAuthAdapter
+from job_service import JobServiceClient
 
 # Ensure db module is fresh
 importlib.reload(db)
@@ -223,9 +225,15 @@ if "active_gh_account_id" not in st.session_state:
 if "quick_action_prompt" not in st.session_state:
     st.session_state.quick_action_prompt = None
 if "top_nav" not in st.session_state:
-    st.session_state.top_nav = "💬 Workspace & Chat"
+    st.session_state.top_nav = "🏠 Home"
 if "selected_model_label" not in st.session_state:
     st.session_state.selected_model_label = "Google Gemini 2.5 Pro (Recommended)"
+if "active_job_id" not in st.session_state:
+    st.session_state.active_job_id = None
+if "last_event_id" not in st.session_state:
+    st.session_state.last_event_id = 0
+if "design_dial" not in st.session_state:
+    st.session_state.design_dial = 0.5
 
 # =========================================================
 # 0. HANDLE OAUTH CALLBACK (SAFE & ROBUST)
@@ -509,7 +517,42 @@ def render_landing_and_auth():
 
 
 # =========================================================
-# 2. WORKSPACE & CHAT VIEW
+# 2. JOB SERVICE & CLIENT HELPER (SERVER BOUNDARY)
+# =========================================================
+
+_auth_adapter_instance = None
+_job_service_client_instance = None
+
+
+def get_auth_adapter() -> SupabaseAuthAdapter:
+    """Returns singleton SupabaseAuthAdapter backed by server authority secret."""
+    global _auth_adapter_instance
+    if _auth_adapter_instance is None:
+        _auth_adapter_instance = SupabaseAuthAdapter()
+    return _auth_adapter_instance
+
+
+def get_job_service_client() -> JobServiceClient:
+    """Returns singleton JobServiceClient wired to server authentication authority."""
+    global _job_service_client_instance
+    if _job_service_client_instance is None:
+        adapter = get_auth_adapter()
+        _job_service_client_instance = JobServiceClient(auth_verifier=adapter.authority)
+    return _job_service_client_instance
+
+
+def get_current_principal(user) -> Any:
+    """Issues an AuthenticatedPrincipal for the current verified Streamlit user session."""
+    adapter = get_auth_adapter()
+    session_user_dict = {
+        "id": getattr(user, "id", None) or str(user.get("id")),
+        "email": getattr(user, "email", None) or (user.get("email") if isinstance(user, dict) else None),
+    }
+    return adapter.issue_principal_for_session(session_user_dict)
+
+
+# =========================================================
+# 3. WORKSPACE & CHAT VIEW
 # =========================================================
 
 
@@ -522,6 +565,8 @@ def render_workspace():
 
     # 1. Restore persisted state across logouts / timeouts
     saved_state = db.load_user_workspace_state(user.id, user.email)
+    st.session_state.design_dial = ui_theme.get_user_design_dial(user.id, user.email)
+    st.markdown(ui_theme.generate_theme_css(st.session_state.design_dial), unsafe_allow_html=True)
     if st.session_state.active_gh_account_id is None and saved_state.get(
         "active_gh_account_id"
     ):
@@ -603,7 +648,9 @@ def render_workspace():
     # TOP NAVIGATION BAR (Instant switching between views)
     # ------------------------------------------------------
     nav_options = [
-        "💬 Workspace & Chat",
+        "🏠 Home",
+        "📂 Projects",
+        "⚡ Agent Activity",
         "🐙 GitHub Accounts",
         "🤖 AI Models & Keys",
         "📁 Repos & Sessions",
@@ -691,6 +738,22 @@ def render_workspace():
                 st.rerun()
 
         st.markdown("---")
+        st.markdown("##### 🎨 UI Design Dial")
+        sidebar_dial = st.slider(
+            "Style Dial",
+            min_value=0.0,
+            max_value=1.0,
+            value=st.session_state.design_dial,
+            step=0.05,
+            format="%.2f",
+            key="slider_sidebar_design_dial",
+            label_visibility="collapsed",
+        )
+        if abs(sidebar_dial - st.session_state.design_dial) > 0.001:
+            ui_theme.set_user_design_dial(user.id, user.email, sidebar_dial)
+            st.session_state.design_dial = sidebar_dial
+            st.rerun()
+
         st.caption(f"**🐙 GitHub:** {gh_user_str}")
         st.caption(f"**🤖 Model:** {model_short}")
         st.caption(f"**📁 Repo:** {repo_str}")
@@ -1410,6 +1473,23 @@ def render_workspace():
             unsafe_allow_html=True,
         )
 
+        st.markdown("#### 🎨 Global Design Dial")
+        st.caption("Continuously tune UI styling from Classic / Legacy (0%) to Balanced Modern (50%) to Futuristic / AI-Native (100%).")
+        cur_dial = ui_theme.get_user_design_dial(user.id, user.email)
+        new_dial = st.slider(
+            "Design Dial Level",
+            min_value=0.0,
+            max_value=1.0,
+            value=cur_dial,
+            step=0.05,
+            format="%.2f",
+            key="slider_settings_design_dial",
+        )
+        if abs(new_dial - cur_dial) > 0.001:
+            ui_theme.set_user_design_dial(user.id, user.email, new_dial)
+            st.session_state.design_dial = new_dial
+            st.rerun()
+
         st.markdown("#### 🔒 Security & Privacy Architecture")
         st.markdown(
             """
@@ -1430,9 +1510,9 @@ def render_workspace():
             st.rerun()
 
     # ------------------------------------------------------
-    # TAB 5: 💬 WORKSPACE & CHAT VIEW (Active Arena)
+    # TAB: 🏠 HOME VIEW
     # ------------------------------------------------------
-    elif st.session_state.top_nav == "💬 Workspace & Chat":
+    elif st.session_state.top_nav in ("🏠 Home", "💬 Workspace & Chat"):
         if not st.session_state.current_session_id:
             st.markdown("### ⚡ AI Cloud Workspace Arena")
             if st.session_state.active_repo:
@@ -1467,7 +1547,7 @@ def render_workspace():
                     st.rerun()
             else:
                 st.info(
-                    "👈 No active chat session loaded. Pick a repository below, select one from the **📁 Repos & Sessions** tab, or resume a recent chat!"
+                    "👈 No active chat session loaded. Pick a repository below, select one from the **📂 Projects** view, or resume a recent chat!"
                 )
 
             w_col1, w_col2 = st.columns(2)
@@ -1542,7 +1622,7 @@ def render_workspace():
                     type="primary",
                     use_container_width=True,
                 ):
-                    switch_view("📁 Repos & Sessions")
+                    switch_view("📂 Projects")
                     st.rerun()
             return
 
@@ -1597,6 +1677,97 @@ def render_workspace():
                             unsafe_allow_html=True,
                         )
 
+        # ------------------------------------------------------
+        # PROGRESSIVE JOB MONITORING (ST.FRAGMENT RUN_EVERY="2S")
+        # ------------------------------------------------------
+        client = get_job_service_client()
+        principal = get_current_principal(user)
+
+        # Hydrate active non-terminal job for this session if not already tracking
+        if not st.session_state.active_job_id:
+            active_job_view = client.get_active_job_for_session(
+                session_id=st.session_state.current_session_id,
+                principal=principal,
+            )
+            if active_job_view and active_job_view.status in ("QUEUED", "RUNNING", "RECOVERABLE"):
+                st.session_state.active_job_id = active_job_view.job_id
+                st.session_state.last_event_id = 0
+
+        @st.fragment(run_every="2s")
+        def render_active_job_monitor(job_id: str):
+            """Progressively polls job status and events every 2 seconds without full page reload."""
+            try:
+                job_view = client.get_job(job_id=job_id, principal=principal)
+            except Exception as e:
+                st.error(f"Error checking job status: {str(e)}")
+                return
+
+            st.markdown(f"#### ⚡ Agent Task Execution (`{job_id[:12]}`)")
+            status_color = "#3fb950" if job_view.status == "COMPLETED" else ("#58a6ff" if job_view.status == "RUNNING" else "#d29922")
+            st.markdown(
+                f"<div style='margin-bottom:8px;'><span class='status-badge' style='background:{status_color}22; color:{status_color}; border:1px solid {status_color};'>Status: {job_view.status}</span> &nbsp; <span style='color:#8b949e; font-size:12px;'>Worker: {job_view.worker_id or 'Waiting to claim...'}</span></div>",
+                unsafe_allow_html=True,
+            )
+
+            # Cancellation button for active job
+            if job_view.status in ("QUEUED", "RUNNING", "RECOVERABLE"):
+                if st.button("⏹️ Cancel Active Task", key=f"btn_cancel_job_{job_id}", type="secondary"):
+                    try:
+                        client.cancel_job(job_id=job_id, principal=principal)
+                        st.toast("Cancellation requested.", icon="⏹️")
+                        st.rerun()
+                    except Exception as err:
+                        st.error(f"Failed to cancel job: {str(err)}")
+
+            # Poll events
+            events = client.get_job_events(job_id=job_id, principal=principal, after_id=st.session_state.last_event_id)
+            if events:
+                st.session_state.last_event_id = events[-1].id
+
+            all_events = client.get_job_events(job_id=job_id, principal=principal, after_id=0)
+            if all_events:
+                status_logs = [e.data.get("status_text", "") for e in all_events if e.event_type == "AGENT_STATUS" and e.data]
+                if status_logs:
+                    with st.expander("📡 Live Execution Progress Events", expanded=(job_view.status in ("QUEUED", "RUNNING"))):
+                        for sl in status_logs:
+                            st.caption(f"• {sl}")
+
+            # If job is terminal, show completion/failure and write message to chat if needed
+            if job_view.status in ("COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"):
+                st.session_state.active_job_id = None
+                resp_events = [e for e in all_events if e.event_type == "ASSISTANT_RESPONSE"]
+                reply = resp_events[-1].message if resp_events else ""
+                t_logs = (resp_events[-1].data or {}).get("terminal_logs", "") if resp_events else ""
+
+                if job_view.status == "COMPLETED":
+                    st.success(f"Execution complete! (Job {job_id[:12]})")
+                    if reply:
+                        st.markdown(reply)
+                    if t_logs:
+                        with st.expander("🖥️ Terminal & Test Execution Output"):
+                            st.markdown(f"<div class='terminal-box'>{t_logs}</div>", unsafe_allow_html=True)
+                elif job_view.status == "CANCELLED":
+                    st.warning(f"Task `{job_id[:12]}` was cancelled by user.")
+                elif job_view.status == "TIMED_OUT":
+                    st.error(f"Task `{job_id[:12]}` timed out.")
+                else:
+                    err_msg = job_view.error.get("error", "Task execution failed.") if job_view.error else "Execution failed."
+                    st.error(f"Task failed: {err_msg}")
+
+                # Save assistant response to DB if not already saved
+                if reply or t_logs:
+                    db.add_message(
+                        st.session_state.current_session_id,
+                        "assistant",
+                        reply or "Task execution finished.",
+                        terminal_output=t_logs,
+                        user_id=user.id,
+                        email=user.email,
+                    )
+
+        if st.session_state.active_job_id:
+            render_active_job_monitor(st.session_state.active_job_id)
+
         # QUICK ACTION SHORTCUT BUTTONS
         st.markdown("##### ⚡ Quick Actions")
         q1, q2, q3, q4 = st.columns(4)
@@ -1648,95 +1819,121 @@ def render_workspace():
                 user_id=user.id,
                 email=user.email,
             )
-            with st.chat_message("user"):
-                st.markdown(final_prompt)
 
-            # 2. Run Autonomous AI Execution in Sandbox
-            with st.chat_message("assistant"):
-                status_box = st.status(
-                    "Initializing Sandbox and Repository...", expanded=True
-                )
-
-                sandbox = WorkspaceSandbox(
-                    repo_name=st.session_state.active_repo,
-                    github_token=active_gh_token,
-                )
-
-                status_box.update(
-                    label="Cloning repository into cloud sandbox..."
-                )
-                boot_res = sandbox.start()
-
-                if not boot_res.get("success"):
-                    status_box.update(
-                        label="Failed to start sandbox", state="error"
-                    )
-                    st.error(boot_res.get("error"))
-                    return
-
-                def update_status(text: str):
-                    status_box.update(label=text)
-
-                history_payload = []
-                for m in messages:
-                    history_payload.append(
-                        {
-                            "role": "user"
-                            if m["sender"] == "user"
-                            else "assistant",
-                            "content": m["content"],
-                        }
-                    )
+            # 2. Asynchronously submit agent turn to JobServiceClient
+            history_payload = []
+            for m in messages:
                 history_payload.append(
-                    {"role": "user", "content": final_prompt}
+                    {
+                        "role": "user" if m["sender"] == "user" else "assistant",
+                        "content": m["content"],
+                    }
                 )
+            history_payload.append({"role": "user", "content": final_prompt})
 
-                reasoning_val = st.session_state.get("reasoning_effort", "Auto / Standard").split(" ")[0].lower()
-                try:
-                    result = agent.run_agent_turn(
-                        messages=history_payload,
-                        model=selected_model,
-                        api_key=active_api_key,
-                        sandbox=sandbox,
-                        status_callback=update_status,
-                        reasoning_effort=reasoning_val if reasoning_val in ["low", "medium", "high"] else None,
-                    )
+            reasoning_val = st.session_state.get("reasoning_effort", "Auto / Standard").split(" ")[0].lower()
+            additional_payload = {
+                "messages": history_payload,
+            }
+            if reasoning_val in ["low", "medium", "high"]:
+                additional_payload["reasoning_effort"] = reasoning_val
 
-                    if not result.get("success"):
-                        if result.get("status") == "incomplete_step_limit":
-                            status_box.update(label="⚠️ AI Execution reached step limit (incomplete)", state="error")
-                            st.warning(result.get("content", "Task reached maximum allowed steps before completion."))
-                        else:
-                            status_box.update(label="❌ AI Execution encountered an issue", state="error")
-                            st.error(result.get("error", "An error occurred during AI execution."))
-                    else:
-                        status_box.update(label="Execution complete!", state="complete")
+            credential_refs = {
+                "github": {"key_ref": "primary_pat"},
+                provider_name: {"key_ref": f"{provider_name}_key"},
+            }
 
-                    reply_text = result.get("content", "")
-                    terminal_logs = result.get("terminal_logs", "")
+            try:
+                job_view = client.submit_agent_turn(
+                    principal=principal,
+                    session_id=st.session_state.current_session_id,
+                    repository=st.session_state.active_repo,
+                    prompt=final_prompt,
+                    model=selected_model,
+                    credential_refs=credential_refs,
+                    turn_index=len(messages) + 1,
+                    additional_payload=additional_payload,
+                )
+                st.session_state.active_job_id = job_view.job_id
+                st.session_state.last_event_id = 0
+                st.toast(f"⚡ Turn submitted to durable queue! Job ID: {job_view.job_id[:8]}", icon="⚡")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Failed to submit task to JobService: {str(e)}")
 
-                    if reply_text:
-                        st.markdown(reply_text)
-                    if terminal_logs:
-                        with st.expander("🖥️ Terminal & Test Execution Output"):
-                            st.markdown(
-                                f"<div class='terminal-box'>{terminal_logs}</div>",
-                                unsafe_allow_html=True,
-                            )
+    # ------------------------------------------------------
+    # TAB: 📂 PROJECTS VIEW (Repos & Sessions)
+    # ------------------------------------------------------
+    elif st.session_state.top_nav == "📂 Projects":
+        st.markdown("### 📂 Projects & Repositories")
+        st.caption("Manage all repository workspaces, clone configurations, and associated chat sessions.")
+        recent_sessions = db.list_user_sessions(user.id, user.email)
+        if recent_sessions:
+            st.markdown("#### Active Project Workspaces")
+            for s in recent_sessions:
+                c1, c2, c3 = st.columns([3, 2, 1])
+                with c1:
+                    st.markdown(f"**{s.get('repo_name', 'Unknown')}**")
+                    st.caption(s.get("title", ""))
+                with c2:
+                    st.caption(f"Model: {s.get('model_used', 'Default')}")
+                with c3:
+                    if st.button("Open", key=f"btn_open_proj_{s['id']}", use_container_width=True):
+                        st.session_state.current_session_id = s["id"]
+                        st.session_state.active_repo = s.get("repo_name")
+                        db.save_user_workspace_state(user.id, user.email, active_repo=s.get("repo_name"), current_session_id=s["id"])
+                        switch_view("🏠 Home")
+                        st.rerun()
+        else:
+            st.info("No repositories configured yet. Connect a GitHub account to populate your projects!")
 
-                    if reply_text or terminal_logs:
-                        # Save assistant message to hybrid database & local store
-                        db.add_message(
-                            st.session_state.current_session_id,
-                            "assistant",
-                            reply_text or "Task execution finished.",
-                            terminal_output=terminal_logs,
-                            user_id=user.id,
-                            email=user.email,
+    # ------------------------------------------------------
+    # TAB: ⚡ AGENT ACTIVITY VIEW (Execution Monitor & Audit Ledger)
+    # ------------------------------------------------------
+    elif st.session_state.top_nav == "⚡ Agent Activity":
+        st.markdown("### ⚡ Agent Activity & Durable Task Ledger")
+        st.caption("Inspect live and historical job executions, progress events, timing metrics, and worker leases.")
+
+        client = get_job_service_client()
+        principal = get_current_principal(user)
+        try:
+            user_jobs = client.list_recent_jobs(principal=principal, limit=50)
+        except Exception as e:
+            st.error(f"Error fetching jobs: {str(e)}")
+            user_jobs = []
+
+        if user_jobs:
+            for j in user_jobs:
+                with st.expander(f"Task `{j.job_id[:12]}` — {j.status} ({j.repository or 'No Repo'})", expanded=(j.status in ("QUEUED", "RUNNING"))):
+                    col_a, col_b = st.columns([3, 1])
+                    with col_a:
+                        st.markdown(f"**Model:** `{j.model}`")
+                        st.markdown(f"**Prompt:** {j.prompt}")
+                        st.caption(f"Created: {j.created_at} | Updated: {j.updated_at} | Worker: {j.worker_id or 'None'}")
+                    with col_b:
+                        status_color = "#3fb950" if j.status == "COMPLETED" else ("#58a6ff" if j.status == "RUNNING" else "#d29922")
+                        st.markdown(
+                            f"<span class='status-badge' style='background:{status_color}22; color:{status_color}; border:1px solid {status_color};'>Status: {j.status}</span>",
+                            unsafe_allow_html=True,
                         )
-                finally:
-                    if "Preview URL: https://" not in terminal_logs:
-                        sandbox.close()
+                        if j.status in ("QUEUED", "RUNNING", "RECOVERABLE"):
+                            if st.button("Cancel Task", key=f"activity_cancel_{j.job_id}", use_container_width=True):
+                                try:
+                                    client.cancel_job(job_id=j.job_id, principal=principal)
+                                    st.toast("Cancellation requested.", icon="⏹️")
+                                    st.rerun()
+                                except Exception as err:
+                                    st.error(f"Cancellation failed: {str(err)}")
+
+                    # Fetch events for this job
+                    job_evs = client.get_job_events(job_id=j.job_id, principal=principal, after_id=0)
+                    if job_evs:
+                        st.markdown("##### 📜 Execution Logs & Events")
+                        for ev in job_evs:
+                            ev_text = (ev.data or {}).get("status_text") or (ev.data or {}).get("log_text") or ev.message or str(ev.data)
+                            st.caption(f"[{ev.created_at}] [{ev.event_type}] {ev_text}")
+        else:
+            st.info("No agent tasks have been submitted yet. Instruct the agent from the 🏠 Home view to trigger tasks!")
 
 
 # =========================================================
