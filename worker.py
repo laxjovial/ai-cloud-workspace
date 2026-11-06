@@ -41,6 +41,7 @@ import json
 import logging
 import multiprocessing
 import os
+import re
 import secrets
 import select
 import signal
@@ -67,6 +68,37 @@ from job_queue import (
 
 logger = logging.getLogger("ai_cloud_workspace.worker")
 
+_SECRET_PATTERNS = [
+    re.compile(r"(gh[pousr]_[A-Za-z0-9_]{16,255})"),
+    re.compile(r"(github_pat_[A-Za-z0-9_]{60,255})"),
+    re.compile(r"(sk-[A-Za-z0-9_\-]{20,255})"),
+    re.compile(r"(AIza[0-9A-Za-z-_]{35})"),
+    re.compile(r"(Bearer\s+)[A-Za-z0-9_\-\.]{20,}", re.IGNORECASE),
+]
+
+
+def sanitize_text(text: Optional[str]) -> str:
+    """Masks potential secret tokens, keys, and authorization headers in strings."""
+    if not text:
+        return ""
+    sanitized = text
+    for pattern in _SECRET_PATTERNS:
+        sanitized = pattern.sub("[REDACTED_SECRET]", sanitized)
+    return sanitized
+
+
+def sanitize_recursive(val: Any) -> Any:
+    """Recursively traverses dictionaries, lists, and tuples to sanitize string values at arbitrary depth."""
+    if isinstance(val, str):
+        return sanitize_text(val)
+    elif isinstance(val, dict):
+        return {k: sanitize_recursive(v) for k, v in val.items()}
+    elif isinstance(val, list):
+        return [sanitize_recursive(item) for item in val]
+    elif isinstance(val, tuple):
+        return tuple(sanitize_recursive(item) for item in val)
+    return val
+
 
 class ExecutionController:
     """Thread-safe controller for in-process cooperative and bounded forced interruption with side-effect hooks."""
@@ -91,6 +123,7 @@ class ExecutionController:
 
         self._abort_event = threading.Event()
         self._abort_reason: str = ""
+        self._abort_type: str = ""  # "timeout" | "cancellation" | "stale" | ""
         self._start_time = time.monotonic()
         self.active_sandbox_id: Optional[str] = None
         self._lock = threading.Lock()
@@ -99,17 +132,18 @@ class ExecutionController:
         with self._lock:
             self.active_sandbox_id = sandbox_id
 
-    def abort(self, reason: str) -> None:
+    def abort(self, reason: str, abort_type: str = "cancellation") -> None:
         with self._lock:
             if not self._abort_event.is_set():
                 self._abort_reason = reason
+                self._abort_type = abort_type
                 self._abort_event.set()
 
     def is_aborted(self) -> bool:
         if self._abort_event.is_set():
             return True
         if time.monotonic() - self._start_time > self.timeout_seconds:
-            self.abort(f"Execution exceeded timeout limit ({self.timeout_seconds}s).")
+            self.abort(f"Execution exceeded timeout limit ({self.timeout_seconds}s).", abort_type="timeout")
             return True
         return False
 
@@ -117,6 +151,11 @@ class ExecutionController:
     def abort_reason(self) -> str:
         with self._lock:
             return self._abort_reason
+
+    @property
+    def abort_type(self) -> str:
+        with self._lock:
+            return self._abort_type
 
     def on_create_pull_request(
         self,
@@ -565,27 +604,58 @@ def execute_job_in_worker(
         user_data = user_db._load_local_user_data(user_id=user_id)
         if cred_refs:
             for prov, ref in cred_refs.items():
-                kref = ref.get("key_ref")
-                if prov == "github" and kref:
-                    # 1a. Check primary token in user profile
-                    pat = user_data.get("github_access_token") or user_data.get("profile", {}).get("github_token", "")
-                    # 1b. If key_ref refers to a connected account or specific ID, check accounts list
-                    if not pat and "github_accounts" in user_data:
+                if not isinstance(ref, dict):
+                    err = f"Security violation: malformed credential reference for provider '{prov}'."
+                    queue.update_job_status(job_id, "FAILED", worker_id, lease_gen, error=sanitize_recursive({"error": err}))
+                    raise JobQueueError(err)
+
+                kref = ref.get("key_ref", "").strip() if isinstance(ref.get("key_ref"), str) else ""
+                if not kref:
+                    err = f"Security violation: missing key_ref for provider '{prov}'."
+                    queue.update_job_status(job_id, "FAILED", worker_id, lease_gen, error=sanitize_recursive({"error": err}))
+                    raise JobQueueError(err)
+
+                if prov == "github":
+                    # Check whether kref specifies primary account or a specific connected account
+                    if kref in ("primary", "primary_pat", "default", "github_pat", "github_access_token"):
+                        resolved_github_pat = user_data.get("github_access_token") or user_data.get("profile", {}).get("github_token", "")
+                    else:
+                        # Specific account reference: MUST match connected accounts list by id or account_label.
+                        # Never silently fall back to primary PAT!
+                        pat = ""
                         for acc in user_data.get("github_accounts", []):
                             if acc.get("id") == kref or acc.get("account_label") == kref:
                                 pat = acc.get("github_token", "")
                                 break
-                    resolved_github_pat = pat
-                elif prov in ("gemini", "openai", "anthropic", "deepseek") and kref:
-                    resolved_api_key = user_data.get("api_keys", {}).get(prov, "")
+                        resolved_github_pat = pat
+                elif prov in ("gemini", "openai", "anthropic", "deepseek"):
+                    # key_ref must match provider key reference (e.g. provider name, '{prov}_key', or 'default')
+                    allowed_refs = {prov, f"{prov}_key", f"{prov}_api_key", f"{prov}_tok", "default", "primary"}
+                    if kref in allowed_refs:
+                        resolved_api_key = user_data.get("api_keys", {}).get(prov, "")
+                    else:
+                        resolved_api_key = ""
+                else:
+                    err = f"Security violation: unrecognized credential provider '{prov}'."
+                    queue.update_job_status(job_id, "FAILED", worker_id, lease_gen, error=sanitize_recursive({"error": err}))
+                    raise JobQueueError(err)
+    except JobQueueError:
+        raise
     except Exception as e:
-        queue.append_log(job_id, worker_id, lease_gen, f"Credential store error: {str(e)}")
+        queue.append_log(job_id, worker_id, lease_gen, sanitize_text(f"Credential store error: {str(e)}"))
 
     # Fail closed rule: if credentials were required but not resolvable from secure store, reject job
-    if cred_refs and ("github" in cred_refs and not resolved_github_pat):
-        err = "Security violation: required GitHub credential reference could not be resolved from secure tenant store."
-        queue.update_job_status(job_id, "FAILED", worker_id, lease_gen, error={"error": err})
-        raise JobQueueError(err)
+    if cred_refs:
+        if "github" in cred_refs and not resolved_github_pat:
+            err = "Security violation: required GitHub credential reference could not be resolved from secure tenant store."
+            queue.update_job_status(job_id, "FAILED", worker_id, lease_gen, error=sanitize_recursive({"error": err}))
+            raise JobQueueError(err)
+
+        for prov in ("gemini", "openai", "anthropic", "deepseek"):
+            if prov in cred_refs and not resolved_api_key:
+                err = f"Security violation: required '{prov}' credential reference could not be resolved from secure tenant store."
+                queue.update_job_status(job_id, "FAILED", worker_id, lease_gen, error=sanitize_recursive({"error": err}))
+                raise JobQueueError(err)
 
     # 2. Provision and Start Sandbox
     sandbox = None
@@ -641,13 +711,13 @@ def execute_job_in_worker(
             try:
                 if controller.is_aborted():
                     return
-                # Sanitize status text to prevent accidental raw secret exposure
-                clean_text = str(status_text)[:500]
+                # Sanitize status text before writing to durable event logs
+                sanitized_text = sanitize_text(str(status_text))[:500]
                 queue.append_log(
                     job_id=job_id,
                     worker_id=worker_id,
                     lease_generation=lease_gen,
-                    message=clean_text,
+                    message=sanitized_text,
                     event_type="AGENT_STATUS",
                 )
             except Exception:
@@ -656,7 +726,7 @@ def execute_job_in_worker(
         # Strict Credential Fail-Closed: Providers requiring API key must fail closed if missing
         if not resolved_api_key and not agent_turn_fn:
             err = f"Security violation: required API key for model '{model}' could not be resolved from secure tenant store."
-            queue.update_job_status(job_id, "FAILED", worker_id, lease_gen, error={"error": err})
+            queue.update_job_status(job_id, "FAILED", worker_id, lease_gen, error=sanitize_recursive({"error": err}))
             raise JobQueueError(err)
 
         if agent_turn_fn:
@@ -685,17 +755,28 @@ def execute_job_in_worker(
 
         # 6. Evaluate Result and Finalize Job
         if controller.is_aborted():
+            abort_t = controller.abort_type
+            if abort_t == "timeout":
+                target_status = "TIMED_OUT"
+            elif abort_t == "stale":
+                target_status = "FAILED"
+            else:
+                target_status = "CANCELLED"
+
             queue.update_job_status(
                 job_id=job_id,
-                target_status="CANCELLED",
+                target_status=target_status,
                 worker_id=worker_id,
                 lease_generation=lease_gen,
-                error={"abort_reason": controller.abort_reason},
+                error=sanitize_recursive({
+                    "abort_reason": controller.abort_reason,
+                    "abort_type": abort_t,
+                }),
                 sandbox_id=sb_id,
             )
         elif turn_result.get("success"):
-            final_content = turn_result.get("content", "Completed task.")
-            accumulated_logs = turn_result.get("terminal_logs", "")
+            final_content = sanitize_text(str(turn_result.get("content", "Completed task.")))
+            accumulated_logs = sanitize_text(str(turn_result.get("terminal_logs", "")))
 
             # Dispatch final assistant content event into durable job_events
             queue.append_log(
@@ -718,7 +799,7 @@ def execute_job_in_worker(
                     lease_generation=lease_gen,
                 )
             except Exception as e:
-                queue.append_log(job_id, worker_id, lease_gen, f"Sandbox close error: {str(e)}")
+                queue.append_log(job_id, worker_id, lease_gen, sanitize_text(f"Sandbox close error: {str(e)}"))
 
             queue.update_job_status(
                 job_id=job_id,
@@ -729,8 +810,11 @@ def execute_job_in_worker(
             )
         else:
             status_val = turn_result.get("status", "failed")
-            target = "TIMED_OUT" if "timeout" in status_val or "limit" in status_val else "FAILED"
-            err_dict = {
+            # Precise outcome mapping:
+            # - TIMED_OUT only if genuine execution timeout
+            # - FAILED for incomplete_step_limit, tool error, or agent failure (never conflated with TIMED_OUT)
+            target = "TIMED_OUT" if "timeout" in status_val else "FAILED"
+            err_dict: Dict[str, Any] = {
                 "error": turn_result.get("error", "Task execution failed."),
                 "status": status_val,
             }
@@ -744,7 +828,7 @@ def execute_job_in_worker(
                 target_status=target,
                 worker_id=worker_id,
                 lease_generation=lease_gen,
-                error=err_dict,
+                error=sanitize_recursive(err_dict),
                 sandbox_id=sb_id,
             )
     except Exception as e:
@@ -821,7 +905,7 @@ def worker_child_main(
 
                     # If execution has exceeded timeout deadline, stop extending lease and trigger abort
                     if time.time() - job_start_time > timeout_sec:
-                        controller.abort(f"Execution exceeded timeout limit ({timeout_sec}s).")
+                        controller.abort(f"Execution exceeded timeout limit ({timeout_sec}s).", abort_type="timeout")
                         # Do NOT extend lease beyond job execution timeout
                         break
 
@@ -833,11 +917,11 @@ def worker_child_main(
                     )
 
                     if status == "CANCEL_REQUESTED":
-                        controller.abort("User requested cancellation.")
+                        controller.abort("User requested cancellation.", abort_type="cancellation")
                         # Do NOT extend lease further once cancellation is requested
                         break
                     elif status == "STALE":
-                        controller.abort("Worker lease expired or superseded (STALE).")
+                        controller.abort("Worker lease expired or superseded (STALE).", abort_type="stale")
                         break
 
             wd_thread = threading.Thread(target=watchdog_loop, daemon=True)
@@ -863,7 +947,7 @@ def worker_child_main(
                         target_status="FAILED",
                         worker_id=worker_instance_id,
                         lease_generation=lease_gen,
-                        error={"error": str(e), "type": type(e).__name__},
+                        error=sanitize_recursive({"error": str(e), "type": type(e).__name__}),
                         sandbox_id=controller.active_sandbox_id,
                     )
                 except Exception:
