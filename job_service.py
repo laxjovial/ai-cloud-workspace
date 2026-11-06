@@ -164,10 +164,23 @@ class AuthenticationVerifier(Protocol):
 class HMACAuthenticationAuthority:
     """Cryptographic authentication authority and verifier using HMAC-SHA256 signatures.
     
-    Used by trusted application layers (e.g. auth callbacks, server session validators) to verify
-    credentials and issue non-forgeable `AuthenticatedPrincipal` objects.
+    Architectural Trust Boundary:
+    -----------------------------
+    `HMACAuthenticationAuthority` is the internal cryptographic engine for generating and verifying
+    tamper-proof `AuthenticatedPrincipal` tokens.
     
-    Security Invariant: The authority secret must be kept private within the authentication layer.
+    IMPORTANT AUTHENTICATION BOUNDARY DISTINCTION:
+    - `issue_principal_from_verified_credential()` does NOT itself perform primary credential
+      verification (such as validating Supabase JWTs, session cookies, OAuth tokens, or passwords).
+    - Primary credential validation is the explicit responsibility of the trusted application/API
+      layer (to be wired into the web server / auth callbacks in Phase B.3.3).
+    - The calling application layer MUST verify the identity with Supabase or the identity provider
+      FIRST, and only then pass the verified `user_id` to `issue_principal_from_verified_credential()`.
+    - Once issued, the `AuthenticatedPrincipal` token is cryptographically signed using the authority's
+      shared secret. The `AuthenticationVerifier` protocol (`verify_principal`) represents the service's
+      strict trust boundary, ensuring that callers cannot spoof or forge arbitrary identities.
+    
+    Security Invariant: The authority secret must be kept private within the trusted authentication boundary.
     """
 
     def __init__(self, authority_secret: bytes):
@@ -182,7 +195,13 @@ class HMACAuthenticationAuthority:
         roles: Tuple[str, ...] = ("user",),
         issuer: str = "ai_cloud_auth",
     ) -> AuthenticatedPrincipal:
-        """Issues an AuthenticatedPrincipal after a trusted verification step has validated the user's credential."""
+        """Issues an AuthenticatedPrincipal after a trusted verification step has validated the user's credential.
+        
+        Boundary Note:
+            This method assumes the caller has already validated the external identity via Supabase / IDP.
+            It does not validate passwords or session tokens; it mints an immutable, signed principal token
+            for internal job service trust verification.
+        """
         if not verified_user_id or not isinstance(verified_user_id, str) or not verified_user_id.strip():
             raise AuthenticationVerificationError("Cannot issue principal for empty user_id.")
 
@@ -684,7 +703,7 @@ class JobServiceClient:
                 f"Idempotency conflict: key already exists with max_retries {existing_job.get('max_retries')}, got {max_retries}."
             )
 
-        if abs(existing_job.get("timeout_seconds", 0.0) - timeout_seconds) > 0.001:
+        if existing_job.get("timeout_seconds") != timeout_seconds:
             raise IdempotencyConflictError(
                 f"Idempotency conflict: key already exists with timeout_seconds {existing_job.get('timeout_seconds')}, got {timeout_seconds}."
             )

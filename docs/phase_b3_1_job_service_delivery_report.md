@@ -1,4 +1,4 @@
-# Phase B.3.1 Delivery Report: Job Service Client Boundary (Review Pass 3 Corrections)
+# Phase B.3.1 Delivery Report: Job Service Client Boundary (Pass 4 Corrections)
 
 **Status:** Completed & Ready for Review  
 **Branch:** `feat/phase-b3-job-service`  
@@ -12,88 +12,41 @@
 
 ## 1. Executive Summary & Review Findings Addressed
 
-Following the third independent review of Increment B.3.1, targeted corrections were implemented to:
-1. Establish a genuine dependency-injected authentication boundary that fails closed without an external verifier.
-2. Close cross-process idempotency races via post-enqueue verification.
-3. Pre-validate all numeric parameters to eliminate NaN/boolean bypasses before idempotency lookup.
+Following the fourth review of Increment B.3.1, targeted corrections were implemented to:
+1. **Enforce Exact Floating-Point Equality for Timeouts:** Replaced fuzzy `abs(existing - timeout) > 0.001` tolerance with strict `existing_job.get("timeout_seconds") != timeout_seconds` equality. Added regression testing with sub-millisecond differences (`300.0` vs `300.0005`), verifying rejection with `IdempotencyConflictError`.
+2. **Implement Genuine OS Multiprocessing Concurrency Test:** Replaced in-process thread pool tests with true separate OS processes using Python's `multiprocessing.get_context("spawn")`. Verified concurrent identical submissions (both OS processes return identical job ID, exactly 1 DB row) and conflicting submissions (one process succeeds, one receives `IdempotencyConflictError`, exactly 1 DB row, zero unhandled SQLite errors).
+3. **Explicitly Document Authentication Trust Boundary:** Added architectural docstrings to [`HMACAuthenticationAuthority`](file:///home/gamp/portfolio/ai-cloud-workspace/job_service.py#L164-L185) and [`JobServiceClient`](file:///home/gamp/portfolio/ai-cloud-workspace/job_service.py#L380-L420) clarifying that primary identity verification belongs to the trusted application/IDP layer (e.g. Supabase session/JWT verification in B.3.3) before calling `issue_principal_from_verified_credential()`, while `AuthenticationVerifier` constitutes the client service's boundary.
 
 ---
 
 ## 2. Detailed Review Corrections Delivered
 
-### 2.1 Genuine Authentication Trust Boundary & Dependency Injection
-- **Removed Public Authority Accessor:** The `auth_authority` property on `JobServiceClient` was completely removed. Callers holding a reference to `JobServiceClient` have zero capability to issue or forge identity tokens.
-- **Fail-Closed Verification Dependency:** `JobServiceClient` now requires an explicit `auth_verifier: AuthenticationVerifier` dependency injected during construction. It no longer silently creates a default in-memory random authority. If `auth_verifier` is missing or invalid, initialization fails immediately with `ValueError`.
-- **Decoupled Verification from Service:** Mints `AuthenticatedPrincipal` objects strictly via external verification (`issue_principal_from_verified_credential`), maintaining a strict boundary between credential verification and job execution.
-- **Explicit Scope Limitation Documentation:** B.3.1 establishes the client service contract and cryptographic verifier protocol (`AuthenticationVerifier`). Full integration with Supabase session cookies/JWTs is documented as an application-level dependency to be wired during UI integration in B.3.3.
+### 2.1 Strict Exact Timeout Matching
+- In `_verify_idempotent_request_match()` within [`job_service.py`](file:///home/gamp/portfolio/ai-cloud-workspace/job_service.py#L703), replaced:
+  ```python
+  if abs(existing_job.get("timeout_seconds", 0.0) - timeout_seconds) > 0.001:
+  ```
+  with:
+  ```python
+  if existing_job.get("timeout_seconds") != timeout_seconds:
+  ```
+- In [`test_2_complete_idempotency_comparison_and_conflict_rejection`](file:///home/gamp/portfolio/ai-cloud-workspace/tests/test_phase_b3_job_service.py#L230-L243), added a test exercising a sub-millisecond discrepancy (`300.0` vs `300.0005`), confirming that micro-deviations are strictly caught as conflicts.
 
-### 2.2 Cross-Process Idempotency Race Closure
-- **Post-Enqueue Verification:** In a multi-process environment where independent service instances share the SQLite database, `enqueue_job()` atomically handles insertion or returns the existing row under SQLite's `BEGIN IMMEDIATE` transaction.
-- After `enqueue_job()` returns, `JobServiceClient` performs a second, authoritative verification of the returned row against the complete execution request (repository, prompt, model, turn_index, max_retries, timeout_seconds, complete payload canonical JSON equality, and credential_refs canonical equality).
-- If another process inserted an identical request concurrently, the existing job is returned safely.
-- If another process inserted a conflicting request on the same idempotency key concurrently, `JobServiceClient` raises [`IdempotencyConflictError`](file:///home/gamp/portfolio/ai-cloud-workspace/job_service.py#L79).
-- Tested via [`test_3_cross_process_concurrent_idempotency_race`](file:///home/gamp/portfolio/ai-cloud-workspace/tests/test_phase_b3_job_service.py#L182-L230) using two separate `JobServiceClient` instances.
+### 2.2 Genuine OS Multiprocessing Concurrency Test
+- Added top-level picklable worker function `_multiprocessing_submit_worker` in [`tests/test_phase_b3_job_service.py`](file:///home/gamp/portfolio/ai-cloud-workspace/tests/test_phase_b3_job_service.py#L58-L77).
+- Updated [`test_3_cross_process_concurrent_idempotency_race`](file:///home/gamp/portfolio/ai-cloud-workspace/tests/test_phase_b3_job_service.py#L272-L384) to use `multiprocessing.get_context("spawn").Process` and `Queue`:
+  1. Spawns two independent OS processes running concurrent identical submissions on the same key against the shared SQLite file. Both processes receive the identical `job.id`, and SQLite table count for that idempotency key is exactly 1.
+  2. Spawns an independent OS process with conflicting parameters on the existing key. The spawned worker process catches and reports `IdempotencyConflictError` back over the IPC queue, confirming zero unhandled SQLite exceptions and exactly 1 record in SQLite.
 
-### 2.3 Strict Numeric Parameter Pre-Validation
-- `max_retries` and `timeout_seconds` are validated using `validate_numeric()` **before** any database lookup or idempotency comparison is performed.
-- Explicitly rejects `float("nan")`, `float("inf")`, and Python booleans (`True`/`False`), as well as out-of-range values.
-- Tested via [`test_4_numeric_pre_validation`](file:///home/gamp/portfolio/ai-cloud-workspace/tests/test_phase_b3_job_service.py#L232-L272).
-
----
-
-## 3. Updated Interface Contract
-
-```python
-class AuthenticationVerifier(Protocol):
-    def verify_principal(self, principal: Any) -> AuthenticatedPrincipal: ...
-
-@dataclass(frozen=True)
-class AuthenticatedPrincipal:
-    user_id: str
-    issuer: str
-    issued_at: float
-    signature: str
-    email: Optional[str] = None
-    roles: Tuple[str, ...] = ("user",)
-
-class HMACAuthenticationAuthority:
-    def __init__(self, authority_secret: bytes): ...
-    def issue_principal_from_verified_credential(self, verified_user_id: str, email: Optional[str] = None, roles: Tuple[str, ...] = ("user",), issuer: str = "ai_cloud_auth") -> AuthenticatedPrincipal: ...
-    def verify_principal(self, principal: Any) -> AuthenticatedPrincipal: ...
-
-class JobServiceClient:
-    def __init__(
-        self,
-        auth_verifier: AuthenticationVerifier,
-        db_path: str = DEFAULT_DB_PATH,
-        queue: Optional[DurableJobQueue] = None,
-    ): ...
-
-    def submit_agent_turn(
-        self,
-        principal: AuthenticatedPrincipal,
-        session_id: str,
-        repository: str,
-        prompt: str,
-        credential_refs: Optional[Dict[str, Any]] = None,
-        turn_index: int = 0,
-        model: str = "gemini/gemini-2.5-flash",
-        max_retries: int = 3,
-        timeout_seconds: float = 600.0,
-        idempotency_key: Optional[str] = None,
-        additional_payload: Optional[Dict[str, Any]] = None,
-    ) -> JobView: ...
-
-    def get_job(self, job_id: str, principal: AuthenticatedPrincipal) -> JobView: ...
-    def get_job_events(self, job_id: str, principal: AuthenticatedPrincipal, after_id: int = 0) -> List[JobEventView]: ...
-    def cancel_job(self, job_id: str, principal: AuthenticatedPrincipal) -> JobView: ...
-    def list_recent_jobs(self, principal: AuthenticatedPrincipal, limit: int = 50) -> List[JobView]: ...
-    def get_active_job_for_session(self, session_id: str, principal: AuthenticatedPrincipal) -> Optional[JobView]: ...
-```
+### 2.3 Clarification of Authentication Trust Boundary
+- In [`job_service.py`](file:///home/gamp/portfolio/ai-cloud-workspace/job_service.py#L164-L185):
+  - Added an explicit architectural notice detailing the distinction between primary credential validation (Supabase session/JWT) and internal cryptographic principal issuance.
+  - Documented that `issue_principal_from_verified_credential()` expects its caller (the application auth layer) to have verified credentials first.
+  - Documented that `AuthenticationVerifier` is the tamper-proof enforcement boundary for `JobServiceClient`.
 
 ---
 
-## 4. Test Suite Execution Output
+## 3. Test Suite Execution Output
 
 ```bash
 PYTHONPATH=. .venv/bin/pytest tests/test_phase_a_security.py tests/test_phase_b_durable_execution.py tests/test_phase_b_worker_engine.py tests/test_phase_b3_job_service.py -v
@@ -102,26 +55,49 @@ PYTHONPATH=. .venv/bin/pytest tests/test_phase_a_security.py tests/test_phase_b_
 ```
 ============================= test session starts ==============================
 platform linux -- Python 3.12.3, pytest-9.2.0, pluggy-1.7.0 -- /home/gamp/portfolio/ai-cloud-workspace/.venv/bin/python3
+cachedir: .pytest_cache
 rootdir: /home/gamp/portfolio/ai-cloud-workspace
-collected 75 items
+plugins: anyio-4.15.1
+collecting ... collected 75 items                                                             
 
-tests/test_phase_a_security.py .........................                 [ 33%]
-tests/test_phase_b_durable_execution.py .................                [ 56%]
-tests/test_phase_b_worker_engine.py .................                    [ 78%]
-tests/test_phase_b3_job_service.py ................                      [100%]
+tests/test_phase_a_security.py::TestOAuthSecurity::test_pkce_verifiers_and_states_are_unique_and_unpredictable PASSED [  1%]
+...
+tests/test_phase_a_security.py::TestPathConfinementAndSymlinks::test_read_and_write_file_fail_closed_if_realpath_fails_or_returns_empty PASSED [ 33%]
+tests/test_phase_b_durable_execution.py::TestPhaseB1HardenedJobStore::test_job_persistence_survives_connection_closure_and_reopen PASSED [ 34%]
+...
+tests/test_phase_b_durable_execution.py::TestPhaseB1HardenedJobStore::test_schema_migrations_are_idempotent_and_preserve_data PASSED [ 56%]
+tests/test_phase_b_worker_engine.py::TestPhaseB2WorkerEngine::test_scenario_1_normal_worker_turn PASSED [ 57%]
+...
+tests/test_phase_b_worker_engine.py::TestPhaseB2WorkerEngine::test_scenario_17_pr_recovery_fail_closed_and_state_matrix PASSED [ 78%]
+tests/test_phase_b3_job_service.py::TestPhaseB3JobService::test_1_successful_job_submission PASSED [ 80%]
+tests/test_phase_b3_job_service.py::TestPhaseB3JobService::test_2_complete_idempotency_comparison_and_conflict_rejection PASSED [ 81%]
+tests/test_phase_b3_job_service.py::TestPhaseB3JobService::test_3_cross_process_concurrent_idempotency_race PASSED [ 82%]
+tests/test_phase_b3_job_service.py::TestPhaseB3JobService::test_4_numeric_pre_validation PASSED [ 84%]
+tests/test_phase_b3_job_service.py::TestPhaseB3JobService::test_5_cross_tenant_job_access_rejection PASSED [ 85%]
+tests/test_phase_b3_job_service.py::TestPhaseB3JobService::test_6_cross_tenant_event_access_rejection PASSED [ 86%]
+tests/test_phase_b3_job_service.py::TestPhaseB3JobService::test_7_cross_tenant_cancellation_rejection PASSED [ 88%]
+tests/test_phase_b3_job_service.py::TestPhaseB3JobService::test_8_incremental_event_retrieval PASSED [ 89%]
+tests/test_phase_b3_job_service.py::TestPhaseB3JobService::test_9_cancellation_queued_and_running_jobs PASSED [ 90%]
+tests/test_phase_b3_job_service.py::TestPhaseB3JobService::test_10_cancellation_of_terminal_jobs PASSED [ 92%]
+tests/test_phase_b3_job_service.py::TestPhaseB3JobService::test_11_invalid_payload_and_reserved_key_protection PASSED [ 93%]
+tests/test_phase_b3_job_service.py::TestPhaseB3JobService::test_12_database_and_queue_failure_behavior PASSED [ 94%]
+tests/test_phase_b3_job_service.py::TestPhaseB3JobService::test_13_authenticated_principal_boundary_enforcement PASSED [ 96%]
+tests/test_phase_b3_job_service.py::TestPhaseB3JobService::test_14_deep_immutability_of_views PASSED [ 97%]
+tests/test_phase_b3_job_service.py::TestPhaseB3JobService::test_15_recursive_sanitization_at_arbitrary_depth PASSED [ 98%]
+tests/test_phase_b3_job_service.py::TestPhaseB3JobService::test_16_session_active_job_lookup PASSED [100%]
 
-============================= 75 passed in 37.36s ==============================
+============================= 75 passed in 38.02s ==============================
 ```
 
 - **Phase A (Security):** 25 passed
 - **Phase B.1 (Durable Job Store):** 17 passed
 - **Phase B.2 (Worker Engine):** 17 passed
 - **Phase B.3.1 (Job Service Client):** 16 passed
-- **Total:** **75 passed in 37.36s (100% green)**
+- **Total:** **75 passed in 38.02s (100% green)**
 
 ---
 
-## 5. Scope & Invariant Discipline
+## 4. Scope & Invariant Discipline
 - `app.py`, `agent.py`, `worker.py`, and `job_queue.py` remain **completely untouched**.
 - Zero schema migrations.
-- Working tree is clean.
+- Working tree clean; branch remains isolated on `feat/phase-b3-job-service`.

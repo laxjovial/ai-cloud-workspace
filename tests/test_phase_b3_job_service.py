@@ -26,6 +26,7 @@ Covers all review requirements and safeguards:
 
 import concurrent.futures
 import math
+import multiprocessing
 import os
 import sqlite3
 import tempfile
@@ -52,6 +53,27 @@ from job_service import (
     sanitize_recursive,
     sanitize_text,
 )
+
+
+# Top-level helper function for multiprocessing worker execution (must be picklable for 'spawn' context)
+def _multiprocessing_submit_worker(
+    db_path: str,
+    secret_bytes: bytes,
+    principal: AuthenticatedPrincipal,
+    kwargs: dict,
+    out_queue: multiprocessing.Queue,
+):
+    """Spawns an independent JobServiceClient inside a new OS process, executes submit_agent_turn, and sends result back."""
+    try:
+        verifier = HMACAuthenticationAuthority(authority_secret=secret_bytes)
+        client = JobServiceClient(db_path=db_path, auth_verifier=verifier)
+        job_view = client.submit_agent_turn(principal=principal, **kwargs)
+        out_queue.put(("SUCCESS", job_view.id))
+        client.close()
+    except IdempotencyConflictError as e:
+        out_queue.put(("IDEMPOTENCY_CONFLICT", type(e).__name__, str(e)))
+    except Exception as e:
+        out_queue.put(("ERROR", type(e).__name__, str(e)))
 
 
 @pytest.fixture
@@ -205,6 +227,20 @@ class TestPhaseB3JobService:
             )
         assert "timeout_seconds" in str(exc_timeout.value)
 
+        # Mismatch 3b: Micro-difference in timeout_seconds (< 0.001 delta, e.g. 300.0 vs 300.0005)
+        # Guarantees exact floating-point equality check instead of fuzzy delta tolerance.
+        with pytest.raises(IdempotencyConflictError) as exc_timeout_micro:
+            service_client.submit_agent_turn(
+                principal=alice_principal,
+                session_id="sess_idemp",
+                repository="org/repo_a",
+                prompt="Original prompt",
+                turn_index=1,
+                timeout_seconds=300.0005,  # Micro mismatch < 0.001
+                idempotency_key=custom_key,
+            )
+        assert "timeout_seconds" in str(exc_timeout_micro.value)
+
         # Mismatch 4: extra additional_payload key
         with pytest.raises(IdempotencyConflictError) as exc_extra:
             service_client.submit_agent_turn(
@@ -234,58 +270,118 @@ class TestPhaseB3JobService:
         assert "payload" in str(exc_missing.value)
 
     def test_3_cross_process_concurrent_idempotency_race(self, temp_db_path, auth_authority, alice_principal):
-        """Requirement 3: Two independent JobServiceClient instances sharing the same DB coordinate race-free.
+        """Requirement 3: Genuine OS multiprocessing test verifying concurrent idempotency resolution.
         
-        Exercises:
-        1. Identical concurrent requests return the same job.
-        2. Conflicting concurrent requests raise IdempotencyConflictError.
-        3. Zero duplicate records or uncaught SQLite errors.
+        Uses multiprocessing (with 'spawn' context) to execute two separate OS processes
+        that independently instantiate JobServiceClient against the shared SQLite file.
+        
+        Verifies:
+        1. Identical concurrent requests in separate processes both return the exact same job ID,
+           and exactly 1 row is written to SQLite.
+        2. Conflicting concurrent requests across separate processes result in one successful
+           creation and one IdempotencyConflictError, with zero duplicate rows and zero unhandled
+           SQLite errors.
         """
-        # Create two independent service instances sharing the same underlying SQLite file
-        client_a = JobServiceClient(db_path=temp_db_path, auth_verifier=auth_authority)
-        client_b = JobServiceClient(db_path=temp_db_path, auth_verifier=auth_authority)
+        secret = auth_authority._secret
+        ctx = multiprocessing.get_context("spawn")
 
-        custom_idemp = "cross_process_idemp_key_123"
+        # -------------------------------------------------------------
+        # 1. Concurrent identical requests across independent OS processes
+        # -------------------------------------------------------------
+        idemp_identical = "cross_process_identical_key_999"
+        out_q1 = ctx.Queue()
 
-        # 1. Concurrent identical requests across independent clients
-        def submit_identical(client):
-            return client.submit_agent_turn(
-                principal=alice_principal,
-                session_id="sess_cross",
-                repository="org/repo",
-                prompt="Shared prompt",
-                turn_index=1,
-                idempotency_key=custom_idemp,
-            )
+        params_identical = {
+            "session_id": "sess_multiprocess",
+            "repository": "org/repo_multiprocess",
+            "prompt": "Identical multiprocessing prompt",
+            "turn_index": 1,
+            "idempotency_key": idemp_identical,
+        }
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            fut_a = executor.submit(submit_identical, client_a)
-            fut_b = executor.submit(submit_identical, client_b)
-            res_a = fut_a.result()
-            res_b = fut_b.result()
+        p1 = ctx.Process(
+            target=_multiprocessing_submit_worker,
+            args=(temp_db_path, secret, alice_principal, params_identical, out_q1),
+        )
+        p2 = ctx.Process(
+            target=_multiprocessing_submit_worker,
+            args=(temp_db_path, secret, alice_principal, params_identical, out_q1),
+        )
 
-        # Both independent clients received the exact same job ID
-        assert res_a.id == res_b.id
+        p1.start()
+        p2.start()
+        p1.join(timeout=10.0)
+        p2.join(timeout=10.0)
 
-        # Verify only 1 row exists in the database
-        queue = DurableJobQueue(db_path=temp_db_path)
-        rows = queue.conn.execute("SELECT COUNT(*) as cnt FROM jobs WHERE idempotency_key = ?;", (custom_idemp,)).fetchone()
-        assert rows["cnt"] == 1
-        queue.close()
+        assert not p1.is_alive()
+        assert not p2.is_alive()
 
-        # 2. Conflicting request submitted from client_b on the existing key must raise IdempotencyConflictError
-        with pytest.raises(IdempotencyConflictError):
-            client_b.submit_agent_turn(
-                principal=alice_principal,
-                session_id="sess_cross",
-                repository="org/repo",
-                prompt="Conflicting prompt on same key",
-                turn_index=1,
-                idempotency_key=custom_idemp,
-            )
+        res1 = out_q1.get(timeout=2.0)
+        res2 = out_q1.get(timeout=2.0)
 
-        client_a.close()
-        client_b.close()
+        assert res1[0] == "SUCCESS", f"Process 1 failed: {res1}"
+        assert res2[0] == "SUCCESS", f"Process 2 failed: {res2}"
+        # Both independent OS processes received the exact same job ID
+        assert res1[1] == res2[1]
+
+        # Verify exactly 1 row exists in SQLite for this idempotency key
+        conn = sqlite3.connect(temp_db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM jobs WHERE idempotency_key = ?;", (idemp_identical,))
+        assert cur.fetchone()[0] == 1
+        conn.close()
+
+        # -------------------------------------------------------------
+        # 2. Conflicting requests across independent OS processes on same key
+        # -------------------------------------------------------------
+        idemp_conflict = "cross_process_conflict_key_888"
+        out_q2 = ctx.Queue()
+
+        params_base = {
+            "session_id": "sess_multiprocess",
+            "repository": "org/repo_multiprocess",
+            "prompt": "Base prompt for conflict test",
+            "turn_index": 1,
+            "idempotency_key": idemp_conflict,
+        }
+        params_conflicting = {
+            "session_id": "sess_multiprocess",
+            "repository": "org/repo_multiprocess",
+            "prompt": "DIFFERENT prompt that conflicts on the same key",
+            "turn_index": 1,
+            "idempotency_key": idemp_conflict,
+        }
+
+        # Spawn p_base first to commit the original job or run concurrently
+        p_base = ctx.Process(
+            target=_multiprocessing_submit_worker,
+            args=(temp_db_path, secret, alice_principal, params_base, out_q2),
+        )
+        p_base.start()
+        p_base.join(timeout=10.0)
+        assert not p_base.is_alive()
+        base_res = out_q2.get(timeout=2.0)
+        assert base_res[0] == "SUCCESS"
+
+        # Now spawn p_conflict in a separate OS process; it must raise IdempotencyConflictError
+        p_conflict = ctx.Process(
+            target=_multiprocessing_submit_worker,
+            args=(temp_db_path, secret, alice_principal, params_conflicting, out_q2),
+        )
+        p_conflict.start()
+        p_conflict.join(timeout=10.0)
+        assert not p_conflict.is_alive()
+        conflict_res = out_q2.get(timeout=2.0)
+
+        assert conflict_res[0] == "IDEMPOTENCY_CONFLICT"
+        assert conflict_res[1] == "IdempotencyConflictError"
+
+        # Verify database still has exactly 1 record and no corrupted state
+        conn = sqlite3.connect(temp_db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM jobs WHERE idempotency_key = ?;", (idemp_conflict,))
+        assert cur.fetchone()[0] == 1
+        conn.close()
 
     def test_4_numeric_pre_validation(self, service_client, alice_principal):
         """Requirement 4: Strict pre-validation of numeric execution parameters rejects NaN, Inf, and booleans."""
