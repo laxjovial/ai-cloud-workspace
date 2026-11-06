@@ -567,7 +567,15 @@ def execute_job_in_worker(
             for prov, ref in cred_refs.items():
                 kref = ref.get("key_ref")
                 if prov == "github" and kref:
-                    resolved_github_pat = user_data.get("github_access_token", "")
+                    # 1a. Check primary token in user profile
+                    pat = user_data.get("github_access_token") or user_data.get("profile", {}).get("github_token", "")
+                    # 1b. If key_ref refers to a connected account or specific ID, check accounts list
+                    if not pat and "github_accounts" in user_data:
+                        for acc in user_data.get("github_accounts", []):
+                            if acc.get("id") == kref or acc.get("account_label") == kref:
+                                pat = acc.get("github_token", "")
+                                break
+                    resolved_github_pat = pat
                 elif prov in ("gemini", "openai", "anthropic", "deepseek") and kref:
                     resolved_api_key = user_data.get("api_keys", {}).get(prov, "")
     except Exception as e:
@@ -584,7 +592,23 @@ def execute_job_in_worker(
     sb_id = None
     try:
         if sandbox_factory:
-            sandbox = sandbox_factory(repo_name=repo_name, github_token=resolved_github_pat)
+            import inspect
+            sig = inspect.signature(sandbox_factory)
+            kwargs = {}
+            if "repo_name" in sig.parameters:
+                kwargs["repo_name"] = repo_name
+            elif len(sig.parameters) >= 1:
+                # Fallback for positional lambda repo, tok
+                first_param = list(sig.parameters.keys())[0]
+                kwargs[first_param] = repo_name
+
+            if "github_token" in sig.parameters:
+                kwargs["github_token"] = resolved_github_pat
+            elif len(sig.parameters) >= 2:
+                second_param = list(sig.parameters.keys())[1]
+                kwargs[second_param] = resolved_github_pat
+
+            sandbox = sandbox_factory(**kwargs)
         else:
             from sandbox import WorkspaceSandbox
             sandbox = WorkspaceSandbox(repo_name=repo_name, github_token=resolved_github_pat)
@@ -608,11 +632,26 @@ def execute_job_in_worker(
         queue.register_sandbox(job_id, sb_id, worker_id, lease_gen)
         queue.append_log(job_id, worker_id, lease_gen, f"Cloud sandbox '{sb_id}' provisioned and registered.")
 
-        # 4. Run Agent Turn Loop
-        # Note: All side-effect reservation, contextual prior-worker IPC verification, remote state queries,
-        # adoption, and confirmations are strictly authoritative inside controller.on_create_pull_request().
+        # 4. Run Agent Turn Loop with Status Callback Wiring
         messages = payload.get("messages", [{"role": "user", "content": payload.get("prompt", "Analyze repository")}])
         model = payload.get("model", "gemini/gemini-2.5-flash")
+
+        def agent_status_callback(status_text: str):
+            """Dispatches real-time agent status messages and tool execution notices into durable queue logs."""
+            try:
+                if controller.is_aborted():
+                    return
+                # Sanitize status text to prevent accidental raw secret exposure
+                clean_text = str(status_text)[:500]
+                queue.append_log(
+                    job_id=job_id,
+                    worker_id=worker_id,
+                    lease_generation=lease_gen,
+                    message=clean_text,
+                    event_type="AGENT_STATUS",
+                )
+            except Exception:
+                pass
 
         # Strict Credential Fail-Closed: Providers requiring API key must fail closed if missing
         if not resolved_api_key and not agent_turn_fn:
@@ -621,13 +660,18 @@ def execute_job_in_worker(
             raise JobQueueError(err)
 
         if agent_turn_fn:
-            turn_result = agent_turn_fn(
-                messages=messages,
-                model=model,
-                api_key=resolved_api_key,
-                sandbox=sandbox,
-                execution_controller=controller,
-            )
+            import inspect
+            sig = inspect.signature(agent_turn_fn)
+            kwargs: Dict[str, Any] = {
+                "messages": messages,
+                "model": model,
+                "api_key": resolved_api_key,
+                "sandbox": sandbox,
+                "execution_controller": controller,
+            }
+            if "status_callback" in sig.parameters:
+                kwargs["status_callback"] = agent_status_callback
+            turn_result = agent_turn_fn(**kwargs)
         else:
             import agent
             turn_result = agent.run_agent_turn(
@@ -636,6 +680,7 @@ def execute_job_in_worker(
                 api_key=resolved_api_key,
                 sandbox=sandbox,
                 execution_controller=controller,
+                status_callback=agent_status_callback,
             )
 
         # 6. Evaluate Result and Finalize Job
@@ -649,7 +694,19 @@ def execute_job_in_worker(
                 sandbox_id=sb_id,
             )
         elif turn_result.get("success"):
-            queue.append_log(job_id, worker_id, lease_gen, "Agent turn completed successfully.")
+            final_content = turn_result.get("content", "Completed task.")
+            accumulated_logs = turn_result.get("terminal_logs", "")
+
+            # Dispatch final assistant content event into durable job_events
+            queue.append_log(
+                job_id=job_id,
+                worker_id=worker_id,
+                lease_generation=lease_gen,
+                message=final_content,
+                event_type="ASSISTANT_RESPONSE",
+                data={"terminal_logs": accumulated_logs} if accumulated_logs else None,
+            )
+
             # Normal completion cleanup: destroy sandbox container locally and finalize via fenced cleanup
             try:
                 sandbox.close()
@@ -673,12 +730,21 @@ def execute_job_in_worker(
         else:
             status_val = turn_result.get("status", "failed")
             target = "TIMED_OUT" if "timeout" in status_val or "limit" in status_val else "FAILED"
+            err_dict = {
+                "error": turn_result.get("error", "Task execution failed."),
+                "status": status_val,
+            }
+            if turn_result.get("content"):
+                err_dict["content"] = turn_result.get("content")
+            if turn_result.get("terminal_logs"):
+                err_dict["terminal_logs"] = turn_result.get("terminal_logs")
+
             queue.update_job_status(
                 job_id=job_id,
                 target_status=target,
                 worker_id=worker_id,
                 lease_generation=lease_gen,
-                error={"error": turn_result.get("error", "Task execution failed.")},
+                error=err_dict,
                 sandbox_id=sb_id,
             )
     except Exception as e:
