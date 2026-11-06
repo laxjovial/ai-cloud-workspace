@@ -5,14 +5,18 @@ the Streamlit web interface and the underlying Phase B.1/B.2 durable job store.
 
 Architectural Guarantees:
 - Never exposes raw SQLite connections, cursor objects, or transaction handles to callers.
-- Genuine Trusted-Principal Boundary: Requires a verified `AuthenticatedPrincipal` issued by a
-  trusted `AuthenticationVerifier` adapter. Plain strings and unverified caller-constructed identities
+- Genuine Trusted-Principal Boundary: Requires a verified `AuthenticatedPrincipal` verified by an
+  injected `AuthenticationVerifier` protocol. Plain strings and unverified caller-constructed identities
   are rejected fail-closed.
   * In B.3.1, `JobServiceClient` requires an `auth_verifier: AuthenticationVerifier` dependency injection;
     it FAILS CLOSED if none is provided. No default random-secret authority is silently created.
   * `auth_authority` is NOT exposed as a public property on `JobServiceClient`.
-  * `AuthenticationVerifier` verifies authentic external credentials (such as Supabase JWTs or shared-secret tokens)
-    before issuing or returning an `AuthenticatedPrincipal`.
+  * Authentication Boundary Distinction:
+    The trusted application authentication adapter validates external credentials (e.g. Supabase session/JWT).
+    The application then obtains an internally signed `AuthenticatedPrincipal`.
+    `HMACAuthenticationAuthority.verify_principal()` validates that internal principal.
+    `JobServiceClient` relies on the injected `AuthenticationVerifier`.
+    Actual Supabase/session/JWT integration remains future B.3.3 work.
 - Pre-Validation of Numeric Parameters:
   * Numeric parameters (`max_retries`, `timeout_seconds`) are strictly validated using `validate_numeric()`
     BEFORE any idempotency lookup or comparison. Booleans, NaN, Infinity, floats-for-ints, and out-of-range

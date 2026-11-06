@@ -31,6 +31,7 @@ import os
 import sqlite3
 import tempfile
 import time
+from typing import Any, Optional
 import pytest
 
 from job_queue import (
@@ -62,18 +63,31 @@ def _multiprocessing_submit_worker(
     principal: AuthenticatedPrincipal,
     kwargs: dict,
     out_queue: multiprocessing.Queue,
+    barrier: Optional[Any] = None,
 ):
-    """Spawns an independent JobServiceClient inside a new OS process, executes submit_agent_turn, and sends result back."""
+    """Spawns an independent JobServiceClient inside a new OS process, executes submit_agent_turn, and sends result back.
+    
+    If barrier is provided, waits on the barrier immediately before calling submit_agent_turn to ensure
+    all participating OS processes reach the submission call simultaneously.
+    """
+    client = None
     try:
         verifier = HMACAuthenticationAuthority(authority_secret=secret_bytes)
         client = JobServiceClient(db_path=db_path, auth_verifier=verifier)
+        if barrier is not None:
+            barrier.wait(timeout=5.0)
         job_view = client.submit_agent_turn(principal=principal, **kwargs)
         out_queue.put(("SUCCESS", job_view.id))
-        client.close()
     except IdempotencyConflictError as e:
         out_queue.put(("IDEMPOTENCY_CONFLICT", type(e).__name__, str(e)))
     except Exception as e:
         out_queue.put(("ERROR", type(e).__name__, str(e)))
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
 
 
 @pytest.fixture
@@ -275,12 +289,15 @@ class TestPhaseB3JobService:
         Uses multiprocessing (with 'spawn' context) to execute two separate OS processes
         that independently instantiate JobServiceClient against the shared SQLite file.
         
-        Verifies:
-        1. Identical concurrent requests in separate processes both return the exact same job ID,
-           and exactly 1 row is written to SQLite.
-        2. Conflicting concurrent requests across separate processes result in one successful
-           creation and one IdempotencyConflictError, with zero duplicate rows and zero unhandled
-           SQLite errors.
+        Uses multiprocessing.Barrier to guarantee that both processes reach the `submit_agent_turn`
+        call concurrently, exercising true cross-process racing for both:
+        1. Identical concurrent requests in separate processes: both processes race on the same key
+           with identical parameters. Both succeed, both return the exact same job ID, and exactly
+           1 row is written to SQLite.
+        2. Conflicting concurrent requests across separate processes: both processes race on the same key
+           with different execution parameters. Exactly one process wins and creates the job, while
+           the other receives IdempotencyConflictError. Exactly 1 row exists in SQLite, with zero
+           unhandled SQLite exceptions.
         """
         secret = auth_authority._secret
         ctx = multiprocessing.get_context("spawn")
@@ -290,6 +307,7 @@ class TestPhaseB3JobService:
         # -------------------------------------------------------------
         idemp_identical = "cross_process_identical_key_999"
         out_q1 = ctx.Queue()
+        barrier1 = ctx.Barrier(2)
 
         params_identical = {
             "session_id": "sess_multiprocess",
@@ -301,87 +319,117 @@ class TestPhaseB3JobService:
 
         p1 = ctx.Process(
             target=_multiprocessing_submit_worker,
-            args=(temp_db_path, secret, alice_principal, params_identical, out_q1),
+            args=(temp_db_path, secret, alice_principal, params_identical, out_q1, barrier1),
         )
         p2 = ctx.Process(
             target=_multiprocessing_submit_worker,
-            args=(temp_db_path, secret, alice_principal, params_identical, out_q1),
+            args=(temp_db_path, secret, alice_principal, params_identical, out_q1, barrier1),
         )
 
-        p1.start()
-        p2.start()
-        p1.join(timeout=10.0)
-        p2.join(timeout=10.0)
+        try:
+            p1.start()
+            p2.start()
+            p1.join(timeout=10.0)
+            p2.join(timeout=10.0)
 
-        assert not p1.is_alive()
-        assert not p2.is_alive()
+            assert not p1.is_alive(), "Process 1 timed out and is still alive"
+            assert not p2.is_alive(), "Process 2 timed out and is still alive"
+            assert p1.exitcode == 0, f"Process 1 exited with non-zero code {p1.exitcode}"
+            assert p2.exitcode == 0, f"Process 2 exited with non-zero code {p2.exitcode}"
 
-        res1 = out_q1.get(timeout=2.0)
-        res2 = out_q1.get(timeout=2.0)
+            res1 = out_q1.get(timeout=2.0)
+            res2 = out_q1.get(timeout=2.0)
 
-        assert res1[0] == "SUCCESS", f"Process 1 failed: {res1}"
-        assert res2[0] == "SUCCESS", f"Process 2 failed: {res2}"
-        # Both independent OS processes received the exact same job ID
-        assert res1[1] == res2[1]
+            assert res1[0] == "SUCCESS", f"Process 1 failed: {res1}"
+            assert res2[0] == "SUCCESS", f"Process 2 failed: {res2}"
+            # Both independent OS processes received the exact same job ID
+            assert res1[1] == res2[1]
 
-        # Verify exactly 1 row exists in SQLite for this idempotency key
-        conn = sqlite3.connect(temp_db_path)
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM jobs WHERE idempotency_key = ?;", (idemp_identical,))
-        assert cur.fetchone()[0] == 1
-        conn.close()
+            # Verify exactly 1 row exists in SQLite for this idempotency key
+            conn = sqlite3.connect(temp_db_path)
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM jobs WHERE idempotency_key = ?;", (idemp_identical,))
+            assert cur.fetchone()[0] == 1
+            conn.close()
+        finally:
+            if p1.is_alive():
+                p1.terminate()
+                p1.join()
+            if p2.is_alive():
+                p2.terminate()
+                p2.join()
+            out_q1.close()
 
         # -------------------------------------------------------------
-        # 2. Conflicting requests across independent OS processes on same key
+        # 2. Conflicting requests racing concurrently across independent OS processes on same key
         # -------------------------------------------------------------
         idemp_conflict = "cross_process_conflict_key_888"
         out_q2 = ctx.Queue()
+        barrier2 = ctx.Barrier(2)
 
-        params_base = {
+        params_a = {
             "session_id": "sess_multiprocess",
             "repository": "org/repo_multiprocess",
-            "prompt": "Base prompt for conflict test",
+            "prompt": "Prompt Candidate Alpha for race",
             "turn_index": 1,
             "idempotency_key": idemp_conflict,
         }
-        params_conflicting = {
+        params_b = {
             "session_id": "sess_multiprocess",
             "repository": "org/repo_multiprocess",
-            "prompt": "DIFFERENT prompt that conflicts on the same key",
+            "prompt": "DIFFERENT Prompt Candidate Beta that conflicts on the same key",
             "turn_index": 1,
             "idempotency_key": idemp_conflict,
         }
 
-        # Spawn p_base first to commit the original job or run concurrently
-        p_base = ctx.Process(
+        # Spawn two processes that hit submit_agent_turn simultaneously via barrier2
+        p_a = ctx.Process(
             target=_multiprocessing_submit_worker,
-            args=(temp_db_path, secret, alice_principal, params_base, out_q2),
+            args=(temp_db_path, secret, alice_principal, params_a, out_q2, barrier2),
         )
-        p_base.start()
-        p_base.join(timeout=10.0)
-        assert not p_base.is_alive()
-        base_res = out_q2.get(timeout=2.0)
-        assert base_res[0] == "SUCCESS"
-
-        # Now spawn p_conflict in a separate OS process; it must raise IdempotencyConflictError
-        p_conflict = ctx.Process(
+        p_b = ctx.Process(
             target=_multiprocessing_submit_worker,
-            args=(temp_db_path, secret, alice_principal, params_conflicting, out_q2),
+            args=(temp_db_path, secret, alice_principal, params_b, out_q2, barrier2),
         )
-        p_conflict.start()
-        p_conflict.join(timeout=10.0)
-        assert not p_conflict.is_alive()
-        conflict_res = out_q2.get(timeout=2.0)
 
-        assert conflict_res[0] == "IDEMPOTENCY_CONFLICT"
-        assert conflict_res[1] == "IdempotencyConflictError"
+        try:
+            p_a.start()
+            p_b.start()
+            p_a.join(timeout=10.0)
+            p_b.join(timeout=10.0)
 
-        # Verify database still has exactly 1 record and no corrupted state
-        conn = sqlite3.connect(temp_db_path)
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM jobs WHERE idempotency_key = ?;", (idemp_conflict,))
-        assert cur.fetchone()[0] == 1
-        conn.close()
+            assert not p_a.is_alive(), "Process A timed out and is still alive"
+            assert not p_b.is_alive(), "Process B timed out and is still alive"
+            assert p_a.exitcode == 0, f"Process A exited with non-zero code {p_a.exitcode}"
+            assert p_b.exitcode == 0, f"Process B exited with non-zero code {p_b.exitcode}"
+
+            outcome1 = out_q2.get(timeout=2.0)
+            outcome2 = out_q2.get(timeout=2.0)
+
+            outcomes = [outcome1, outcome2]
+            successes = [o for o in outcomes if o[0] == "SUCCESS"]
+            conflicts = [o for o in outcomes if o[0] == "IDEMPOTENCY_CONFLICT"]
+            errors = [o for o in outcomes if o[0] == "ERROR"]
+
+            assert len(errors) == 0, f"Unexpected uncaught error in race: {errors}"
+            assert len(successes) == 1, f"Expected exactly 1 success in race, got {len(successes)}: {outcomes}"
+            assert len(conflicts) == 1, f"Expected exactly 1 IdempotencyConflictError in race, got {len(conflicts)}: {outcomes}"
+            assert conflicts[0][1] == "IdempotencyConflictError"
+
+            # Verify database still has exactly 1 record and no corrupted state
+            conn = sqlite3.connect(temp_db_path)
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM jobs WHERE idempotency_key = ?;", (idemp_conflict,))
+            assert cur.fetchone()[0] == 1
+            conn.close()
+        finally:
+            if p_a.is_alive():
+                p_a.terminate()
+                p_a.join()
+            if p_b.is_alive():
+                p_b.terminate()
+                p_b.join()
+            out_q2.close()
 
     def test_4_numeric_pre_validation(self, service_client, alice_principal):
         """Requirement 4: Strict pre-validation of numeric execution parameters rejects NaN, Inf, and booleans."""
