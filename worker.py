@@ -100,6 +100,28 @@ def sanitize_recursive(val: Any) -> Any:
     return val
 
 
+def get_model_provider(model_name: str) -> Optional[str]:
+    """Determines the required credential provider from the model string.
+    
+    Fails closed: returns None for unknown or unsupported providers.
+    """
+    clean = model_name.strip().lower()
+    if "/" in clean:
+        prefix = clean.split("/")[0]
+        if prefix in ("gemini", "openai", "anthropic", "deepseek"):
+            return prefix
+    else:
+        if clean.startswith("gemini"):
+            return "gemini"
+        elif clean.startswith(("gpt-", "o1", "o3")):
+            return "openai"
+        elif clean.startswith("claude"):
+            return "anthropic"
+        elif clean.startswith("deepseek"):
+            return "deepseek"
+    return None
+
+
 class ExecutionController:
     """Thread-safe controller for in-process cooperative and bounded forced interruption with side-effect hooks."""
 
@@ -596,8 +618,8 @@ def execute_job_in_worker(
 
     queue.append_log(job_id, worker_id, lease_gen, f"Worker '{worker_id}' initializing execution.")
 
-    # 1. Resolve Credentials strictly from user store (Fail-Closed, zero payload fallback)
-    resolved_api_key = ""
+    # 1. Resolve Credentials strictly from user store into provider-indexed mapping (Fail-Closed, zero payload fallback)
+    resolved_api_keys: Dict[str, str] = {}
     resolved_github_pat = ""
     try:
         import db as user_db
@@ -629,12 +651,13 @@ def execute_job_in_worker(
                                 break
                         resolved_github_pat = pat
                 elif prov in ("gemini", "openai", "anthropic", "deepseek"):
-                    # key_ref must match provider key reference (e.g. provider name, '{prov}_key', or 'default')
-                    allowed_refs = {prov, f"{prov}_key", f"{prov}_api_key", f"{prov}_tok", "default", "primary"}
+                    # key_ref must strictly identify that specific provider's credential
+                    allowed_refs = {prov, f"{prov}_key", f"{prov}_api_key", f"{prov}_tok"}
                     if kref in allowed_refs:
-                        resolved_api_key = user_data.get("api_keys", {}).get(prov, "")
+                        resolved_api_keys[prov] = user_data.get("api_keys", {}).get(prov, "")
                     else:
-                        resolved_api_key = ""
+                        # Generic 'default' or 'primary' is prohibited unless explicitly defined as key_ref for this provider
+                        resolved_api_keys[prov] = ""
                 else:
                     err = f"Security violation: unrecognized credential provider '{prov}'."
                     queue.update_job_status(job_id, "FAILED", worker_id, lease_gen, error=sanitize_recursive({"error": err}))
@@ -652,7 +675,7 @@ def execute_job_in_worker(
             raise JobQueueError(err)
 
         for prov in ("gemini", "openai", "anthropic", "deepseek"):
-            if prov in cred_refs and not resolved_api_key:
+            if prov in cred_refs and not resolved_api_keys.get(prov):
                 err = f"Security violation: required '{prov}' credential reference could not be resolved from secure tenant store."
                 queue.update_job_status(job_id, "FAILED", worker_id, lease_gen, error=sanitize_recursive({"error": err}))
                 raise JobQueueError(err)
@@ -723,9 +746,18 @@ def execute_job_in_worker(
             except Exception:
                 pass
 
-        # Strict Credential Fail-Closed: Providers requiring API key must fail closed if missing
-        if not resolved_api_key and not agent_turn_fn:
-            err = f"Security violation: required API key for model '{model}' could not be resolved from secure tenant store."
+        # Strict Provider-Model Credential Binding (Fail-Closed)
+        # Determine provider required by the specified model string
+        model_prov = get_model_provider(model)
+        if not model_prov:
+            err = f"Security violation: model '{model}' does not map to any supported provider (gemini, openai, anthropic, deepseek)."
+            queue.update_job_status(job_id, "FAILED", worker_id, lease_gen, error=sanitize_recursive({"error": err}))
+            raise JobQueueError(err)
+
+        # Select the exact credential matching the model's provider
+        selected_api_key = resolved_api_keys.get(model_prov, "")
+        if not selected_api_key and (cred_refs or not agent_turn_fn):
+            err = f"Security violation: required API key for provider '{model_prov}' (model '{model}') could not be resolved from secure tenant store."
             queue.update_job_status(job_id, "FAILED", worker_id, lease_gen, error=sanitize_recursive({"error": err}))
             raise JobQueueError(err)
 
@@ -735,7 +767,7 @@ def execute_job_in_worker(
             kwargs: Dict[str, Any] = {
                 "messages": messages,
                 "model": model,
-                "api_key": resolved_api_key,
+                "api_key": selected_api_key,
                 "sandbox": sandbox,
                 "execution_controller": controller,
             }
@@ -747,7 +779,7 @@ def execute_job_in_worker(
             turn_result = agent.run_agent_turn(
                 messages=messages,
                 model=model,
-                api_key=resolved_api_key,
+                api_key=selected_api_key,
                 sandbox=sandbox,
                 execution_controller=controller,
                 status_callback=agent_status_callback,
@@ -941,13 +973,42 @@ def worker_child_main(
             except StaleLeaseError:
                 break
             except Exception as e:
+                # If execution raises an exception after the controller has recorded an authoritative abort condition,
+                # preserve that authoritative outcome rather than overriding it with FAILED.
+                abort_t = controller.abort_type if controller.is_aborted() else ""
+                if abort_t == "stale":
+                    # Stale worker must never be allowed to mutate job state or persist results
+                    break
+                elif abort_t == "timeout":
+                    target_status = "TIMED_OUT"
+                    error_payload = {
+                        "abort_reason": controller.abort_reason,
+                        "abort_type": "timeout",
+                        "exception": str(e),
+                        "exception_type": type(e).__name__,
+                    }
+                elif abort_t == "cancellation":
+                    target_status = "CANCELLED"
+                    error_payload = {
+                        "abort_reason": controller.abort_reason,
+                        "abort_type": "cancellation",
+                        "exception": str(e),
+                        "exception_type": type(e).__name__,
+                    }
+                else:
+                    target_status = "FAILED"
+                    error_payload = {
+                        "error": str(e),
+                        "type": type(e).__name__,
+                    }
+
                 try:
                     queue.update_job_status(
                         job_id=job_id,
-                        target_status="FAILED",
+                        target_status=target_status,
                         worker_id=worker_instance_id,
                         lease_generation=lease_gen,
-                        error=sanitize_recursive({"error": str(e), "type": type(e).__name__}),
+                        error=sanitize_recursive(error_payload),
                         sandbox_id=controller.active_sandbox_id,
                     )
                 except Exception:

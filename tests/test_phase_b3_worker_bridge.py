@@ -40,6 +40,7 @@ import tempfile
 import threading
 import time
 from typing import Any, Dict, List, Optional
+from unittest.mock import MagicMock, patch
 import pytest
 
 from db import _save_local_user_data
@@ -829,3 +830,257 @@ class TestPhaseB3WorkerBridge:
         assert checkpoints_reached == ["before_llm", "before_tool_1"]
         updated_job = service_client.get_job(job_view.id, principal=alice_principal)
         assert updated_job.status == "CANCELLED"
+
+    def test_12_real_production_agent_invocation_path(
+        self, temp_db_path, service_client, alice_principal
+    ):
+        """Final Review Requirement A: Exercise execute_job_in_worker with agent_turn_fn=None (real agent.run_agent_turn)."""
+        _save_local_user_data(
+            user_id="user_alice",
+            email="alice@example.com",
+            data={"api_keys": {"gemini": "sk-real-agent-gemini-key-12345"}},
+        )
+
+        job_view = service_client.submit_agent_turn(
+            principal=alice_principal,
+            session_id="sess_prod_agent",
+            repository="owner/repo_prod",
+            prompt="Production agent integration test",
+            model="gemini/gemini-2.5-flash",
+            credential_refs={"gemini": {"key_ref": "gemini_key"}},
+        )
+
+        mock_sb = MockSandbox(repo_name="owner/repo_prod")
+
+        # Mock litellm.completion to return a simulated assistant message without real network calls
+        fake_choice = MagicMock()
+        fake_choice.message = MagicMock()
+        fake_choice.message.content = "Production agent successfully synthesized solution."
+        fake_choice.message.tool_calls = None
+        fake_response = MagicMock()
+        fake_response.choices = [fake_choice]
+
+        with patch("agent.completion", return_value=fake_response) as mock_completion:
+            stop_ev = multiprocessing.Event()
+            worker_child_main(
+                worker_instance_id="worker_prod_agent",
+                db_path=temp_db_path,
+                stop_event=stop_ev,
+                test_sandbox_factory=lambda repo, tok: mock_sb,
+                test_agent_turn_fn=None,  # MUST BE None: invokes production agent.run_agent_turn
+                single_turn=True,
+            )
+
+            # 1. Verify litellm.completion was invoked by agent.py with correct arguments
+            assert mock_completion.called
+            call_kwargs = mock_completion.call_args[1]
+            assert call_kwargs["model"] == "gemini/gemini-2.5-flash"
+            assert call_kwargs["api_key"] == "sk-real-agent-gemini-key-12345"
+            assert any("Production agent integration test" in m["content"] for m in call_kwargs["messages"])
+
+        # 2. Verify progress and assistant completion events are in durable store
+        events = service_client.get_job_events(job_view.id, principal=alice_principal)
+        event_types = [e.event_type for e in events]
+        assert "AGENT_STATUS" in event_types
+        assert "ASSISTANT_RESPONSE" in event_types
+
+        # Verify assistant response content is persisted
+        resp_ev = next(e for e in events if e.event_type == "ASSISTANT_RESPONSE")
+        assert "Production agent successfully synthesized solution." in resp_ev.message
+
+        # 3. Verify terminal status
+        updated_job = service_client.get_job(job_view.id, principal=alice_principal)
+        assert updated_job.status == "COMPLETED"
+        assert updated_job.sandbox_cleanup_status == "CLEANED"
+        assert mock_sb.closed is True
+
+    def test_13_exception_after_timeout_or_cancellation_preserves_authoritative_status(
+        self, temp_db_path, service_client, alice_principal
+    ):
+        """Final Review Requirement B: Preserves TIMED_OUT or CANCELLED if an exception occurs after abort condition was recorded."""
+        _save_local_user_data(
+            user_id="user_alice",
+            email="alice@example.com",
+            data={"api_keys": {"gemini": "sk-alice-gemini-key-123456789012"}},
+        )
+
+        # Case 1: Exception raised after timeout
+        j_timeout = service_client.submit_agent_turn(
+            principal=alice_principal,
+            session_id="sess_ex_timeout",
+            repository="owner/repo_to",
+            prompt="Timeout exception test",
+            credential_refs={"gemini": {"key_ref": "gemini_key"}},
+        )
+
+        def timeout_then_raise_turn(messages, model, api_key, sandbox, execution_controller, status_callback=None):
+            execution_controller.abort("Timeout deadline reached.", abort_type="timeout")
+            raise ConnectionResetError("Network abruptly severed during timeout handling")
+
+        stop_ev = multiprocessing.Event()
+        worker_child_main(
+            worker_instance_id="worker_ex_timeout",
+            db_path=temp_db_path,
+            stop_event=stop_ev,
+            test_sandbox_factory=lambda repo, tok: MockSandbox(repo),
+            test_agent_turn_fn=timeout_then_raise_turn,
+            single_turn=True,
+        )
+
+        res_to = service_client.get_job(j_timeout.id, principal=alice_principal)
+        assert res_to.status == "TIMED_OUT"
+        assert res_to.error.get("abort_type") == "timeout"
+        assert "ConnectionResetError" in str(res_to.error.get("exception_type"))
+
+        # Case 2: Exception raised after cancellation
+        j_cancel = service_client.submit_agent_turn(
+            principal=alice_principal,
+            session_id="sess_ex_cancel",
+            repository="owner/repo_ca",
+            prompt="Cancel exception test",
+            credential_refs={"gemini": {"key_ref": "gemini_key"}},
+        )
+
+        def cancel_then_raise_turn(messages, model, api_key, sandbox, execution_controller, status_callback=None):
+            execution_controller.abort("User cancelled job.", abort_type="cancellation")
+            raise BrokenPipeError("Broken pipe during cancellation cleanup")
+
+        stop_ev = multiprocessing.Event()
+        worker_child_main(
+            worker_instance_id="worker_ex_cancel",
+            db_path=temp_db_path,
+            stop_event=stop_ev,
+            test_sandbox_factory=lambda repo, tok: MockSandbox(repo),
+            test_agent_turn_fn=cancel_then_raise_turn,
+            single_turn=True,
+        )
+
+        res_ca = service_client.get_job(j_cancel.id, principal=alice_principal)
+        assert res_ca.status == "CANCELLED"
+        assert res_ca.error.get("abort_type") == "cancellation"
+        assert "BrokenPipeError" in str(res_ca.error.get("exception_type"))
+
+    def test_14_deterministic_provider_model_credential_binding(
+        self, temp_db_path, service_client, alice_principal
+    ):
+        """Final Review Requirement C: Credential selection matches model provider deterministically regardless of dict order."""
+        _save_local_user_data(
+            user_id="user_alice",
+            email="alice@example.com",
+            data={
+                "github_access_token": "ghp_alice_primary_token",
+                "api_keys": {
+                    "gemini": "sk-alice-gemini-key-111",
+                    "openai": "sk-alice-openai-key-222",
+                    "anthropic": "sk-alice-anthropic-key-333",
+                    "deepseek": "sk-alice-deepseek-key-444",
+                },
+            },
+        )
+
+        captured_keys = []
+
+        def capture_key_turn(messages, model, api_key, sandbox, execution_controller, status_callback=None):
+            captured_keys.append({"model": model, "api_key": api_key})
+            return {"success": True, "content": "Done"}
+
+        # Test Order 1: OpenAI first in dict, executing an Anthropic model -> MUST select Anthropic key
+        j1 = service_client.submit_agent_turn(
+            principal=alice_principal,
+            session_id="sess_prov_1",
+            repository="owner/repo",
+            prompt="Anthropic task",
+            model="anthropic/claude-3-7-sonnet-20250219",
+            credential_refs={
+                "openai": {"key_ref": "openai_key"},
+                "anthropic": {"key_ref": "anthropic_key"},
+                "gemini": {"key_ref": "gemini_key"},
+            },
+        )
+        stop_ev = multiprocessing.Event()
+        worker_child_main(
+            worker_instance_id="worker_prov_1",
+            db_path=temp_db_path,
+            stop_event=stop_ev,
+            test_sandbox_factory=lambda repo, tok: MockSandbox(repo),
+            test_agent_turn_fn=capture_key_turn,
+            single_turn=True,
+        )
+        assert captured_keys[-1]["api_key"] == "sk-alice-anthropic-key-333"
+
+        # Test Order 2: Reverse dict order executing DeepSeek model -> MUST select DeepSeek key
+        j2 = service_client.submit_agent_turn(
+            principal=alice_principal,
+            session_id="sess_prov_2",
+            repository="owner/repo",
+            prompt="DeepSeek task",
+            model="deepseek/deepseek-reasoner",
+            credential_refs={
+                "gemini": {"key_ref": "gemini_key"},
+                "anthropic": {"key_ref": "anthropic_key"},
+                "deepseek": {"key_ref": "deepseek_key"},
+                "openai": {"key_ref": "openai_key"},
+            },
+        )
+        stop_ev = multiprocessing.Event()
+        worker_child_main(
+            worker_instance_id="worker_prov_2",
+            db_path=temp_db_path,
+            stop_event=stop_ev,
+            test_sandbox_factory=lambda repo, tok: MockSandbox(repo),
+            test_agent_turn_fn=capture_key_turn,
+            single_turn=True,
+        )
+        assert captured_keys[-1]["api_key"] == "sk-alice-deepseek-key-444"
+
+        # Test Mismatched Model Provider: OpenAI model requested, but ONLY Gemini credential provided
+        # MUST fail closed with Security violation, NEVER substitute Gemini key
+        j3 = service_client.submit_agent_turn(
+            principal=alice_principal,
+            session_id="sess_prov_3",
+            repository="owner/repo",
+            prompt="OpenAI task with only Gemini key",
+            model="openai/gpt-4o",
+            credential_refs={
+                "gemini": {"key_ref": "gemini_key"},
+            },
+        )
+        stop_ev = multiprocessing.Event()
+        worker_child_main(
+            worker_instance_id="worker_prov_3",
+            db_path=temp_db_path,
+            stop_event=stop_ev,
+            test_sandbox_factory=lambda repo, tok: MockSandbox(repo),
+            test_agent_turn_fn=capture_key_turn,
+            single_turn=True,
+        )
+        res_3 = service_client.get_job(j3.id, principal=alice_principal)
+        assert res_3.status == "FAILED"
+        assert "Security violation" in str(res_3.error)
+        assert "openai" in str(res_3.error)
+
+        # Test Unsupported Model String: e.g. 'custom-llama-3/70b'
+        # MUST fail closed
+        j4 = service_client.submit_agent_turn(
+            principal=alice_principal,
+            session_id="sess_prov_4",
+            repository="owner/repo",
+            prompt="Custom model task",
+            model="unknown-provider/model-xyz",
+            credential_refs={
+                "gemini": {"key_ref": "gemini_key"},
+            },
+        )
+        stop_ev = multiprocessing.Event()
+        worker_child_main(
+            worker_instance_id="worker_prov_4",
+            db_path=temp_db_path,
+            stop_event=stop_ev,
+            test_sandbox_factory=lambda repo, tok: MockSandbox(repo),
+            test_agent_turn_fn=capture_key_turn,
+            single_turn=True,
+        )
+        res_4 = service_client.get_job(j4.id, principal=alice_principal)
+        assert res_4.status == "FAILED"
+        assert "Security violation" in str(res_4.error)
+
